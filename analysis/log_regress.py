@@ -97,7 +97,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train logistic regression to classify embeddings')
     parser.add_argument('embedding_files', type=str, nargs='+',
                         help='path to embedding file/s')
-    parser.add_argument('train_data_file', type=str,
+    parser.add_argument('--train_data_file', type=str,
                         default='data/class_labels.csv',
                         help='path to file with classification labels')
     parser.add_argument('--pred_path', type=str, default=None,

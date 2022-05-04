@@ -131,7 +131,8 @@ if __name__ == '__main__':
     emb, ids = merge_embeds(args.features_files)
     nbr_dist, filt_ids = calculate_distances(emb, ids, nbrs_dict, args.cosine, args.one_side)
     distances.append(nbr_dist)
-    print(int(np.mean(nbr_dist)), int(np.std(nbr_dist)), int(np.median(nbr_dist)))
+    print("Mean distance: ", int(np.mean(nbr_dist)))
+    print("Median distance: ",  int(np.median(nbr_dist)))
 
     if args.features_files2:
         emb2, ids2 = merge_embeds(args.features_files2)
