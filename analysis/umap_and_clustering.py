@@ -59,7 +59,7 @@ def umap_leiden_clust(emb, nn=20, res=0.004):
     G = ig.Graph.from_networkx(net_graph)
     part = leidenalg.find_partition(G, leidenalg.CPMVertexPartition, resolution_parameter=res)
     cl_labels = np.array(part.membership)
-    analyze(cl_labels)
+    analyze(cl_labels, types, ids, neighbors_dict)
     show_types_in_clusters(cl_labels, types, type_names)
     plt.scatter(umap_emb[:, 0], umap_emb[:, 1], c=cl_labels, cmap='Spectral')
     plt.show()
@@ -77,26 +77,22 @@ def show_types_in_clusters(cl_lbls, cell_types, type_names):
     print(type_distr_df)
 
 
-def analyze_bilateral(cl_lbls):
-    lbl_dict = {idx: lbl for idx, lbl in zip(ids, cl_lbls)}
+def analyze(cl_lbls, cell_types, cell_ids, nbrs_dict):
+    print('Resulted in {} clusters'.format(len(np.unique(cl_lbls))))
+    labl_true, labl_pred = cell_types[cell_types != 0], cl_lbls[cell_types != 0]
+    homogen = metrics.homogeneity_score(labl_true, labl_pred)
+    print('Homogeneity score {:0.3f}'.format(homogen))
+    lbl_dict = {idx: lbl for idx, lbl in zip(cell_ids, cl_lbls)}
     in_same_clust = []
-    for idx in ids:
+    for idx in cell_ids:
         lbl = lbl_dict[idx]
         if lbl == -1: continue
         if idx not in nbrs_dict: continue
         nbr_ids = nbrs_dict[idx]
-        nbr_ids = [n for n in nbr_ids if n in ids]
+        nbr_ids = [n for n in nbr_ids if n in cell_ids]
         in_same_clust.append(np.any([lbl_dict[n] == lbl for n in nbr_ids]))
-    print('Bilateral score {:0.3f}'.format(np.mean(in_same_clust)))
-    return np.mean(in_same_clust)
-
-
-def analyze(cl_lbls):
-    print('Resulted in {} clusters'.format(len(np.unique(cl_lbls))))
-    labl_true, labl_pred = types[types != 0], cl_lbls[types != 0]
-    homogen = metrics.homogeneity_score(labl_true, labl_pred)
-    print('Homogeneity score {:0.3f}'.format(homogen))
-    bil_mean = analyze_bilateral(cl_lbls)
+    bil_mean = np.mean(in_same_clust)
+    print('Bilateral score {:0.3f}'.format(bil_mean))
     return np.mean([bil_mean, homogen])
 
 
@@ -118,7 +114,6 @@ def save_labels(ids, cl_lbls, u_emb, out_name):
     df2save.to_csv(out_name, sep='\t')
 
 
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Plot a umap, cluster the embedding')
     parser.add_argument('embedding_file', type=str,
@@ -138,7 +133,7 @@ if __name__ == '__main__':
     label_file = 'data/types_and_intensity_corr.csv'
     dict_file = 'data/bilateral_neighbors.pkl'
     with open(dict_file, 'rb') as f:
-        nbrs_dict = pickle.load(f)
+        neighbors_dict = pickle.load(f)
 
     embedding, types, type_names, ids = get_data(args.embedding_file, label_file)
 
