@@ -130,7 +130,7 @@ if __name__ == '__main__':
                         help='resolution for clustering')
     args = parser.parse_args()
 
-    label_file = 'data/types_and_intensity_corr.csv'
+    label_file = 'data/types_and_intensity_corr.tsv'
     dict_file = 'data/bilateral_neighbors.pkl'
     with open(dict_file, 'rb') as f:
         neighbors_dict = pickle.load(f)

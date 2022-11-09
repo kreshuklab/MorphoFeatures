@@ -57,7 +57,7 @@ if __name__ == '__main__':
     dict_file = 'data/bilateral_neighbors.pkl'
     with open(dict_file, 'rb') as f:
         neighbors_dict = pickle.load(f)
-    label_file = 'data/types_and_intensity_corr.csv'
+    label_file = 'data/types_and_intensity_corr.tsv'
     embedding, types, type_names, ids = get_data(args.embedding_file, label_file)
 
     labels, umap_emb = load_cl_labels(args.clustering_file)

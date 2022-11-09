@@ -62,7 +62,7 @@ def get_embed(f_name):
         with h5py.File(f_name, 'r') as f:
             all_embed = f['embed'][:]
             all_ids = f['label_ids'][:]
-    elif f_name.endswith('csv'):
+    elif f_name.endswith('tsv'):
         morph_stats = pd.read_csv(f_name, sep='\t')
         all_ids = morph_stats.label_id
         all_embed = morph_stats.drop(columns=['label_id'])
@@ -124,7 +124,7 @@ if __name__ == '__main__':
     with open(dict_file, 'rb') as f:
         nbrs_dict = pickle.load(f)
 
-    loc_file = 'data/distance_from_midline_cells_1_0_1.csv'
+    loc_file = 'data/distance_from_midline_cells_1_0_1.tsv'
     is_side1 = np.insert(np.array(pd.read_csv(loc_file, sep='\t')['side']), 0, False)
 
     distances = []

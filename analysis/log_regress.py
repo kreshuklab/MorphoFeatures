@@ -23,7 +23,7 @@ def get_embed(embed_path):
     if embed_path.endswith('npy'):
         encoded = np.load(embed_path)
     else:
-        encoded = np.loadtxt(embed_path)
+        encoded = np.loadtxt(embed_path, delimiter='\t', skiprows=1)
     ids = encoded[:, 0].astype(int)
     encoded = encoded[:, 1:]
     if not np.all(np.sort(ids) == ids):
@@ -98,7 +98,7 @@ if __name__ == '__main__':
     parser.add_argument('embedding_files', type=str, nargs='+',
                         help='path to embedding file/s')
     parser.add_argument('--train_data_file', type=str,
-                        default='data/class_labels.csv',
+                        default='data/class_labels.tsv',
                         help='path to file with classification labels')
     parser.add_argument('--pred_path', type=str, default=None,
                         help='a path to save class predictions for all cells')

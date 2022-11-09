@@ -43,7 +43,7 @@ if __name__ == '__main__':
 
     ids, umap_emb = load_umap_and_ids(args.clustering_file)
 
-    genes_file = 'data/gene_expression.csv'
+    genes_file = 'data/gene_expression.tsv'
     gene_table = get_genes(genes_file, ids)
 
     if args.one_gene:
