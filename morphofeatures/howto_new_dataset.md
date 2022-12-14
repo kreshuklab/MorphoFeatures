@@ -20,7 +20,7 @@ In our experience, bigger patch sizes do not necessarily work better because the
 We recommend using community detection methods for clustering the resulting morphological representations. This requires setting a resolution parameter which influences the number of resulting clusters. Our algorithm for setting this parameter and further defining subclusters was as follows:
 - Choose an initial parameter that would result in a smaller number of clusters that could be easily analysed manually (10-20)
 - Visually inspect the clusters and further subcluster (by increasing clustering resolution) if necessary. We suggest further subclustering in the following cases:
-    - cells in a cluster occupy clearly distinct areas in the volume (e.g. subclusters 8.1, 8.2 and 8.3 in Figure 4B);
-    - cells have distinct visual appearance (e.g. subclusters 14 and 15 in Figure 4B);
-    - gene expression (or other available information about the data) shows high heterogeneity in a cluster (subclustering midgut cells, Figure 6);
+    - cells in a cluster occupy clearly distinct areas in the volume (e.g. subclusters 8.1, 8.2 and 8.3 in Figure 3B);
+    - cells have distinct visual appearance (e.g. subclusters 14 and 15 in Figure 3B);
+    - gene expression (or other available information about the data) shows high heterogeneity in a cluster (subclustering midgut cells, Figure 5);
     - based on prior knowledge.
