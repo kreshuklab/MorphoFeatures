@@ -23,4 +23,4 @@ We recommend using community detection methods for clustering the resulting morp
     - cells in a cluster occupy clearly distinct areas in the volume (e.g. subclusters 8.1, 8.2 and 8.3 in Figure 3B);
     - cells have distinct visual appearance (e.g. subclusters 14 and 15 in Figure 3B);
     - gene expression (or other available information about the data) shows high heterogeneity in a cluster (subclustering midgut cells, Figure 5);
-    - based on prior knowledge.
+    - prior knowledge is available, such as cell types or broader cell classes (e.g. splitting the cluster of foregut neurons and foregut epithelial cells, Figure 9).
