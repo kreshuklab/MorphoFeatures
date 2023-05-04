@@ -70,11 +70,11 @@ class CellLoaders(object):
         nucl_segm = os.path.join(self.PATH, version, "images/local",
                                  "sbem-6dpf-1-whole-segmented-nuclei.xml")
         cell_to_nucl = os.path.join(self.PATH, version, "tables",
-                                    "sbem-6dpf-1-whole-segmented-cells/cells_to_nuclei.csv")
+                                    "sbem-6dpf-1-whole-segmented-cells/cells_to_nuclei.tsv")
         cell_default = os.path.join(self.PATH, version, "tables",
-                                    "sbem-6dpf-1-whole-segmented-cells/default.csv")
+                                    "sbem-6dpf-1-whole-segmented-cells/default.tsv")
         nucl_default = os.path.join(self.PATH, version, "tables",
-                                    "sbem-6dpf-1-whole-segmented-nuclei/default.csv")
+                                    "sbem-6dpf-1-whole-segmented-nuclei/default.tsv")
 
         cell_file = z5py.File(get_data_path(cell_segm, True), 'r')
         nucl_file = z5py.File(get_data_path(nucl_segm, True), 'r')

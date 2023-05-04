@@ -67,6 +67,7 @@ def get_class_embeds(all_encoded, all_ids, id_labels):
 def train_cv_regr(data, labels):
     skf = StratifiedKFold(n_splits=5)
     scores = []
+    conf_matrices = []
     for train_idx, test_idx in skf.split(data, labels):
         logistic_regr = LogisticRegression(C=1, multi_class='auto', solver='lbfgs')
         logistic_regr.fit(data[train_idx], labels[train_idx])
@@ -75,12 +76,17 @@ def train_cv_regr(data, labels):
 
         preds = logistic_regr.predict(data[test_idx])
         conf_matrix = metrics.confusion_matrix(labels[test_idx], preds)
+        conf_matrices.append(conf_matrix)
         print("The accuracy is {0}".format(score))
         print(CELL_TYPES)
         print(conf_matrix)
 
     scores = np.array(scores)
+    print("The average accuracy:")
     print("Mean: {:.4f}, std: {:.4f}".format(np.mean(scores), np.std(scores)))
+    conf_matrices = np.sum(np.array(conf_matrices), axis=0)
+    print("The complete prediction matrix:")
+    print(conf_matrices)
 
 
 def predict_and_save(X, Y, all_embs, cell_ids, path_to_save):

@@ -35,7 +35,7 @@ def load_cl_labels(cluster_file_name):
     labels_matrix = np.array(pd.read_csv(cluster_file_name, sep='\t'))
     labels = labels_matrix[:, -3]
     u_emb = labels_matrix[:, -2:]
-    return labels.astype('int'), u_emb
+    return labels, u_emb
 
 
 if __name__ == '__main__':
@@ -57,6 +57,7 @@ if __name__ == '__main__':
     dict_file = 'data/bilateral_neighbors.pkl'
     with open(dict_file, 'rb') as f:
         neighbors_dict = pickle.load(f)
+
     label_file = 'data/types_and_intensity_corr.tsv'
     embedding, types, type_names, ids = get_data(args.embedding_file, label_file)
 

@@ -67,7 +67,7 @@ class CellDataset(Dataset):
     def center_of_mass(self, idx, cell=False):
         table = self.cell_table if cell else self.nucl_table
         id_data = table[table['label_id'] == idx]
-        com_um = [id_data['com_{}'.format(ax)].values.item()
+        com_um = [id_data['anchor_{}'.format(ax)].values.item()
                   for ax in ['z', 'y', 'x']]
         com_pxl = [int(np.rint(i / self.RES[n] * self.res_diff[n]))
                    for n, i in enumerate(com_um)]
