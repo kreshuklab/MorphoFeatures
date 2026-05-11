@@ -1,0 +1,20 @@
+# Example texture model training configuration.
+#
+# Copy this file to <texture_run>/train_config.yml and edit model/loss settings
+# for the installed neurofire model you want to train.
+
+model_name: ExampleModelName
+model_kwargs: {}
+
+loss: MSELoss
+loss_kwargs: {}
+
+training_optimizer_kwargs:
+  optimizer: Adam
+  lr: 0.0001
+
+num_epochs: 10
+backprop_every: 1
+smoothness: 0.95
+opt_level: O1
+mixed_precision: false

@@ -1,0 +1,12 @@
+# Shared defaults for MorphoFeatures commands.
+project:
+  seed: 42
+  output_dir: runs/example
+
+paths:
+  analysis_data_dir: analysis/data
+  mobie_data_dir: data_mobie
+
+embedding_format:
+  id_column: label_id
+  description: First column is label_id; remaining columns are numeric feature values.

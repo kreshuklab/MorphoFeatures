@@ -1,0 +1,20 @@
+# Example analysis configuration.
+
+embedding_files:
+  - analysis/data/morphofeatures_all_cells.npy
+
+labels:
+  class_labels: analysis/data/class_labels.tsv
+  type_labels: analysis/data/types_and_intensity_corr.tsv
+  bilateral_neighbors: analysis/data/bilateral_neighbors.pkl
+  side_mask: analysis/data/distance_from_midline_cells_1_0_1.tsv
+  gene_expression: analysis/data/gene_expression.tsv
+
+umap:
+  n_neighbors: 15
+  min_dist: 0.0
+  metric: euclidean
+
+clustering:
+  n_neighbors: 20
+  resolution: 0.004

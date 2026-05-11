@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "morphofeatures"
+version = "0.1.0"
+description = "Reusable shape, texture, and analysis pipeline for cell morphology features."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "MorphoFeatures contributors" }]
+dependencies = [
+  "numpy",
+  "pandas",
+  "PyYAML",
+]
+
+[project.optional-dependencies]
+analysis = [
+  "matplotlib",
+  "seaborn",
+  "scikit-learn",
+  "umap-learn",
+  "networkx",
+  "python-igraph",
+  "leidenalg",
+]
+texture = [
+  "torch",
+  "z5py",
+  "pybdv",
+  "inferno",
+  "neurofire",
+  "scikit-image",
+]
+shape = [
+  "torch",
+  "torch-cluster",
+  "pytorch-metric-learning",
+  "wandb",
+  "tqdm",
+  "networkx",
+  "libigl",
+  "vedo",
+]
+dev = [
+  "pytest",
+  "nbformat",
+]
+
+[project.scripts]
+morphofeatures-texture = "morphofeatures.cli.texture:main"
+morphofeatures-shape = "morphofeatures.cli.shape:main"
+morphofeatures-analysis = "morphofeatures.cli.analysis:main"
+morphofeatures-train = "morphofeatures.cli.train:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

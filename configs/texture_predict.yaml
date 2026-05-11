@@ -1,0 +1,30 @@
+# Example texture prediction configuration.
+
+contrastive: true
+texture_contrastive: false
+
+data:
+  root_dir: /scratch/zinchenk/cell_match/data/platy_data
+  version: example-version
+  raw_dataset: setup0/timepoint0/s3
+  cell_dataset: setup0/timepoint0/s2
+  nucleus_dataset: setup0/timepoint0/s0
+  resolution_um: [0.025, 0.01, 0.01]
+  high_resolution_shape: [11416, 25916, 27499]
+
+prediction_loader:
+  batch_size: 1
+  shuffle: false
+  num_workers: 2
+
+transforms:
+  crop_pad_to_size:
+    target_shape: [128, 128, 128]
+  cast: true
+  normalize_range:
+    min_value: 0
+    max_value: 255
+  torch_batch: true
+
+other:
+  size_cut: 200

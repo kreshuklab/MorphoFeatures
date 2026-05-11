@@ -1,0 +1,39 @@
+# Example shape training configuration.
+
+experiment_dir: runs/shape-example
+device: cpu
+wandb_project: MorphoFeatures
+
+data:
+  npz_path: data/shape_point_clouds.npz
+  validation_fraction: 0.2
+  seed: 42
+
+loader:
+  batch_size: 8
+  shuffle: true
+  num_workers: 0
+
+model:
+  name: DeepGCN
+  kwargs:
+    in_channels: 6
+    channels: 64
+    out_channels: 64
+    k: 12
+    n_blocks: 14
+
+optimizer:
+  name: Adam
+  kwargs:
+    lr: 0.0001
+
+criterion:
+  name: NTXentLoss
+  kwargs:
+    temperature: 0.1
+
+training:
+  epochs: 50
+  checkpoint_every: 5
+  validate_every: 1

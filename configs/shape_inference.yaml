@@ -1,0 +1,23 @@
+# Example shape inference configuration.
+#
+# Set model.checkpoint to a checkpoint produced by:
+#   morphofeatures-train shape --config configs/shape_train.yaml
+
+device: cpu
+
+data:
+  npz_path: data/shape_point_clouds.npz
+
+loader:
+  batch_size: 8
+  shuffle: false
+  num_workers: 0
+
+model:
+  checkpoint: runs/shape-example/checkpoints/best_ckpt_iter_0.pt
+  kwargs:
+    in_channels: 6
+    channels: 64
+    out_channels: 64
+    k: 12
+    n_blocks: 14
