@@ -14,6 +14,8 @@ dependencies = [
   "numpy",
   "pandas",
   "PyYAML",
+  "torch",
+  "torchvision"
 ]
 
 [project.optional-dependencies]
@@ -27,8 +29,6 @@ analysis = [
   "leidenalg",
 ]
 texture = [
-  "torch",
-  "z5py",
   "pybdv",
   "inferno",
   "neurofire",
