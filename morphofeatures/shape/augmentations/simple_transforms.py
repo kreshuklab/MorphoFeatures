@@ -21,7 +21,7 @@ class RandomCompose:
         self.num_compositions = num_compositions
 
     def __call__(self, tensors):
-        transforms = random.sample(self.transforms, 2)
+        transforms = random.sample(self.transforms, self.num_compositions)
         intermediate = tensors
         for transform in transforms:
             intermediate = transform(intermediate)
@@ -31,7 +31,7 @@ class RandomCompose:
 class SymmetryTransform:
 
     def __call__(self, tensor):
-        axis = np.random.randint(0, 2, 3, dtype=bool)
+        axis = np.random.randint(0, 2, size=3).astype(bool)
         for i, ax in enumerate(axis):
             if ax:
                 tensor[:, i] = np.max(tensor[:, i]) - tensor[:, i]
@@ -85,7 +85,7 @@ class AxisRotationTransform:
         phi = np.zeros(3)
         for i, angle in enumerate(self.rot_angles):
             if angle > 0:
-                phi[i] = float(2 * random.random() * angle - angle) / 180.
+                phi[i] = np.deg2rad(float(2 * random.random() * angle - angle))
         rot_matrix = self.compute_rot_matrix(phi, shuffle=True)
 
         return tensor @ rot_matrix.T

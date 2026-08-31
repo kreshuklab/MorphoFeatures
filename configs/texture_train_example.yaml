@@ -1,0 +1,21 @@
+model_kwargs:
+  input_channels: 1
+  base_channels: 16
+  embedding_dim: 80
+  projection_dim: 80
+
+optimizer:
+  name: AdamW
+  kwargs:
+    lr: 0.001
+    weight_decay: 0.0001
+
+num_epochs: 100
+loss_kwargs:
+  contrastive_weight: 1.0
+  reconstruction_weight: 1.0
+  bottleneck_weight: 0.0001
+  temperature: 0.1
+
+wandb:
+  enabled: false

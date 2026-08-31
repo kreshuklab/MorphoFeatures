@@ -1,0 +1,17 @@
+seed: 7
+device: cpu
+
+paths:
+  repo_root: ..
+  data_root: tests/fixtures/synthetic
+  analysis_data: analysis/data
+  mobie_data: data_mobie
+  output_root: outputs/smoke
+
+mae:
+  input_shape: [16, 16, 16]
+  patch_size: [4, 4, 4]
+  embedding_dim: 32
+  encoder_depth: 1
+  encoder_heads: 4
+  mask_ratio: 0.5

@@ -1,6 +1,7 @@
 import argparse
 import os
 import pickle
+from pathlib import Path
 import h5py
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -8,10 +9,14 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
-from log_regress import reorder
+try:
+    from analysis.log_regress import reorder
+except ImportError:
+    from log_regress import reorder
 
 
-def calculate_distances(embed, cell_ids, cell_nbrs, cosine=False, use_one_side=False):
+def calculate_distances(embed, cell_ids, cell_nbrs, cosine=False, use_one_side=False,
+                        side1=None):
     normed_embed = StandardScaler().fit_transform(embed)
     if cosine:
         precom_dist = cosine_similarity(normed_embed)
@@ -24,13 +29,15 @@ def calculate_distances(embed, cell_ids, cell_nbrs, cosine=False, use_one_side=F
                                    algorithm='ball_tree', metric='euclidean',
                                    n_jobs=8).fit(normed_embed)
         indices = nn_nbrs.kneighbors(normed_embed, return_distance=False)
-    all_distances = get_nearest_index(indices, cell_ids, cell_nbrs, use_one_side)
+    all_distances = get_nearest_index(indices, cell_ids, cell_nbrs, use_one_side, side1)
     return all_distances[all_distances >= 0], cell_ids[all_distances >= 0]
 
 
-def get_nearest_index(nn, ids, nbrs, one_side=False):
+def get_nearest_index(nn, ids, nbrs, one_side=False, side1=None):
     ids = ids.astype('int')
-    is_side1_ids = is_side1[ids]
+    if one_side and side1 is None:
+        raise ValueError('side1 is required when one_side=True')
+    is_side1_ids = side1[ids] if side1 is not None else None
     nearest_index = []
     for n, idx in enumerate(ids):
         if idx not in nbrs:
@@ -42,9 +49,9 @@ def get_nearest_index(nn, ids, nbrs, one_side=False):
             continue
         pot_nbrs_ids = [np.where(ids == i)[0][0] for i in pot_nbrs]
         if one_side:
-            cell_on_side1 = is_side1[idx]
+            cell_on_side1 = side1[idx]
             # potential symm neighbors on the same side - cell is central
-            if not np.all(is_side1[pot_nbrs] == ~cell_on_side1):
+            if not np.all(side1[pot_nbrs] == ~cell_on_side1):
                 nearest_index.append(-1)
                 continue
             is_nn_other_side = ~is_side1_ids[nn[n]] if cell_on_side1 else is_side1_ids[nn[n]]
@@ -120,23 +127,26 @@ if __name__ == '__main__':
                         help='calculate on the other side only')
     args = parser.parse_args()
 
-    dict_file = 'data/bilateral_neighbors.pkl'
+    data_dir = Path(__file__).resolve().parent / 'data'
+    dict_file = data_dir / 'bilateral_neighbors.pkl'
     with open(dict_file, 'rb') as f:
         nbrs_dict = pickle.load(f)
 
-    loc_file = 'data/distance_from_midline_cells_1_0_1.tsv'
+    loc_file = data_dir / 'distance_from_midline_cells_1_0_1.tsv'
     is_side1 = np.insert(np.array(pd.read_csv(loc_file, sep='\t')['side']), 0, False)
 
     distances = []
     emb, ids = merge_embeds(args.features_files)
-    nbr_dist, filt_ids = calculate_distances(emb, ids, nbrs_dict, args.cosine, args.one_side)
+    nbr_dist, filt_ids = calculate_distances(emb, ids, nbrs_dict, args.cosine,
+                                             args.one_side, is_side1)
     distances.append(nbr_dist)
     print("Mean distance: ", int(np.mean(nbr_dist)))
     print("Median distance: ",  int(np.median(nbr_dist)))
 
     if args.features_files2:
         emb2, ids2 = merge_embeds(args.features_files2)
-        nbr_dist2, _ = calculate_distances(emb2, ids2, nbrs_dict, args.cosine, args.one_side)
+        nbr_dist2, _ = calculate_distances(emb2, ids2, nbrs_dict, args.cosine,
+                                           args.one_side, is_side1)
         distances.append(nbr_dist2)
         print(int(np.mean(nbr_dist2)), int(np.std(nbr_dist2)), int(np.median(nbr_dist2)))
 

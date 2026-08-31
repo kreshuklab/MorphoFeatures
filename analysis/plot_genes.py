@@ -1,5 +1,6 @@
 import argparse
 import os
+from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -14,8 +15,8 @@ def load_umap_and_ids(cluster_file_name):
 
 def get_genes(gene_file, chosen_ids):
     genes_df = pd.read_csv(gene_file, sep='\t')
-    genes = genes_df[genes_df['label_id'].isin(chosen_ids)]
-    return genes
+    genes = genes_df.set_index('label_id').reindex(chosen_ids)
+    return genes.reset_index()
 
 
 def plot_gene(emb, genes, gene_name, save_dir=False):
@@ -43,11 +44,12 @@ if __name__ == '__main__':
 
     ids, umap_emb = load_umap_and_ids(args.clustering_file)
 
-    genes_file = 'data/gene_expression.tsv'
+    genes_file = Path(__file__).resolve().parent / 'data' / 'gene_expression.tsv'
     gene_table = get_genes(genes_file, ids)
 
     if args.one_gene:
         plot_gene(umap_emb, gene_table, args.one_gene, args.save_path)
     else:
-        for g in list(gene_table):
+        excluded = {'label_id', 'Unnamed: 0'}
+        for g in [column for column in gene_table.columns if column not in excluded]:
             plot_gene(umap_emb, gene_table, g, args.save_path)

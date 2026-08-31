@@ -1,0 +1,21 @@
+device: auto
+
+data:
+  manifest: /data/project/shape_manifest.tsv
+  num_points: 1024
+  seed: 42
+
+loader:
+  batch_size: 8
+  num_workers: 4
+
+model:
+  checkpoint: ../outputs/shape_cell/checkpoints/best.pt
+  data_parallel: true
+  kwargs:
+    in_channels: 6
+    channels: 64
+    out_channels: 80
+    projection_head: true
+    n_blocks: 14
+    k: 12

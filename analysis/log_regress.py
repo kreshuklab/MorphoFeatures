@@ -1,4 +1,7 @@
 import argparse
+import functools
+import warnings
+from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn import cluster
@@ -7,10 +10,18 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import scale
 from sklearn.exceptions import ConvergenceWarning
-from sklearn.utils.testing import ignore_warnings
 
 
-CELL_TYPES = ['epithelial', 'neuron', 'midgut', 'muscle', 'secretory', 'ciliated', 'dark']
+CELL_TYPES = ('epithelial', 'neuron', 'midgut', 'muscle', 'secretory', 'ciliated', 'dark')
+
+
+def ignore_convergence_warnings(function):
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', category=ConvergenceWarning)
+            return function(*args, **kwargs)
+    return wrapped
 
 
 def reorder(emb, indices):
@@ -43,17 +54,17 @@ def merge_embeds(emb_files):
     return scale(all_embs), ids
 
 
-def get_labels(val_data_path, skip_types=None):
+def get_labels(val_data_path, skip_types=None, return_classes=False):
     test_data = pd.read_csv(val_data_path, sep='\t')
+    skipped = set(skip_types or ())
     if skip_types is not None:
         for cell_type in skip_types:
             test_data = test_data[test_data['cell_type'] != cell_type]
-            if cell_type in CELL_TYPES:
-                CELL_TYPES.remove(cell_type)
-    type2label = {cell_type: i for i, cell_type in enumerate(CELL_TYPES)}
+    active_types = tuple(cell_type for cell_type in CELL_TYPES if cell_type not in skipped)
+    type2label = {cell_type: i for i, cell_type in enumerate(active_types)}
     id2label = {row['label_id'] : type2label[row['cell_type']] for i, row in test_data.iterrows()}
     id_labels = np.array(list(id2label.items()))
-    return id_labels
+    return (id_labels, active_types) if return_classes else id_labels
 
 
 def get_class_embeds(all_encoded, all_ids, id_labels):
@@ -63,13 +74,14 @@ def get_class_embeds(all_encoded, all_ids, id_labels):
     return selected_encoded, labels
 
 
-@ignore_warnings(category=ConvergenceWarning)
-def train_cv_regr(data, labels):
-    skf = StratifiedKFold(n_splits=5)
+@ignore_convergence_warnings
+def train_cv_regr(data, labels, seed=42, class_names=CELL_TYPES):
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
     scores = []
     conf_matrices = []
     for train_idx, test_idx in skf.split(data, labels):
-        logistic_regr = LogisticRegression(C=1, multi_class='auto', solver='lbfgs')
+        logistic_regr = LogisticRegression(C=1, solver='lbfgs', max_iter=2000,
+                                           random_state=seed)
         logistic_regr.fit(data[train_idx], labels[train_idx])
         score = logistic_regr.score(data[test_idx], labels[test_idx])
         scores.append(score)
@@ -78,7 +90,7 @@ def train_cv_regr(data, labels):
         conf_matrix = metrics.confusion_matrix(labels[test_idx], preds)
         conf_matrices.append(conf_matrix)
         print("The accuracy is {0}".format(score))
-        print(CELL_TYPES)
+        print(class_names)
         print(conf_matrix)
 
     scores = np.array(scores)
@@ -89,12 +101,13 @@ def train_cv_regr(data, labels):
     print(conf_matrices)
 
 
-def predict_and_save(X, Y, all_embs, cell_ids, path_to_save):
-    model = LogisticRegression(C=1, multi_class='auto', solver='lbfgs')
+def predict_and_save(X, Y, all_embs, cell_ids, path_to_save, seed=42,
+                     class_names=CELL_TYPES):
+    model = LogisticRegression(C=1, solver='lbfgs', max_iter=2000, random_state=seed)
     model.fit(X, Y)
     predictions = model.predict_proba(all_embs)
     to_write = np.column_stack((cell_ids[:, np.newaxis], predictions))
-    col_names = ['label_id', ] + CELL_TYPES
+    col_names = ['label_id'] + list(class_names)
     predictions_df = pd.DataFrame(data=to_write, columns=col_names)
     predictions_df.to_csv(path_to_save, index=False, sep='\t')
 
@@ -104,7 +117,7 @@ if __name__ == '__main__':
     parser.add_argument('embedding_files', type=str, nargs='+',
                         help='path to embedding file/s')
     parser.add_argument('--train_data_file', type=str,
-                        default='data/class_labels.tsv',
+                        default=str(Path(__file__).resolve().parent / 'data' / 'class_labels.tsv'),
                         help='path to file with classification labels')
     parser.add_argument('--pred_path', type=str, default=None,
                         help='a path to save class predictions for all cells')
@@ -112,6 +125,7 @@ if __name__ == '__main__':
                         help='cell types to skip, if any')
     parser.add_argument('--agglomerate', type=int, default=None,
                         help='reduce the number of features by agglomeration')
+    parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
     embed, label_ids = merge_embeds(args.embedding_files)
 
@@ -119,8 +133,10 @@ if __name__ == '__main__':
         aggl = cluster.FeatureAgglomeration(n_clusters=args.agglomerate)
         embed = aggl.fit_transform(embed)
 
-    train_data = get_labels(args.train_data_file, skip_types=args.skip_types)
+    train_data, active_types = get_labels(args.train_data_file, skip_types=args.skip_types,
+                                          return_classes=True)
     train_embed, train_labels = get_class_embeds(embed, label_ids, train_data)
-    train_cv_regr(train_embed, train_labels)
+    train_cv_regr(train_embed, train_labels, seed=args.seed, class_names=active_types)
     if args.pred_path:
-        predict_and_save(train_embed, train_labels, embed, label_ids, args.pred_path)
+        predict_and_save(train_embed, train_labels, embed, label_ids, args.pred_path,
+                         seed=args.seed, class_names=active_types)

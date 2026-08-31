@@ -1,0 +1,46 @@
+data_config:
+  data_root: /data/platy_data
+  version: sbem-6dpf-1-whole-segmented-cells
+  raw_volume: ../rawdata/sbem-6dpf-1-whole-raw.n5
+  cell_segmentation: images/local/sbem-6dpf-1-whole-segmented-cells.xml
+  nucleus_segmentation: images/local/sbem-6dpf-1-whole-segmented-nuclei.xml
+  cell_to_nucleus: tables/sbem-6dpf-1-whole-segmented-cells/cells_to_nuclei.tsv
+  cell_table: tables/sbem-6dpf-1-whole-segmented-cells/default.tsv
+  nucleus_table: tables/sbem-6dpf-1-whole-segmented-nuclei/default.tsv
+  raw_dataset: setup0/timepoint0/s3
+  cell_dataset: setup0/timepoint0/s2
+  nucleus_dataset: setup0/timepoint0/s0
+  split: 0.2
+  seed: 42
+
+contrastive: true
+
+loader_config:
+  batch_size: 2
+  shuffle: true
+  num_workers: 4
+val_loader_config:
+  batch_size: 2
+  shuffle: false
+  num_workers: 4
+pred_loader_config:
+  batch_size: 2
+  shuffle: false
+  num_workers: 4
+
+transforms:
+  crop_pad_to_size:
+    shape: [64, 64, 64]
+  normalize_range: {}
+  rotate90: true
+  torch_batch: true
+transforms_sim:
+  rotate90: true
+  torch_batch: true
+
+other:
+  size_cut: 200
+  resolution: [0.025, 0.01, 0.01]
+  reference_shape: [11416, 25916, 27499]
+  remove_nucl: false
+  only_nucl: false

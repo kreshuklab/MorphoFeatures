@@ -1,0 +1,20 @@
+seed: 42
+device: auto
+
+paths:
+  # Relative paths are resolved against the repository, never the shell cwd.
+  repo_root: ..
+  data_root: .
+  analysis_data: analysis/data
+  mobie_data: data_mobie
+  output_root: outputs
+
+data:
+  coordinate_order: zyx
+  resolution_unit: micrometer
+  raw_volume: null
+  cell_segmentation: null
+  nucleus_segmentation: null
+  cell_to_nucleus: null
+  cell_table: null
+  nucleus_table: null

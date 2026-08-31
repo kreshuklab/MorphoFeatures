@@ -1,5 +1,4 @@
 import numpy as np
-import z5py
 import torch
 from torch.utils.data.dataset import Dataset
 from skimage.transform import rescale
@@ -8,15 +7,16 @@ from skimage.transform import rescale
 class CellDataset(Dataset):
     def __init__(self, cell_nucl_tables, nucl_dict, cell_data, nucl_data, raw_data,
                  predict=False, indices=None, transforms=None, transforms_sim=None,
-                 size_cut=200):
-        self.RES = [0.025, 0.01, 0.01]
-        self.HR_SHAPE = [11416, 25916, 27499]
+                 size_cut=200, resolution=(0.025, 0.01, 0.01), reference_shape=None):
+        self.RES = np.asarray(resolution, dtype=float)
         self.cell_table = cell_nucl_tables[0]
         self.nucl_table = cell_nucl_tables[1]
         self.nucl_dict = nucl_dict
         self.cell_data = cell_data
         self.nucl_data = nucl_data
         self.raw_data = raw_data
+        self.HR_SHAPE = np.asarray(cell_data.shape if reference_shape is None else reference_shape,
+                                   dtype=float)
 
         self.predict = predict
 
@@ -46,9 +46,8 @@ class CellDataset(Dataset):
                       int(np.rint(row['bb_max_{}'.format(ax)] / self.RES[n])))
                 for n, ax in enumerate(['z', 'y', 'x'])]
                for _, row in table.iterrows()]
-        upd_bbs = [self.update_bb(bb) for bb in bbs]
-        upd_bbs = [[]] + upd_bbs
-        return upd_bbs
+        return {int(row['label_id']): self.update_bb(bb)
+                for bb, (_, row) in zip(bbs, table.iterrows())}
 
     def get_resolution_diff(self):
         act_shape = self.cell_data.shape
@@ -123,7 +122,18 @@ class TextPatchContrCellDataset(CellDataset):
         self.hr_cell_data = super_kwargs.pop('cell_hr_vol')
         self.radius = super_kwargs.pop('radius')
         if super_kwargs.get('crops_file', None):
-            positions_file = z5py.File(super_kwargs.pop('crops_file'))
+            crops_file = super_kwargs.pop('crops_file')
+            try:
+                import z5py
+
+                positions_file = z5py.File(crops_file, 'r')
+            except ImportError:
+                try:
+                    import zarr
+
+                    positions_file = zarr.open(crops_file, mode='r')
+                except ImportError as error:
+                    raise RuntimeError('Patch positions require zarr or legacy z5py') from error
             self.positions = positions_file['positions']
             self.all_ids = positions_file['ids'][:]
         else:
@@ -150,11 +160,17 @@ class TextPatchContrCellDataset(CellDataset):
         hr_crop = self.raw_data[hr_bb] * (self.hr_cell_data[hr_bb] == cell_idx)
         nucl_crop = self.nucl_data[tuple(crop_bb)] == self.nucl_dict[cell_idx]
         if self.remove_nucl and np.any(nucl_crop):
-            ups_nucl = rescale(nucl_crop, self.bb_scale, multichannel=False, order=0)
+            try:
+                ups_nucl = rescale(nucl_crop, self.bb_scale, channel_axis=None, order=0)
+            except TypeError:
+                ups_nucl = rescale(nucl_crop, self.bb_scale, multichannel=False, order=0)
             hr_crop = hr_crop * (1 - ups_nucl)
         if self.only_nucl:
             hr_crop = self.raw_data[hr_bb]
-            ups_nucl = rescale(nucl_crop, self.bb_scale, multichannel=False, order=0)
+            try:
+                ups_nucl = rescale(nucl_crop, self.bb_scale, channel_axis=None, order=0)
+            except TypeError:
+                ups_nucl = rescale(nucl_crop, self.bb_scale, multichannel=False, order=0)
             hr_crop = hr_crop * ups_nucl
 
         return hr_crop

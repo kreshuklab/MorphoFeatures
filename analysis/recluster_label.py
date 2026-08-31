@@ -1,5 +1,6 @@
 import argparse
 import pickle
+from pathlib import Path
 import igraph as ig
 import leidenalg
 import matplotlib.pyplot as plt
@@ -7,14 +8,22 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 import umap
-from umap_and_clustering import get_data, analyze, save_labels
+try:
+    from analysis.umap_and_clustering import get_data, analyze, save_labels
+except ImportError:
+    from umap_and_clustering import get_data, analyze, save_labels
 
 
-def recluster_label(curr_labels, lbl2recluster, res=0.05, nn=20):
+def recluster_label(curr_labels, lbl2recluster, embedding, umap_emb,
+                    types, ids, neighbors_dict, res=0.05, nn=20, seed=42):
     is_lbl = curr_labels == lbl2recluster
-    fit_umap = umap.UMAP(n_neighbors=nn, metric='euclidean', min_dist=0.0, n_components=2)
+    fit_umap = umap.UMAP(n_neighbors=nn, metric='euclidean', min_dist=0.0,
+                         n_components=2, random_state=seed, n_jobs=1)
     _ = fit_umap.fit_transform(embedding[is_lbl])
-    net_graph = nx.from_scipy_sparse_matrix(fit_umap.graph_)
+    graph_constructor = getattr(nx, 'from_scipy_sparse_array', None)
+    if graph_constructor is None:
+        graph_constructor = nx.from_scipy_sparse_matrix
+    net_graph = graph_constructor(fit_umap.graph_)
     G = ig.Graph.from_networkx(net_graph)
     part = leidenalg.find_partition(G, leidenalg.CPMVertexPartition, resolution_parameter=res)
     part_labels = np.array(part.membership) + 1
@@ -54,16 +63,18 @@ if __name__ == '__main__':
                         help='resolution for clustering')
     args = parser.parse_args()
 
-    dict_file = 'data/bilateral_neighbors.pkl'
+    data_dir = Path(__file__).resolve().parent / 'data'
+    dict_file = data_dir / 'bilateral_neighbors.pkl'
     with open(dict_file, 'rb') as f:
         neighbors_dict = pickle.load(f)
 
-    label_file = 'data/types_and_intensity_corr.tsv'
+    label_file = data_dir / 'types_and_intensity_corr.tsv'
     embedding, types, type_names, ids = get_data(args.embedding_file, label_file)
 
     labels, umap_emb = load_cl_labels(args.clustering_file)
 
-    new_labels = recluster_label(labels, args.label, nn=args.clust_nn, res=args.clust_res)
+    new_labels = recluster_label(labels, args.label, embedding, umap_emb, types, ids,
+                                 neighbors_dict, nn=args.clust_nn, res=args.clust_res)
 
     if args.save_path is not None:
         save_labels(ids, new_labels, umap_emb, args.save_path)

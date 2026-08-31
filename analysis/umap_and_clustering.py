@@ -1,6 +1,6 @@
 import argparse
-import os
 import pickle
+from pathlib import Path
 import igraph as ig
 import leidenalg
 import matplotlib.pyplot as plt
@@ -33,9 +33,11 @@ def get_data(emb_file, label_file):
     return scaled_data, cell_types, type_names, selected_ids
 
 
-def get_umap(emb, neib=15, metric='euclidean', min_dist=0.0, n_components=2):
+def get_umap(emb, neib=15, metric='euclidean', min_dist=0.0, n_components=2,
+             seed=42):
     fit_umap = umap.UMAP(n_neighbors=neib, metric=metric,
-                         min_dist=min_dist, n_components=n_components)
+                         min_dist=min_dist, n_components=n_components,
+                         random_state=seed, n_jobs=1)
     return fit_umap.fit_transform(emb)
 
 
@@ -52,16 +54,25 @@ def plot_types(emb, cell_types, type_names):
     plt.show()
 
 
-def umap_leiden_clust(emb, nn=20, res=0.004):
-    fit_umap = umap.UMAP(n_neighbors=nn, metric='euclidean', min_dist=0.0, n_components=2)
-    _ = fit_umap.fit_transform(emb)
-    net_graph = nx.from_scipy_sparse_matrix(fit_umap.graph_)
+def umap_leiden_clust(emb, cell_types=None, cell_ids=None, neighbors=None,
+                      type_names=None, projection=None, nn=20, res=0.004,
+                      seed=42):
+    fit_umap = umap.UMAP(n_neighbors=nn, metric='euclidean', min_dist=0.0,
+                         n_components=2, random_state=seed, n_jobs=1)
+    fitted_projection = fit_umap.fit_transform(emb)
+    graph_constructor = getattr(nx, 'from_scipy_sparse_array', None)
+    if graph_constructor is None:
+        graph_constructor = nx.from_scipy_sparse_matrix
+    net_graph = graph_constructor(fit_umap.graph_)
     G = ig.Graph.from_networkx(net_graph)
-    part = leidenalg.find_partition(G, leidenalg.CPMVertexPartition, resolution_parameter=res)
+    part = leidenalg.find_partition(G, leidenalg.CPMVertexPartition,
+                                    resolution_parameter=res, seed=seed)
     cl_labels = np.array(part.membership)
-    analyze(cl_labels, types, ids, neighbors_dict)
-    show_types_in_clusters(cl_labels, types, type_names)
-    plt.scatter(umap_emb[:, 0], umap_emb[:, 1], c=cl_labels, cmap='Spectral')
+    if cell_types is not None and cell_ids is not None and neighbors is not None:
+        analyze(cl_labels, np.asarray(cell_types), cell_ids, neighbors)
+        show_types_in_clusters(cl_labels, np.asarray(cell_types), type_names)
+    shown_projection = fitted_projection if projection is None else projection
+    plt.scatter(shown_projection[:, 0], shown_projection[:, 1], c=cl_labels, cmap='Spectral')
     plt.show()
     return cl_labels
 
@@ -96,12 +107,12 @@ def analyze(cl_lbls, cell_types, cell_ids, nbrs_dict):
     return np.mean([bil_mean, homogen])
 
 
-def plot_labels_separately(cl_lbls):
+def plot_labels_separately(cl_lbls, projection):
     for i in np.unique(cl_lbls):
         print(i)
-        plt.scatter(umap_emb[:, 0], umap_emb[:, 1],
+        plt.scatter(projection[:, 0], projection[:, 1],
                     c=(0.5, 0.5, 0.5), s=0.1, alpha=0.5)
-        plt.scatter(umap_emb[cl_lbls == i, 0], umap_emb[cl_lbls == i, 1],
+        plt.scatter(projection[cl_lbls == i, 0], projection[cl_lbls == i, 1],
                     c='red', s=10)
         plt.show()
 
@@ -130,21 +141,24 @@ if __name__ == '__main__':
                         help='resolution for clustering')
     args = parser.parse_args()
 
-    label_file = 'data/types_and_intensity_corr.tsv'
-    dict_file = 'data/bilateral_neighbors.pkl'
+    data_dir = Path(__file__).resolve().parent / 'data'
+    label_file = data_dir / 'types_and_intensity_corr.tsv'
+    dict_file = data_dir / 'bilateral_neighbors.pkl'
     with open(dict_file, 'rb') as f:
         neighbors_dict = pickle.load(f)
 
     embedding, types, type_names, ids = get_data(args.embedding_file, label_file)
 
     print('Plotting umap')
-    umap_emb = get_umap(embedding, neib=args.umap_nn)
+    umap_emb = get_umap(embedding, neib=args.umap_nn, seed=42)
     plot_types(umap_emb, types, type_names)
 
     print('Clustering')
-    labels = umap_leiden_clust(embedding, nn=args.clust_nn, res=args.clust_res)
+    labels = umap_leiden_clust(embedding, types, ids, neighbors_dict, type_names,
+                              umap_emb, nn=args.clust_nn, res=args.clust_res,
+                              seed=42)
     if args.plot_labels_separately:
-        plot_labels_separately(labels)
+        plot_labels_separately(labels, umap_emb)
 
     if args.save_path is not None:
         save_labels(ids, labels, umap_emb, args.save_path)

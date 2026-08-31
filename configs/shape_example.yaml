@@ -1,0 +1,43 @@
+experiment_dir: ../outputs/shape_cell
+device: auto
+
+data:
+  manifest: /data/project/shape_manifest.tsv
+  num_points: 1024
+  validation_fraction: 0.2
+  seed: 42
+
+loader:
+  batch_size: 8
+  num_workers: 4
+  pin_memory: true
+
+model:
+  name: DeepGCN
+  kwargs:
+    in_channels: 6
+    channels: 64
+    out_channels: 80
+    projection_head: true
+    n_blocks: 14
+    k: 12
+
+optimizer:
+  name: AdamW
+  kwargs:
+    lr: 0.001
+    weight_decay: 0.0001
+
+criterion:
+  name: NTXentLoss
+  kwargs:
+    temperature: 0.1
+
+training:
+  epochs: 100
+  validate_every: 1
+  checkpoint_every: 5
+  data_parallel: true
+
+wandb:
+  enabled: false

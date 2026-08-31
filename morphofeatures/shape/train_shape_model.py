@@ -1,139 +1,142 @@
-import os
-import sys
+"""Train the legacy DeepGCN shape encoder with portable runtime behavior."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
 import torch
 import yaml
-import wandb
-
-from collections import namedtuple
 from tqdm import tqdm
-from pytorch_metric_learning import losses
 
+from morphofeatures.losses import nt_xent_loss
+from morphofeatures.shape.loader import get_train_val_loaders
 from morphofeatures.shape.network import DeepGCN
-from morphofeatures.shape.data_loading.loader import get_train_val_loaders
+from morphofeatures.training_runtime import ExperimentLogger, resolve_device, save_checkpoint
 
 
 class ShapeTrainer:
-
     def __init__(self, config):
-        super().__init__()
         self.config = config
-        self.device = torch.device(config['device'])
-        self.ckpt_dir = os.path.join(config['experiment_dir'], 'checkpoints')
-        os.makedirs(self.ckpt_dir, exist_ok=True)
-        self.build_loaders()
-        self.reset()
+        self.device = resolve_device(str(config.get("device", "auto")))
+        self.checkpoint_dir = Path(config["experiment_dir"]) / "checkpoints"
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        loaders = get_train_val_loaders(config["data"], config["loader"])
+        self.train_loader, self.val_loader = loaders["train"], loaders["val"]
+        self.epoch, self.step, self.best_val_loss = 0, 0, None
+        self._build_model()
 
-    def reset(self):
-        self.build_model()
-        self.best_val_loss = None
-        self.epoch = 0
-        self.step = 0
-
-    def build_loaders(self):
-        dataset_config = self.config['data']
-        loader_config = self.config['loader']
-        loaders = get_train_val_loaders(dataset_config, loader_config)
-        self.train_loader = loaders['train']
-        self.val_loader = loaders['val']
-
-    def build_model(self):
-        self.model = DeepGCN(**config['model']['kwargs'])
-        if torch.cuda.device_count() > 1:
-            self.model = torch.nn.DataParallel(
-                self.model,
-                device_ids=[i for i in range(torch.cuda.device_count())]
+    def _build_model(self):
+        self.model = DeepGCN(**self.config["model"].get("kwargs", {})).to(self.device)
+        parallel = bool(self.config.get("training", {}).get("data_parallel", True))
+        if self.device.type == "cuda" and parallel and torch.cuda.device_count() > 1:
+            self.model = torch.nn.DataParallel(self.model)
+        optimizer = self.config.get("optimizer", {"name": "AdamW", "kwargs": {"lr": 1e-3}})
+        self.optimizer = getattr(torch.optim, optimizer["name"])(
+            self.model.parameters(), **optimizer.get("kwargs", {})
+        )
+        scheduler = self.config.get("scheduler")
+        self.scheduler = None
+        if scheduler:
+            self.scheduler = getattr(torch.optim.lr_scheduler, scheduler["name"])(
+                self.optimizer, **scheduler.get("kwargs", {})
             )
-            self.model.cuda()
-        else:
-            self.model = self.model.to(self.device)
 
-        self.optimizer = getattr(
-            torch.optim, self.config['optimizer']['name']
-        )(self.model.parameters(), **self.config['optimizer']['kwargs'])
-        self.criterion = getattr(
-            losses, self.config['criterion']['name']
-        )(**self.config['criterion']['kwargs'])
-
-    def checkpoint(self, force=True):
-        save = force or (self.epoch % self.config['training']['checkpoint_every'] == 0)
-        if save:
-            info = {
-                'epoch': self.epoch,
-                'iteration': self.step,
-                'model': self.model.state_dict(),
-                'optimizer': self.optimizer.state_dict(),
-                # 'scheduler': self.scheduler.state_dict(),
-                'config/model/name': self.config['model']['name'],
-                'config/model/kwargs': self.config['model']['kwargs'],
-            }
-            ckpt_name = f'best_ckpt_iter_{self.step}.pt' if force else f'ckpt_iter_{self.step}.pt'
-            ckpt_path = os.path.join(self.ckpt_dir, ckpt_name)
-            torch.save(info, ckpt_path)
-
-    def train_epoch(self):
-        self.model.train()
-        # generator = iter(self.train_loader)
-        # for iteration in range(len(self.train_loader)):
-        generator = iter(self.val_loader)
-        for iteration in tqdm(range(len(self.val_loader)), desc='Iteration'):
+    def _loss(self, projection):
+        criterion = self.config.get("criterion", {})
+        if criterion.get("name") and criterion["name"] != "NTXentLoss":
             try:
-                data = next(generator)
-            except (IndexError, TypeError) as e:
-                print(e)
-                continue
-            out, h = self.model(data['points'], data['features'])
-            labels = torch.arange(out.size(0) // 2) \
-                          .repeat_interleave(2) \
-                          .to(self.device)
+                from pytorch_metric_learning import losses
+            except ImportError as error:
+                raise RuntimeError("This criterion requires pytorch-metric-learning") from error
+            labels = torch.arange(projection.size(0) // 2, device=self.device).repeat_interleave(2)
+            return getattr(losses, criterion["name"])(**criterion.get("kwargs", {}))(
+                projection, labels
+            )
+        temperature = float(criterion.get("kwargs", {}).get("temperature", 0.1))
+        return nt_xent_loss(projection, temperature=temperature)
 
-            loss = self.criterion(out, labels)
-            if torch.isnan(loss).item():
-                print(f'Loss: {loss.item()}')
-                continue
+    def _forward(self, batch):
+        projection, embedding = self.model(
+            batch["points"].to(self.device, non_blocking=True),
+            batch["features"].to(self.device, non_blocking=True),
+        )
+        return self._loss(projection), embedding
 
-            self.optimizer.zero_grad()
+    def train_epoch(self, logger):
+        self.model.train()
+        losses = []
+        for batch in tqdm(self.train_loader, desc="train", leave=False):
+            loss, _ = self._forward(batch)
+            if not torch.isfinite(loss):
+                continue
+            self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             self.optimizer.step()
-            wandb.log({'training/loss': loss.item()}, step=self.step)
+            losses.append(float(loss.detach()))
+            logger.log({"training/loss": losses[-1]}, step=self.step)
             self.step += 1
+        return float(sum(losses) / max(1, len(losses)))
 
     def validate_epoch(self):
-        if self.epoch % self.config['training']['validate_every'] != 0:
-            return
         self.model.eval()
-        total_loss = 0.0
-        for data in tqdm(self.val_loader):
-            out, h = self.model(data['points'], data['features'])
-            labels = torch.arange(out.size(0) // 2) \
-                          .repeat_interleave(2) \
-                          .to(self.device)
-            total_loss += self.criterion(out, labels).item()
-        avg_loss = total_loss / len(self.val_loader)
+        losses = []
+        with torch.no_grad():
+            for batch in tqdm(self.val_loader, desc="validate", leave=False):
+                loss, _ = self._forward(batch)
+                if torch.isfinite(loss):
+                    losses.append(float(loss))
+        return float(sum(losses) / max(1, len(losses)))
 
-        if self.best_val_loss is None or avg_loss < self.best_val_loss:
-            self.best_val_loss = avg_loss
-            self.checkpoint(True)
-
-        wandb.log({'validation': {'average_loss': avg_loss}})
-
-    def train(self):
-        for epoch_num in tqdm(range(self.config['training']['epochs']), desc='Epochs'):
-            self.train_epoch()
-            self.validate_epoch()
-            self.scheduler.step(epoch_num)
-            self.checkpoint(False)
-            self.epoch += 1
+    def checkpoint(self, name, metrics):
+        return save_checkpoint(
+            self.checkpoint_dir / name, self.model, optimizer=self.optimizer,
+            scheduler=self.scheduler, epoch=self.epoch, step=self.step,
+            config=self.config, metrics=metrics,
+        )
 
     def run(self):
-        with wandb.init(project='MorphoFeatures'):
-            self.validate_epoch()
-            self.train()
+        training = self.config.get("training", {})
+        wandb_config = self.config.get("wandb", {})
+        with ExperimentLogger(enabled=bool(wandb_config.get("enabled", False)),
+                              project=wandb_config.get("project", "MorphoFeatures"),
+                              config=self.config) as logger:
+            for self.epoch in tqdm(range(int(training.get("epochs", 10))), desc="epochs"):
+                train_loss = self.train_epoch(logger)
+                metrics = {"train_loss": train_loss}
+                if self.epoch % int(training.get("validate_every", 1)) == 0:
+                    validation_loss = self.validate_epoch()
+                    metrics["validation_loss"] = validation_loss
+                    logger.log(metrics, step=self.step)
+                    if self.best_val_loss is None or validation_loss < self.best_val_loss:
+                        self.best_val_loss = validation_loss
+                        self.checkpoint("best.pt", metrics)
+                if self.scheduler is not None:
+                    if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                        self.scheduler.step(metrics.get("validation_loss", train_loss))
+                    else:
+                        self.scheduler.step()
+                if (self.epoch + 1) % int(training.get("checkpoint_every", 1)) == 0:
+                    self.checkpoint("epoch_{:04d}.pt".format(self.epoch + 1), metrics)
 
 
-if __name__ == '__main__':
-    path_to_config = sys.argv[1]
-    with open(path_to_config, 'r') as f: 
-        config = yaml.load(f, Loader=yaml.FullLoader)
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("config", type=Path)
+    args = parser.parse_args(argv)
+    with args.config.open("r", encoding="utf-8") as stream:
+        config = yaml.safe_load(stream)
+    base = args.config.resolve().parent
+    for key in ("manifest", "root"):
+        if config.get("data", {}).get(key):
+            value = Path(config["data"][key])
+            if not value.is_absolute():
+                config["data"][key] = str(base / value)
+    experiment = Path(config["experiment_dir"])
+    if not experiment.is_absolute():
+        config["experiment_dir"] = str(base / experiment)
+    ShapeTrainer(config).run()
 
-    trainer = ShapeTrainer(config)
-    trainer.run()
+
+if __name__ == "__main__":
+    main()
