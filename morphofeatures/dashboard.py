@@ -58,19 +58,7 @@ DOCS = {
     "Troubleshooting": ROOT / "docs" / "troubleshooting.md",
     "Reproducibility report": ROOT / "docs" / "reproducibility_report.md",
 }
-PAGES = (
-    "Overview",
-    "Analyze",
-    "Build features",
-    "Train and encode",
-    "Experiments",
-    "Scientific pipeline",
-    "Embeddings and comparison",
-    "Preprocessing",
-    "Meshes",
-    "Data and config",
-    "Documentation",
-)
+PAGES = ("Workflow", "Runs", "Results", "Tools", "Workspace settings", "Help")
 CACHE_DATA = st.cache_data if hasattr(st, "cache_data") else st.experimental_memo
 DATAFRAME_SUPPORTS_CONTAINER_WIDTH = (
     "use_container_width" in inspect.signature(st.dataframe).parameters
@@ -87,44 +75,14 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    :root {
-        --mf-ink: #1d252b;
-        --mf-muted: #617078;
-        --mf-line: #d7dde0;
-        --mf-teal: #0f766e;
-        --mf-amber: #a55f0a;
-        --mf-red: #b42318;
-        --mf-surface: #11544d;
-        --mf-bright-ink: #beebe6;
-    }
-    .stApp { color: var(--mf-bright-ink); }
-    [data-testid="stSidebar"] { border-right: 1px solid var(--mf-line); }
-    [data-testid="stSidebar"] .block-container { padding-top: 1.4rem; }
-    .block-container { padding-top: 1.8rem; padding-bottom: 3rem; }
-    h1, h2, h3 { letter-spacing: 0; color: var(--mf-bright-ink); }
-    h1 { font-size: 1.75rem; margin-bottom: 0.2rem; }
-    h2 { font-size: 1.25rem; margin-top: 0.5rem; }
-    h3 { font-size: 1rem; }
-    [data-testid="stMetric"] {
-        border-top: 3px solid var(--mf-teal);
-        border-radius: 4px;
-        padding: 0.8rem 0.9rem;
-        background: var(--mf-surface);
-    }
-    [data-testid="stMetricLabel"] { color: var(--mf-muted); }
-    [data-testid="stForm"] { border-radius: 6px; border-color: var(--mf-line); }
-    .mf-kicker { color: var(--mf-teal); font-weight: 700; font-size: 0.78rem; }
-    .mf-note {
-        border-left: 3px solid var(--mf-amber);
-        background: #fff8eb;
-        padding: 0.65rem 0.8rem;
-        color: #5c411b;
-        margin: 0.5rem 0 1rem;
-    }
-    .mf-ok { color: var(--mf-teal); font-weight: 700; }
-    .mf-bad { color: var(--mf-red); font-weight: 700; }
-    div.stButton > button { border-radius: 4px; }
-    div[data-baseweb="select"] > div { border-radius: 4px; }
+    .block-container { max-width: 1120px; padding-top: 2rem; padding-bottom: 3rem; }
+    h1 { font-size: 1.8rem; }
+    h2 { font-size: 1.35rem; }
+    h3 { font-size: 1.1rem; }
+    [data-testid="stSidebar"] { border-right: 1px solid rgba(128,128,128,0.18); }
+    .mf-kicker { font-weight: 600; font-size: 0.8rem; }
+    .mf-note { border-left: 3px solid #9a711d; padding: 0.7rem 1rem; margin: 1rem 0; }
+    .mf-ok, .mf-bad { font-weight: 600; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -226,11 +184,11 @@ def _overview(config) -> None:
         _show_dataframe(
             pd.DataFrame(
                 [
-                    ("1", "Validate inputs", "Data and config"),
-                    ("2", "Train or load embeddings", "Train and encode"),
-                    ("3", "Combine six feature groups", "Build features"),
-                    ("4", "Classify, project, or cluster", "Analyze"),
-                    ("5", "Export label-first tables", "Build features"),
+                    ("1", "Validate inputs", "Workflow / Tools → Data inspection"),
+                    ("2", "Train or load embeddings", "Workflow → Train / Analyze"),
+                    ("3", "Combine six feature groups", "Tools → Feature assembly"),
+                    ("4", "Classify, project, or cluster", "Workflow → Analyze / Tools"),
+                    ("5", "Reopen and export outputs", "Results"),
                 ],
                 columns=("stage", "operation", "workspace"),
             )
@@ -895,10 +853,12 @@ def _legacy_train_encode(config) -> None:
 
 
 def _experiments(config) -> None:
-    _header("Experiments", "Persistent jobs, scheduler state, bounded logs, metrics, and artifacts.")
-    from morphofeatures.workspace_ui import workspace_jobs
+    _header("Runs", "Track submissions, inspect outputs, and continue from a completed stage.")
+    from morphofeatures.workflow_ui import run_actions
 
-    workspace_jobs(config)
+    notice = st.session_state.pop("run_notice", None)
+    if notice:
+        st.success(notice)
     registry = JobRegistry.under_output_root(config.paths.output_root)
     filter_column, state_column, refresh_column = st.columns((2, 2, 1))
     run_filter = filter_column.text_input("Filter run ID", "")
@@ -919,7 +879,7 @@ def _experiments(config) -> None:
             st.warning("squeue/sacct are unavailable; persisted records and artifacts remain viewable.")
     records = registry.list(run_id=run_filter or None, states=states, limit=500)
     if not records:
-        st.info("No matching jobs. Create a dry run or submission on the Train and encode page.")
+        st.info("No matching runs. Open Workflow to configure and review a run.")
         return
     _show_dataframe(
         pd.DataFrame(
@@ -941,9 +901,29 @@ def _experiments(config) -> None:
         height=260,
     )
     labels = ["{} · {} · {}".format(record.run_id, record.workflow, record.id[:10]) for record in records]
-    selected = records[labels.index(st.selectbox("Inspect job", labels))]
-    details_tab, metrics_tab, logs_tab, artifacts_tab = st.tabs(("Details", "Metrics", "Logs", "Artifacts"))
-    with details_tab:
+    focus = st.session_state.pop("selected_run_id", None)
+    if focus:
+        st.session_state["run_selection"] = next((label for label, record in zip(labels, records) if record.id == focus), labels[0])
+    if st.session_state.get("run_selection") not in labels:
+        st.session_state["run_selection"] = labels[0]
+    selected = records[labels.index(st.selectbox("Inspect run", labels, key="run_selection"))]
+    if selected.workflow == "workspace_run":
+        import json
+
+        status_path = Path(selected.working_directory) / "status.json"
+        st.button("Refresh progress and logs")
+        if status_path.exists():
+            try:
+                status = json.loads(status_path.read_text())
+                st.write("Pipeline: " + status["state"])
+                _show_dataframe(pd.DataFrame(status.get("stages", [])))
+                if status.get("error"):
+                    st.error(status["error"])
+            except (OSError, ValueError, KeyError) as error:
+                st.warning(str(error))
+    run_actions(config, selected)
+    with st.expander("Execution details and configuration"):
+
         st.code(
             "command: {}\nworkdir: {}\nconfig: {}\ncheckpoint: {}\nembedding: {}\nparent: {}\nexit: {}".format(
                 format_command(selected.command),
@@ -958,7 +938,7 @@ def _experiments(config) -> None:
         )
         if selected.error_message:
             st.warning(selected.error_message)
-        if selected.application_state in {"queued", "running", "unknown"}:
+        if selected.slurm_job_id and selected.application_state in {"queued", "running", "unknown"}:
             confirmed = st.checkbox("Confirm cancellation of this SLURM job", value=False)
             if st.button("Cancel selected job", disabled=not confirmed):
                 try:
@@ -966,7 +946,7 @@ def _experiments(config) -> None:
                     st.success("Cancellation requested and retained in the registry.")
                 except Exception as error:
                     st.error(str(error))
-    with metrics_tab:
+    with st.expander("Metrics", expanded=selected.application_state == "running"):
         try:
             events = read_metric_events(Path(selected.metrics_path))
             if events:
@@ -1023,13 +1003,14 @@ def _experiments(config) -> None:
                 st.info("No structured epoch metrics are available yet.")
         except Exception as error:
             st.error(str(error))
-    with logs_tab:
-        stdout_tab, stderr_tab = st.tabs(("stdout (tail)", "stderr (tail)"))
-        with stdout_tab:
+    with st.expander("Logs"):
+        st.caption("Standard output")
+        with st.container():
             st.code(tail_text(Path(selected.stdout_path)) or "Log does not exist yet.")
-        with stderr_tab:
+        st.caption("Standard error")
+        with st.container():
             st.code(tail_text(Path(selected.stderr_path)) or "Log does not exist yet.")
-    with artifacts_tab:
+    with st.expander("Output files"):
         st.write("Explicit run artifacts (no recursive guessing):")
         _show_dataframe(pd.DataFrame({"path": selected.artifacts or (
             selected.config_snapshot,
@@ -1058,9 +1039,10 @@ def _experiments(config) -> None:
                         len(annotated.intersection(present)), len(annotated)
                     )
                 )
-                if st.button("Use this embedding on Analyze page"):
-                    st.session_state["analysis_embedding_path"] = selected.embedding_path
-                    st.success("Analysis defaults now point to this label-first embedding.")
+                if st.button("Analyze this embedding"):
+                    from morphofeatures.workflow_ui import continue_from_artifact
+
+                    continue_from_artifact(config, selected.embedding_path)
             except Exception as error:
                 st.error(str(error))
 
@@ -1142,48 +1124,89 @@ def _load_active_config(value: str):
         return load_config(), ROOT / "configs" / "default.yaml", error
 
 
-def main() -> None:
-    with st.sidebar:
-        st.title("MorphoFeatures")
-        st.caption("Scientific pipeline workspace")
-        page = st.radio("Workspace", PAGES)
-        st.markdown("---")
-        config_value = st.text_input("Pipeline config", "configs/default.yaml")
-        config, config_path, config_error = _load_active_config(config_value)
-        if config_error:
-            st.error(str(config_error))
-        else:
-            st.markdown('<span class="mf-ok">Config ready</span>', unsafe_allow_html=True)
-        st.caption("v0.2.0")
+def _workspace_settings(config, config_path):
+    from morphofeatures.workflow_ui import rerun
+    from morphofeatures.workspace_ui import retained_input
 
-    if page == "Overview":
-        _overview(config)
-    elif page == "Analyze":
-        _analyze(config)
-    elif page == "Build features":
+    _header("Workspace settings", "Choose where drafts, runs and results are stored.")
+    source = retained_input("Workspace defaults YAML", str(config_path), "settings:config")
+    root = retained_input("Workspace output directory", str(config.paths.output_root), "settings:root")
+    st.caption("Workspace defaults set shared paths and bundled-data locations. Load training and pipeline settings inside Workflow.")
+    if st.button("Apply workspace settings"):
+        try:
+            path = _resolve(source)
+            if not path.is_file():
+                raise ValueError("Workspace defaults file does not exist: " + str(path))
+            load_config(path)
+            st.session_state["active_workspace_config"] = str(path)
+            st.session_state["workspace_root"] = str(_resolve(root))
+            st.session_state.pop("workspace_plan", None)
+            rerun()
+        except Exception as error:
+            st.error(str(error))
+    st.caption("Active workspace: " + str(config.paths.output_root))
+    st.caption("In-session drafts remain associated with their workspace. Save drafts in Workflow to reopen them after a restart.")
+
+
+def _tools(config, config_path):
+    _header("Tools", "Specialist workflows, data inspection, and published feature processing.")
+    tool = st.selectbox("Tool", ("Choose a tool", "Published shape / texture workflows and MAE sweeps",
+        "Feature assembly", "Classification and projection tools", "Mesh inspection", "Data inspection and synthetic fixtures", "Runtime and bundled-data checks"))
+    if tool == "Published shape / texture workflows and MAE sweeps":
+        _legacy_train_encode(config)
+    elif tool == "Feature assembly":
         _build_features(config)
-    elif page == "Train and encode":
-        _train_encode(config)
-    elif page == "Experiments":
-        _experiments(config)
-    elif page == "Scientific pipeline":
-        from morphofeatures.workspace_ui import pipeline_page
-
-        pipeline_page(config)
-    elif page == "Embeddings and comparison":
-        from morphofeatures.workspace_ui import representations_page
-
-        representations_page(config)
-    elif page == "Preprocessing":
-        from morphofeatures.workspace_ui import preprocessing_page
-
-        preprocessing_page(config)
-    elif page == "Meshes":
+    elif tool == "Classification and projection tools":
+        st.caption("These published analysis tools compute interactively on the app host. Workflow schedules new embedding analyses locally or on Slurm.")
+        _analyze(config)
+    elif tool == "Mesh inspection":
         from morphofeatures.workspace_ui import mesh_page
 
         mesh_page(config)
-    elif page == "Data and config":
+    elif tool == "Data inspection and synthetic fixtures":
         _data_config(config, config_path)
+    elif tool == "Runtime and bundled-data checks":
+        _overview(config)
+
+
+def main() -> None:
+    from morphofeatures.workflow_ui import workflow_page
+    from morphofeatures.workspace_ui import result_browser
+
+    config_value = st.session_state.get("active_workspace_config", str(ROOT / "configs/default.yaml"))
+    config, config_path, config_error = _load_active_config(config_value)
+    if "workspace_root" not in st.session_state:
+        st.session_state["workspace_root"] = str(config.paths.output_root)
+    config = replace(config, paths=replace(config.paths, output_root=Path(st.session_state["workspace_root"])))
+    pending = st.session_state.pop("navigate_to", None)
+    if pending in PAGES:
+        st.session_state["workspace_navigation"] = pending
+    with st.sidebar:
+        st.title("MorphoFeatures")
+        st.caption("From segmented objects to representations")
+        page = st.radio("Navigate", PAGES, key="workspace_navigation")
+        if hasattr(st, "divider"):
+            st.divider()
+        else:
+            st.markdown("---")
+        st.caption("Active workspace")
+        st.caption(str(config.paths.output_root))
+        st.caption("Load and edit scientific settings in Workflow. Review & run is the submission step.")
+        if config_error:
+            st.error(str(config_error))
+
+    if page == "Workflow":
+        workflow_page(config)
+    elif page == "Runs":
+        _experiments(config)
+    elif page == "Results":
+        st.title("Results")
+        st.caption("Reopen saved analyses and embeddings. Opening a result does not repeat extraction or analysis.")
+        result_browser(config)
+    elif page == "Tools":
+        _tools(config, config_path)
+    elif page == "Workspace settings":
+        _workspace_settings(config, config_path)
     else:
         _documentation()
 

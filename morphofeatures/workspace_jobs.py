@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from copy import deepcopy
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import yaml
@@ -22,22 +23,31 @@ from morphofeatures.registry import JobRecord, JobRegistry
 from morphofeatures.slurm import ClusterProfile, SlurmScheduler, render_slurm_script
 
 
-def resolve_job(document, base):
+def resolve_job(document, base, *, validate=True):
     document = deepcopy(document)
     stages = document.get("stages")
     if not isinstance(stages, list) or not stages:
         raise ValueError("Job requires a nonempty stages list")
     available = set()
     named_embeddings = set()
+    prepared = None
     for stage in stages:
+        if not isinstance(stage, dict):
+            raise ValueError("Each pipeline stage must be a YAML mapping")
         for link, required in (
             ("from_preprocessing", "preprocess"),
             ("from_training", "train"),
             ("from_extraction", "extract"),
         ):
-            if stage.get(link) and required not in available:
+            if validate and stage.get(link) and required not in available:
                 raise ValueError(f"{link} requires an earlier {required} stage")
-        if stage.get("action") not in {"train", "extract", "analyze", "compare", "preprocess"}:
+        if validate and stage.get("action") not in {
+            "train",
+            "extract",
+            "analyze",
+            "compare",
+            "preprocess",
+        }:
             raise ValueError(f"Unsupported stage action: {stage.get('action')}")
         if "config" in stage:
             stage["config"] = (
@@ -64,14 +74,31 @@ def resolve_job(document, base):
                 k: str((Path(base) / Path(v).expanduser()).resolve())
                 for k, v in stage["embeddings"].items()
             }
-        if stage["action"] == "train" and not stage.get("from_preprocessing"):
+        if not validate:
+            continue
+        if stage["action"] == "train":
             if "config" not in stage:
                 raise ValueError("Training requires config")
-            stage["config"] = validate_training(stage["config"], base)
+            if stage.get("from_preprocessing"):
+                if stage["config"].get("data", {}).get("source") == "n5_masked_patches":
+                    raise ValueError(
+                        "Prepared whole-object crops require a crop MAE configuration, not grouped N5"
+                    )
+                config = deepcopy(stage["config"])
+                shape = prepared.get("crop_shape", [32, 32, 32])
+                config.setdefault("mae", {}).setdefault("input_shape", shape)
+                if list(config["mae"]["input_shape"]) != list(shape):
+                    raise ValueError(
+                        "Training input shape must match the preceding preparation crop shape"
+                    )
+                stage["config"] = validate_training(config, base, require_data=False)
+            else:
+                stage["config"] = validate_training(stage["config"], base)
         if stage["action"] == "preprocess":
             from morphofeatures.data.preprocessing import validate_preprocessing
 
             validate_preprocessing(stage)
+            prepared = stage
         if stage["action"] == "extract":
             if stage.get("model", "mae") not in {"mae", "dinov2", "dinov3"}:
                 raise ValueError("Extraction model must be mae, dinov2, or dinov3")
@@ -137,18 +164,50 @@ def scope_training_outputs(config, destination):
     return config
 
 
-def submit_job(document, *, output_root, run_id, execution="local", base=None, dependency=None):
-    """Validate, snapshot, register, and launch without blocking the caller."""
+@dataclass(frozen=True)
+class WorkspacePlan:
+    """A reviewed snapshot. Planning never allocates a run or opens the registry."""
+
+    record: JobRecord
+    submitted_yaml: str
+    resolved_yaml: str
+    script: str
+    environment: tuple
+    execution: str
+    cpus: int
+    fingerprint: str
+
+
+def submission_fingerprint(document, *, output_root, run_id, execution, dependency=None):
+    payload = {
+        "document": document,
+        "output_root": str(Path(output_root).expanduser().resolve()),
+        "run_id": run_id,
+        "execution": execution,
+        "dependency": dependency or None,
+    }
+    return hashlib.sha256(yaml.safe_dump(payload, sort_keys=True).encode()).hexdigest()
+
+
+def plan_workspace_job(
+    document, *, output_root, run_id, execution="local", base=None, dependency=None
+):
+    """Validate and render the exact submission without persisting anything."""
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", run_id):
         raise ValueError("Run ID requires 1–80 letters, digits, dots, underscores or dashes")
     if execution not in {"local", "slurm", "dry-run"}:
         raise ValueError("execution must be local, slurm, or dry-run")
     if dependency and execution != "slurm":
         raise ValueError("Job dependencies require SLURM; use stages for a local pipeline")
+    if dependency and not re.fullmatch(r"[0-9]+(?:_[0-9]+)?", dependency):
+        raise ValueError("Dependency must be a Slurm job ID")
+    fingerprint = submission_fingerprint(
+        document, output_root=output_root, run_id=run_id, execution=execution, dependency=dependency
+    )
     document = resolve_job(document, base or repository_root())
     profile = ClusterProfile.from_mapping("workspace", document.get("slurm", {}))
-    folder = Path(output_root).resolve() / "experiments" / run_id / "workspace"
-    registry = JobRegistry.under_output_root(output_root)
+    output_root = Path(output_root).expanduser().resolve()
+    folder = output_root / "experiments" / run_id / "workspace"
     source = folder / "job.yaml"
     interpreter = profile.python_executable or sys.executable
     command = (interpreter, "-m", "morphofeatures", "workspace-run", "--config", str(source))
@@ -174,14 +233,11 @@ def submit_job(document, *, output_root, run_id, execution="local", base=None, d
         if stage["action"] == "train" and stage.get("config"):
             stage["config"] = scope_training_outputs(stage["config"], folder / f"{index:02d}-train")
     document["worker"] = {
-        "registry": str(registry.path.resolve()),
+        "registry": str(output_root / ".morphofeatures" / "registry.sqlite3"),
         "record_id": record.id,
         "directory": str(folder),
         "execution": execution,
     }
-    folder.mkdir(parents=True, exist_ok=False)
-    (folder / "submitted_settings.yaml").write_text(yaml.safe_dump(submitted, sort_keys=False))
-    source.write_text(yaml.safe_dump(document, sort_keys=False))
     environment = {
         METRICS_ENV: record.metrics_path,
         "PYTHONUNBUFFERED": "1",
@@ -197,18 +253,47 @@ def submit_job(document, *, output_root, run_id, execution="local", base=None, d
         stderr_path=Path(record.stderr_path),
         environment=environment,
     )
+    return WorkspacePlan(
+        record=record,
+        submitted_yaml=yaml.safe_dump(submitted, sort_keys=False),
+        resolved_yaml=yaml.safe_dump(document, sort_keys=False),
+        script=script,
+        environment=tuple(environment.items()),
+        execution=execution,
+        cpus=profile.cpus,
+        fingerprint=fingerprint,
+    )
+
+
+def submit_workspace_plan(plan, *, expected_fingerprint, dry_run=False):
+    """Persist a reviewed plan and launch once; reject stale reviews and collisions."""
+    if expected_fingerprint != plan.fingerprint:
+        raise ValueError("Settings changed after review. Review the run again before submitting.")
+    document = yaml.safe_load(plan.resolved_yaml)
+    execution = "dry-run" if dry_run else plan.execution
+    document["worker"]["execution"] = execution
+    record = replace(
+        plan.record, application_state="dry_run" if execution == "dry-run" else "queued"
+    )
+    folder = Path(record.working_directory)
+    # Atomic reservation also protects against double clicks and concurrent sessions.
+    folder.mkdir(parents=True, exist_ok=False)
+    registry = JobRegistry(Path(document["worker"]["registry"]))
+    (folder / "submitted_settings.yaml").write_text(plan.submitted_yaml)
+    Path(record.config_snapshot).write_text(yaml.safe_dump(document, sort_keys=False))
     script_path = folder / "job.slurm"
-    script_path.write_text(script)
+    script_path.write_text(plan.script)
     registry.create(record)
+    environment = dict(plan.environment)
     try:
         if execution == "local":
-            environment.update(OMP_NUM_THREADS=str(profile.cpus), MKL_NUM_THREADS=str(profile.cpus))
+            environment.update(OMP_NUM_THREADS=str(plan.cpus), MKL_NUM_THREADS=str(plan.cpus))
             with (
                 Path(record.stdout_path).open("ab") as stdout,
                 Path(record.stderr_path).open("ab") as stderr,
             ):
                 process = subprocess.Popen(
-                    command,
+                    record.command,
                     cwd=folder,
                     env={**os.environ, **environment},
                     stdout=stdout,
@@ -217,14 +302,27 @@ def submit_job(document, *, output_root, run_id, execution="local", base=None, d
                 )
             write_json_atomic(folder / "process.json", {"pid": process.pid, "started": utc_now()})
         elif execution == "slurm":
-            job_id = SlurmScheduler().submit(script_path, dependency)
-            registry.update(record.id, slurm_job_id=job_id, submitted_at=utc_now())
+            job_id = SlurmScheduler().submit(script_path, record.dependency_job_id)
+            record = registry.update(record.id, slurm_job_id=job_id, submitted_at=utc_now())
     except Exception as error:
         registry.update(
             record.id, application_state="failed", error_message=str(error), completed_at=utc_now()
         )
         raise
     return record
+
+
+def submit_job(document, *, output_root, run_id, execution="local", base=None, dependency=None):
+    """CLI-compatible convenience wrapper around shared planning and submission."""
+    plan = plan_workspace_job(
+        document,
+        output_root=output_root,
+        run_id=run_id,
+        execution=execution,
+        base=base,
+        dependency=dependency,
+    )
+    return submit_workspace_plan(plan, expected_fingerprint=plan.fingerprint)
 
 
 def run_job(path):

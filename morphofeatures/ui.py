@@ -54,7 +54,7 @@ def dashboard_path() -> Path:
 
 
 def build_streamlit_command(
-    port: int = 8501, address: str = "localhost", headless: bool = False
+    port: int = 1010, address: str = "localhost", headless: bool = False
 ) -> List[str]:
     return [
         sys.executable,

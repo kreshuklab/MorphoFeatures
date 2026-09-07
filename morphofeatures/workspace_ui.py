@@ -392,14 +392,20 @@ def extraction_defaults():
 
 def result_browser(config):
     records = JobRegistry.under_output_root(config.paths.output_root).list(limit=500)
-    options = ["Enter path"] + [p for record in records for p in record.artifacts]
-    chosen = st.selectbox("Registered results (local and SLURM)", options)
+    options = ["Enter path"] + list(dict.fromkeys(
+        p for record in records for p in record.artifacts
+        if Path(p).suffix in {".json", ".npz", ".npy", ".tsv", ".csv"}
+    ))
+    if st.session_state.get("results:registered") not in options:
+        st.session_state["results:registered"] = "Enter path"
+    chosen = st.selectbox("Registered results (local and Slurm)", options, key="results:registered")
     manual = retained_input(
         "Saved analysis.json, comparison.json, or embedding file", "", "results:path"
     )
     path = Path(chosen if chosen != "Enter path" else manual).expanduser()
     if not str(manual).strip() and chosen == "Enter path":
         return
+    path = (repository_root() / path).resolve()
     try:
         if path.suffix == ".json":
             metadata = json.loads(path.read_text())
@@ -485,6 +491,11 @@ def result_browser(config):
         from morphofeatures.representation_analysis import nearest_neighbors
 
         reference = load_embeddings(next(iter(embeddings.values())))
+        selected_embedding = st.selectbox("Embedding to use in a new workflow", list(embeddings))
+        if st.button("Analyze these embeddings in a new workflow"):
+            from morphofeatures.workflow_ui import continue_from_artifact
+
+            continue_from_artifact(config, embeddings[selected_embedding])
         neighbor_normalization = (
             metadata.get("settings", {}).get("normalization", "standardize")
             if path.suffix == ".json"

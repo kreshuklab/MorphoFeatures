@@ -29,7 +29,8 @@ The result is a label-first `(n_cells, 481)` array: column 0 is `label_id`, and 
 - Optional WandB logging, disabled by default.
 - Pragmatic 3D MAE with the same train, encode, aggregate, export, and evaluate interface.
 - Deterministic synthetic 3D fixture generator and automated smoke tests.
-- Streamlit workspace for analysis, feature building, configuration, and documentation.
+- Guided Streamlit workspace: connected pipeline stages, saved drafts, exact run review,
+  local/Slurm submission, and shared Runs and Results browsers.
 - SLURM-safe experiment previews/submission, SQLite job persistence, scheduler refresh,
   bounded log tails, structured metrics, and explicit artifact inspection.
 - Ordered, visualization-rich notebooks for contracts, CPU MAE training/encoding, biological
@@ -61,6 +62,22 @@ python -m morphofeatures project --subset 256 --umap-epochs 50 \
 ```
 
 For the published Leiden workflow, install the `analysis` extra and use `--cluster-method leiden`.
+
+## Workflow UI
+
+```bash
+python -m morphofeatures ui
+```
+
+Start in **Workflow** with raw volumes, prepared data, a checkpoint, or saved
+embeddings. Configure the relevant stages, then use **Review & run** to inspect
+the exact settings and command before running locally or submitting to Slurm.
+**Save draft** preserves edits for later; **Save dry-run bundle** saves a run
+snapshot without executing it. Follow progress in **Runs** and reopen outputs
+in **Results**. Specialist workflows and sweeps remain in **Tools**.
+
+See [the workspace guide](docs/workspace_workflows.md) and
+[UI design notes](docs/ui_redesign.md).
 
 ## Installation groups
 
@@ -204,14 +221,14 @@ The Streamlit lifecycle is:
 validate inputs → configure → preview → submit → monitor → encode → inspect → analyze/export
 ```
 
-`Train and encode` supports shape, texture, and MAE training/encoding. It previews the exact
-argument-list-derived command and SLURM script, saves immutable configuration snapshots, and
-defaults to a non-executing dry run. `Experiments` reads the persistent SQLite registry below
-the output root, refreshes active jobs through `squeue`/`sacct`, displays JSONL loss curves and
-bounded log tails, and passes completed embeddings into the existing analysis pages. Real
-submission occurs only after pressing **Submit to SLURM**; widget reruns never submit jobs.
+`Workflow → Review & run` previews the exact worker configuration, command and Slurm
+script. Review does not reserve a run ID. Saving a dry-run bundle creates an immutable
+snapshot without execution. `Runs` reads the shared SQLite registry, refreshes jobs through
+`squeue`/`sacct`, displays metrics and logs, and passes completed artifacts into a new workflow.
+Only **Run locally** or **Submit to Slurm** launches work; navigation never submits jobs.
+Published shape/texture workflows retain their existing adapters under `Tools`.
 
-For real-data MAE training, the page also supports a bounded, allowlisted soft grid. The default
+For real-data MAE training, `Tools` also provides the existing bounded, allowlisted soft grid. The default
 one-at-a-time mode can compare learning rates/schedulers, linear versus 3D ResNet patch encoders,
 embedding and reconstruction dimensions, and normalization without hiding settings in callbacks.
 Each variant is a normal persistent job; optional encoding is queued with an `afterok` dependency.

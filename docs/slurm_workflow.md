@@ -9,6 +9,13 @@ python -m pip install -e ".[ui]"
 python -m morphofeatures ui --headless --address 127.0.0.1
 ```
 
+For connected preprocessing, MAE training, extraction and analysis, use
+**Workflow → Review & run**. **Review run** builds an exact preview without
+reserving a run ID. **Save dry-run bundle** persists it without execution;
+**Submit to Slurm** submits the reviewed settings and opens the run record.
+The [workspace guide](workspace_workflows.md) describes this shared workflow.
+The details below also cover the retained specialist training/sweep adapters.
+
 The intended lifecycle is:
 
 ```text
@@ -16,7 +23,7 @@ validate inputs → configure experiment → preview → submit training → mon
 → select checkpoint → submit encoding → inspect embedding → analyze/export
 ```
 
-The `Train and encode` page supports the existing shape, texture, and MAE training/encoding
+The **Tools → Published shape / texture workflows and MAE sweeps** tool supports the existing shape, texture, and MAE training/encoding
 schemas. It does not flatten them into a universal scientific config. Shape/MAE YAML is copied
 to an immutable run snapshot; recognized texture YAML files are copied together. Relative input
 paths are made absolute before the snapshot is saved.
@@ -154,7 +161,7 @@ embedding; compare reconstruction structure, stability, and the same ID-aligned 
 
 ## Monitoring and states
 
-The `Experiments` page filters jobs/runs and refreshes active numeric IDs in a single manual
+The **Runs** page filters jobs/runs and refreshes active numeric IDs in a single manual
 operation. `squeue` supplies active states; IDs absent there are queried through `sacct`.
 
 - `queued`: pending/configuring/requeued.
@@ -172,7 +179,7 @@ Log views read at most 64 KiB and 200 lines. Metrics are append-only JSON Lines;
 written final line is ignored while training continues. Shape, texture, and MAE trainers preserve
 console/WandB behavior while emitting epoch, loss, validation loss when available, learning rate,
 checkpoint, completion, and controlled failure events. The real N5 MAE additionally emits named
-preprocessing stages and bounded batch-level throughput/ETA events. The Experiments page displays
+preprocessing stages and bounded batch-level throughput/ETA events. The Runs page displays
 the latest event, current phase progress, and the latest 100 structured events without reading an
 unbounded log.
 

@@ -18,39 +18,83 @@ its upstream dependencies must be available in the worker environment. No DINO
 code or weights are downloaded implicitly. The mesh page needs `trimesh` and
 `plotly`, both included in the `workspace` extra.
 
-## Configure and train
+## Guided workspace
 
-On **Train and encode → Persistent training configuration**, load an MAE YAML
-file. All document fields are retained; scalar fields have controls and lists
-or unset values accept YAML. The full YAML editor allows additional fields.
+The main destinations are **Workflow**, **Runs**, and **Results**. **Tools** keeps
+published shape/texture workflows, feature assembly, classification/projection,
+MAE sweeps, meshes and data inspection available. **Workspace settings** selects
+one output directory shared by drafts, submissions and result lookup. Workspace
+defaults are distinct from the scientific settings loaded into a workflow.
+
+In **Workflow**, choose your starting point: raw aligned volumes, prepared crops
+or grouped N5 patches, an existing checkpoint, saved embeddings, or an explicit
+synthetic demonstration. Preparation, training, extraction and analysis share
+one draft. The stage navigator shows what will run; moving between its steps
+never starts processing. Existing artifacts let you enter at later stages.
+
+Essential settings are visible in each stage. Expand advanced sections for
+architecture, grouped data, extraction, evaluation and execution details. Full
+pipeline YAML remains available for custom fields, repeated stages and named
+representation comparisons. An edited YAML buffer must be applied explicitly;
+if the form changes, reload the buffer before applying it. Invalid YAML leaves
+the current draft intact.
+
+### Load, edit and save settings
+
+**Preview settings to load** reads a training configuration or pipeline YAML.
+The preview names the source and stages. **Load settings into draft**, or
+**Replace current draft settings**, applies it. Editing the path alone does not
+load a file. Training and extraction also offer **Load model / data settings**
+for replacing the model/data configuration of a single stage.
+
 The site reference `configs/sites/mae_platynereis_nuclei_embl.yaml` is supported.
-Its selected profile is resolved *before editing*, so an edited epoch count is
-not subsequently overwritten by `profiles.full`. Alternative profiles remain
-in the exported document. To change profiles, choose one when loading the base
-file again.
+Its active profile is resolved before editing, so edits are not overwritten by
+`profiles.full` during submission. Alternative profiles and additional fields
+are retained. Checkpoint resume is an explicit path in advanced training
+settings and is supported by grouped N5 MAE; whole-crop MAE rejects resume.
+Loading a configuration or cloning a run does not implicitly resume training.
 
-Edits and execution settings survive navigation through ordinary Streamlit
-session state stored independently of widget state. Export downloads YAML.
-The latest submitted settings are also saved under
-`<output_root>/.morphofeatures/training-last.json`; **Restore most recently
-submitted settings** works after an app restart. Unsaved drafts survive page
-navigation within a session, not a browser/server restart.
+**Save draft** persists the document and UI settings under
+`<workspace>/.morphofeatures/drafts/<draft_id>.json`. Saved drafts can be reopened
+from **Start** after restarting the app. Unsaved changes survive navigation in
+the same session. Concurrent saves detect conflicting versions. **Download
+pipeline YAML** exports the runnable document without changing its source file.
+Linked crop shapes are derived consistently for export and submission.
 
-Restoring settings does not resume training. The separate resume control must
-be enabled, with `training.resume_from` set, for grouped N5 MAE checkpoint
-resume. Whole-crop MAE currently rejects resume. Legacy shape/texture workflows
-and sweeps remain available in the adjacent tab; their existing editor and
-execution behavior are retained.
+**Change which stages run** can stop a workflow early, append extraction or
+analysis, replace training with an existing model, or turn standalone analysis
+into a comparison. Stage changes can be undone. Completed outputs can be chosen
+from a stage's artifact selector or from **Runs → Use this output in a new
+workflow**. Crops, IDs, masks, model settings and checkpoints are carried forward
+where the recorded output supplies them.
 
-Output root and run ID determine a fresh experiment directory. Run-specific
-checkpoint, log, split-manifest and metadata paths are relocated there, as in
-the existing experiment manager. `submitted_settings.yaml` preserves the
-submitted document; `job.yaml` contains resolved job settings, and each trained
-model has `resolved_config.yaml`. Other configuration fields are preserved.
-Use a new run ID for each variant. Existing run directories cannot be overwritten.
-Dataset paths, model dimension/head compatibility, crop shapes, optimizer
-parameters, supported resume behavior, and relevant resource settings are
-validated before launch. Additional model checks occur in the worker.
+### Review and submit
+
+Open **Review & run** to name the run and choose local execution or Slurm.
+Slurm resources are configured once for the whole workflow; cluster presets
+are separate from training profiles. Ordered stages run sequentially in one
+allocation and share its resources.
+
+**Review run** validates the configuration and renders the resolved worker YAML,
+command and Slurm script without reserving a run ID or creating a registry
+entry. The preview shows the stage order, directories and changes from loaded
+settings. Changing settings invalidates the review.
+
+After review, **Run locally** starts a detached process on the app host;
+**Submit to Slurm** calls `sbatch` and shows the returned job ID. **Save dry-run
+bundle** saves the configuration/script and a dry-run record without launching
+work. Saving a dry run reserves its run ID: clone it with **Use settings for a
+new run** to make a later submission under a fresh ID.
+
+The destination is `<workspace>/experiments/<run_id>/workspace`. Training
+checkpoint, log, split and metadata paths are scoped to that run.
+`submitted_settings.yaml` preserves submitted settings; `job.yaml` contains the
+resolved worker document, and each trained model has `resolved_config.yaml`.
+Existing run directories cannot be overwritten. Invalid inputs and stale reviews
+are rejected before launch; double submissions cannot allocate the same run.
+
+See [the UI design notes](ui_redesign.md) for the navigation mapping, state
+contract and implementation rationale.
 
 ## Local jobs, CLI, and SLURM
 
@@ -64,7 +108,7 @@ python -m morphofeatures workspace-submit \
 ```
 
 Local submission returns immediately and runs a separate Python process.
-**Experiments** shows persisted state, stage results, logs, and metrics. Use
+**Runs** shows persisted state, stage results, logs, and metrics. Use
 **Refresh progress and logs** while a job runs. Training reports batch/epoch
 events; extraction reports object or batch progress; preprocessing reports
 scanned blocks and object outcomes. Exceptions mark the stage/job failed and
@@ -111,8 +155,9 @@ The SQLite registry and existing SLURM renderer/scheduler are reused.
 
 ## Extract, analyze, reopen, export
 
-In **Embeddings and comparison → Extract**, load the model configuration, edit
-`config.data` to identify the target crops or N5 objects, and set the checkpoint.
+In **Workflow → Analyze → Extract embeddings**, load the model configuration,
+identify the target crops or N5 objects, and set the checkpoint. A linked training
+stage supplies its checkpoint and data automatically.
 For MAE, the architecture must match the checkpoint. Extraction preserves the
 object IDs supplied by the data source. A whole-crop checkpoint and a grouped
 N5 checkpoint have different input contracts and are not interchangeable.
@@ -140,7 +185,7 @@ Install the `analysis` extra for Leiden. PCA and clustering are always saved;
 disable UMAP for very small inputs. The worker exports `analysis.json`,
 `coordinates.tsv`, matched `embeddings.npz`, and `projection.svg`.
 
-**Reopen results** loads registered local/SLURM outputs or an explicit
+**Results** loads registered local/SLURM outputs or an explicit
 `analysis.json`, `comparison.json`, or embedding file. No inference is repeated.
 Plots show IDs in tooltips. Comparison panels share ID-based selection: click
 the first plot to highlight corresponding objects across panels. Neighbor
@@ -166,8 +211,9 @@ unlisted variants are not accepted. See the official
 
 `configs/workspace_comparison.example.yaml` extracts MAE and DINO representations
 for one target configuration, then compares the named outputs. Replace paths,
-remove unavailable representations, and submit through the CLI or load it on
-**Scientific pipeline**. The **Compare** tab also accepts already cached files.
+remove unavailable representations, and submit through the CLI or load it from
+**Workflow → Start**. For already cached files, start from saved embeddings and
+choose **Change which stages run → Compare multiple saved representations**.
 
 The 3D-to-2D procedure is explicit and configurable:
 
@@ -219,7 +265,7 @@ projections or silhouette scores do not establish a better representation.
 
 ## Standardized preprocessing
 
-**Preprocessing** and CLI `action: preprocess` call the same function. Accepted
+**Workflow → Prepare data** and CLI `action: preprocess` call the same function. Accepted
 sources are HDF5, N5, Zarr, and NPY with explicit dataset keys, axis order,
 channel, shared voxel spacing, origin, and unit. The implementation validates
 spatial shapes, keys/channels, axes (including HDF5 `DIMENSION_LABELS` when
@@ -322,7 +368,7 @@ distributed task queue.
 
 ## Meshes
 
-The separate **Meshes** page loads triangle meshes, preserves available object
+**Tools → Mesh inspection** loads triangle meshes, preserves available object
 IDs or accepts a supplied ID, and displays a Plotly surface. An affine
 `mesh_to_world_xyz` transforms mesh XYZ vertices into the units shared with raw
 spacing/origin (ZYX). Raw samples use nearest-voxel or trilinear interpolation
