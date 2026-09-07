@@ -42,3 +42,29 @@ python -m morphofeatures combine group1.npy group2.npy group3.npy \
 ```
 
 The command sorts label IDs, verifies exact alignment, and refuses mismatched groups.
+
+## Structured run metrics
+
+Shape, texture, and MAE training preserve console output and optional WandB logging while also
+appending JSON Lines events to `metrics.jsonl` beside the experiment/checkpoint. Each complete
+line is independently readable during a running job and records timestamps, epoch/step, training
+loss, validation loss when available, learning rate, checkpoints, and final/controlled-failure
+events. The Streamlit monitor ignores only a partially written last line.
+
+For SLURM previews, snapshots, persistence, dependencies, monitoring, and safe resubmission, see
+`docs/slurm_workflow.md`.
+
+## MAE crop and foreground-mask contract
+
+For MAE training, `data.crops` contains fixed finite intensity inputs and `data.label_ids`
+contains one unique segmentation ID per crop. Segmentation-masked cell/nucleus windows should
+also provide `data.loss_masks`; this keeps random patch masking but restricts reconstruction MSE
+to target-object voxels. The saved crop manifest should record bounds/center, crop coverage,
+foreground fraction, resolution, normalization, source datasets, and selection exclusions.
+
+Notebook 02 demonstrates the full crop contract on segmented synthetic cells. Notebook 04 uses
+the indexed real N5 adapter for 11,382 cell-associated nuclei, including lazy reads, group splits,
+raw/masked alignment, quick training, SLURM preview, per-ID encoding, and annotation joins. The
+[legacy workspace inventory](legacy_workspaces_inventory.md) records inspected code/data,
+licenses, duplicates, QC, and uncertainties; the earlier [ROI inventory](platyneris_data_inventory.md)
+documents volume-to-crop preparation. Neither implies exact historical recovery.

@@ -7,15 +7,14 @@ import importlib.util
 import json
 import pickle
 from pathlib import Path
+import shutil
 from typing import Optional, Sequence
 
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 
 from morphofeatures.analysis.classification import (
-    cross_validate_logistic,
-    load_class_labels,
-    select_labeled_embeddings,
+    evaluate_embedding_classifier,
 )
 from morphofeatures.analysis.context import aggregate_neighbors, agglomerate_features
 from morphofeatures.analysis.projection import cluster_embeddings, compute_umap
@@ -53,12 +52,19 @@ def _classify(args: argparse.Namespace) -> int:
         args.embedding, config.paths.analysis_data / "morphofeatures_all_cells.npy"
     )
     labels_path = _path(args.labels, config.paths.analysis_data / "class_labels.tsv")
-    embeddings = load_embeddings(embedding_path)
-    ids, labels, class_names = load_class_labels(labels_path, args.skip_type)
-    features, labels = select_labeled_embeddings(embeddings, ids, labels)
-    features = StandardScaler().fit_transform(features)
-    result = cross_validate_logistic(
-        features, labels, class_names, folds=args.folds, seed=args.seed, max_iter=args.max_iter
+    result = evaluate_embedding_classifier(
+        embedding_path,
+        labels_path,
+        output_dir=Path(args.output_dir).resolve() if args.output_dir else None,
+        model=args.model,
+        folds=args.folds,
+        seed=args.seed,
+        max_iter=args.max_iter,
+        c=args.c,
+        class_weight=None if args.class_weight == "none" else args.class_weight,
+        hidden_dimensions=args.hidden_dimensions,
+        minimum_class_count=args.minimum_class_count,
+        skip_types=args.skip_type,
     )
     print("accuracy mean={:.4f} std={:.4f}".format(result.mean_accuracy, result.std_accuracy))
     print("classes={}".format(",".join(result.class_names)))
@@ -112,6 +118,16 @@ def _synthetic(args: argparse.Namespace) -> int:
     return 0
 
 
+def _n5_inventory(args: argparse.Namespace) -> int:
+    from morphofeatures.data.n5 import write_n5_inventory
+
+    destination = write_n5_inventory(
+        [Path(path) for path in args.containers], Path(args.output)
+    )
+    print("N5 metadata inventory written to {}".format(destination.resolve()))
+    return 0
+
+
 def _doctor(_: argparse.Namespace) -> int:
     optional = (
         "umap",
@@ -128,6 +144,8 @@ def _doctor(_: argparse.Namespace) -> int:
     )
     for module in optional:
         print("{:<16} {}".format(module, "available" if importlib.util.find_spec(module) else "missing"))
+    for command in ("sbatch", "squeue", "sacct", "scancel"):
+        print("{:<16} {}".format(command, "available" if shutil.which(command) else "missing"))
     return 0
 
 
@@ -173,6 +191,51 @@ def _mae_encode(args: argparse.Namespace) -> int:
     return 0
 
 
+def _mae_sweep_prepare(args: argparse.Namespace) -> int:
+    from morphofeatures.mae_sweep import prepare_soft_grid
+
+    config = load_config(Path(args.pipeline_config) if args.pipeline_config else None)
+    prepared = prepare_soft_grid(
+        Path(args.config),
+        Path(args.sweep),
+        output_root=Path(args.output_root).resolve() if args.output_root else config.paths.output_root,
+        profile=args.profile,
+    )
+    print("Prepared {} variants in {}".format(len(prepared.variants), prepared.manifest_path))
+    return 0
+
+
+def _mae_sweep_compare(args: argparse.Namespace) -> int:
+    from morphofeatures.mae_sweep import (
+        compare_soft_grid_classifiers,
+        plot_soft_grid_metrics,
+        summarize_soft_grid,
+    )
+
+    sweep = Path(args.sweep).resolve()
+    output = Path(args.output).resolve()
+    frame = summarize_soft_grid(sweep, output=output)
+    print(frame.to_string(index=False))
+    if args.plot:
+        plot_soft_grid_metrics(sweep, Path(args.plot).resolve())
+        print("Saved metric comparison to {}".format(Path(args.plot).resolve()))
+    if args.labels:
+        classifier_output = output.with_name(
+            output.stem + "_classifiers" + output.suffix
+        )
+        classifiers = compare_soft_grid_classifiers(
+            sweep,
+            Path(args.labels).resolve(),
+            output=classifier_output,
+            model=args.classifier_model,
+            folds=args.folds,
+            seed=args.seed,
+        )
+        print(classifiers.to_string(index=False))
+        print("Saved classifier comparison to {}".format(classifier_output))
+    return 0
+
+
 def _shape_train(args: argparse.Namespace) -> int:
     from morphofeatures.shape.train_shape_model import main as shape_main
 
@@ -183,7 +246,10 @@ def _shape_train(args: argparse.Namespace) -> int:
 def _shape_encode(args: argparse.Namespace) -> int:
     from morphofeatures.shape.generate_shape_embeddings import main as shape_main
 
-    shape_main(["--config", str(args.config), "--save-to", str(args.output)])
+    forwarded = ["--config", str(args.config), "--save-to", str(args.output)]
+    if args.checkpoint:
+        forwarded.extend(("--checkpoint", str(args.checkpoint)))
+    shape_main(forwarded)
     return 0
 
 
@@ -193,6 +259,8 @@ def _texture_train(args: argparse.Namespace) -> int:
     forwarded = [str(args.experiment), "--device", args.device]
     if args.from_checkpoint:
         forwarded.append("--from-checkpoint")
+    if args.checkpoint:
+        forwarded.extend(("--checkpoint", str(args.checkpoint)))
     texture_main(forwarded)
     return 0
 
@@ -205,7 +273,29 @@ def _texture_encode(args: argparse.Namespace) -> int:
         forwarded.append("--save-patches")
     if args.aggregate:
         forwarded.append("--aggregate-patches")
+    if args.checkpoint:
+        forwarded.extend(("--checkpoint", str(args.checkpoint)))
+    if args.output:
+        forwarded.extend(("--output", str(args.output)))
     texture_main(forwarded)
+    return 0
+
+
+def _workspace_run(args):
+    from morphofeatures.workspace_jobs import run_job
+
+    print(run_job(args.config))
+    return 0
+
+
+def _workspace_submit(args):
+    import yaml
+    from morphofeatures.workspace_jobs import submit_job
+
+    record = submit_job(yaml.safe_load(args.config.read_text()), output_root=args.output_root,
+                        run_id=args.run_id, execution=args.execution,
+                        base=args.config.resolve().parent, dependency=args.dependency)
+    print(json.dumps({"id": record.id, "directory": record.working_directory}))
     return 0
 
 
@@ -213,18 +303,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="morphofeatures", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    worker = subparsers.add_parser("workspace-run", help="Run a saved scientific pipeline")
+    worker.add_argument("--config", required=True, type=Path)
+    worker.set_defaults(handler=_workspace_run)
+    launch = subparsers.add_parser("workspace-submit", help="Submit a pipeline locally or to SLURM")
+    launch.add_argument("--config", required=True, type=Path)
+    launch.add_argument("--output-root", required=True, type=Path)
+    launch.add_argument("--run-id", required=True)
+    launch.add_argument("--execution", choices=("local", "slurm", "dry-run"), default="local")
+    launch.add_argument("--dependency", help="SLURM afterok job ID")
+    launch.set_defaults(handler=_workspace_submit)
     validate = subparsers.add_parser("validate", help="Validate bundled paper artifacts")
     validate.add_argument("--config")
     validate.add_argument("--json", action="store_true")
     validate.set_defaults(handler=_validate)
 
-    classify = subparsers.add_parser("classify", help="Run deterministic logistic-regression CV")
+    classify = subparsers.add_parser("classify", help="Evaluate a shallow embedding classifier")
     classify.add_argument("--embedding")
     classify.add_argument("--labels")
     classify.add_argument("--config")
     classify.add_argument("--folds", type=int, default=5)
     classify.add_argument("--seed", type=int, default=42)
     classify.add_argument("--max-iter", type=int, default=2000)
+    classify.add_argument("--model", choices=("logistic", "mlp"), default="logistic")
+    classify.add_argument("--c", type=float, default=1.0, help="Logistic inverse regularization")
+    classify.add_argument("--class-weight", choices=("none", "balanced"), default="balanced")
+    classify.add_argument("--hidden-dimensions", type=int, nargs="+", default=(64,))
+    classify.add_argument("--minimum-class-count", type=int, default=2)
+    classify.add_argument("--output-dir")
     classify.add_argument("--skip-type", action="append", default=[])
     classify.set_defaults(handler=_classify)
 
@@ -246,6 +352,13 @@ def build_parser() -> argparse.ArgumentParser:
     synthetic.add_argument("output")
     synthetic.add_argument("--seed", type=int, default=42)
     synthetic.set_defaults(handler=_synthetic)
+
+    n5_inventory = subparsers.add_parser(
+        "n5-inventory", help="Inspect N5 metadata without reading dataset chunks"
+    )
+    n5_inventory.add_argument("containers", nargs="+")
+    n5_inventory.add_argument("--output", required=True)
+    n5_inventory.set_defaults(handler=_n5_inventory)
 
     doctor = subparsers.add_parser("doctor", help="Report optional runtime capabilities")
     doctor.set_defaults(handler=_doctor)
@@ -282,6 +395,30 @@ def build_parser() -> argparse.ArgumentParser:
     mae_encode.add_argument("--output", required=True)
     mae_encode.set_defaults(handler=_mae_encode)
 
+    sweep_prepare = subparsers.add_parser(
+        "mae-sweep-prepare", help="Expand a bounded MAE soft grid into immutable configs"
+    )
+    sweep_prepare.add_argument("--config", required=True)
+    sweep_prepare.add_argument("--sweep", required=True)
+    sweep_prepare.add_argument("--profile")
+    sweep_prepare.add_argument("--output-root")
+    sweep_prepare.add_argument("--pipeline-config")
+    sweep_prepare.set_defaults(handler=_mae_sweep_prepare)
+
+    sweep_compare = subparsers.add_parser(
+        "mae-sweep-compare", help="Summarize raw loss curves across an MAE soft grid"
+    )
+    sweep_compare.add_argument("--sweep", required=True, help="Manifest JSON or sweep directory")
+    sweep_compare.add_argument("--output", required=True)
+    sweep_compare.add_argument("--plot")
+    sweep_compare.add_argument("--labels", help="Optionally compare encoded shallow probes")
+    sweep_compare.add_argument(
+        "--classifier-model", choices=("logistic", "mlp"), default="logistic"
+    )
+    sweep_compare.add_argument("--folds", type=int, default=5)
+    sweep_compare.add_argument("--seed", type=int, default=42)
+    sweep_compare.set_defaults(handler=_mae_sweep_compare)
+
     shape_train = subparsers.add_parser("shape-train", help="Train the legacy DeepGCN encoder")
     shape_train.add_argument("--config", type=Path, required=True)
     shape_train.set_defaults(handler=_shape_train)
@@ -289,12 +426,14 @@ def build_parser() -> argparse.ArgumentParser:
     shape_encode = subparsers.add_parser("shape-encode", help="Export DeepGCN shape embeddings")
     shape_encode.add_argument("--config", type=Path, required=True)
     shape_encode.add_argument("--output", type=Path, required=True)
+    shape_encode.add_argument("--checkpoint", type=Path)
     shape_encode.set_defaults(handler=_shape_encode)
 
     texture_train = subparsers.add_parser("texture-train", help="Train legacy-style texture embeddings")
     texture_train.add_argument("experiment", type=Path)
     texture_train.add_argument("--device", default="auto")
     texture_train.add_argument("--from-checkpoint", action="store_true")
+    texture_train.add_argument("--checkpoint", type=Path)
     texture_train.set_defaults(handler=_texture_train)
 
     texture_encode = subparsers.add_parser("texture-encode", help="Export texture embeddings")
@@ -302,6 +441,8 @@ def build_parser() -> argparse.ArgumentParser:
     texture_encode.add_argument("--device", default="auto")
     texture_encode.add_argument("--patches", action="store_true")
     texture_encode.add_argument("--aggregate", action="store_true")
+    texture_encode.add_argument("--checkpoint", type=Path)
+    texture_encode.add_argument("--output", type=Path)
     texture_encode.set_defaults(handler=_texture_encode)
     return parser
 

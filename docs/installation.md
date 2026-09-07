@@ -30,6 +30,15 @@ python -m morphofeatures ui
 
 The workspace opens at `http://localhost:8501`. Use `--port` when that port is occupied and `--headless` on remote machines.
 
+Install the end-to-end notebooks (including the CPU MAE smoke workflow):
+
+```bash
+python -m pip install -e ".[analysis,modern-training,notebooks]"
+jupyter lab
+```
+
+Start Jupyter from the repository root. See `docs/notebooks.md`.
+
 ## Training environments
 
 ```bash
@@ -59,3 +68,8 @@ Inferno and Neurofire are no longer required by active training. Old serialized 
 - `MORPHOFEATURES_OUTPUT_ROOT`: output/checkpoint root.
 
 Explicit YAML paths take precedence for individual files and datasets. CUDA and WandB are never selected silently.
+
+The Streamlit scheduler backend additionally needs `sbatch`; monitoring uses `squeue` and
+`sacct` when available. Their absence leaves dry-run, registry, logs, metrics, artifacts, and
+local analysis usable. Configure placeholder-free cluster profiles as described in
+`docs/slurm_workflow.md`; profiles contain no credentials.

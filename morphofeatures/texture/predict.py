@@ -25,7 +25,7 @@ def predict(model, loader, path_to_save, device='cpu'):
         for samples in pred_loader:
             prediction = model(samples.to(device), just_encode=True).cpu().numpy()
             if np.any(np.isnan(prediction)):
-                warnings.warn("NaN spotted in predictions")
+                warnings.warn("NaN spotted in predictions", stacklevel=2)
             encoded.append(prediction)
     features = np.concatenate(encoded)
     positions = getattr(pred_loader.dataset, 'positions', None)
@@ -40,13 +40,12 @@ def predict(model, loader, path_to_save, device='cpu'):
 def predict_patches(model, loader, path_to_save, device='cpu'):
     assert loader.config.get('texture_contrastive')
     pred_loader = loader.get_predict_loaders()
-    positions = pred_loader.dataset.positions
     predictions = []
     with torch.no_grad():
         for samples in pred_loader:
             prediction = model(samples.to(device), just_encode=True).cpu().numpy()
             if np.any(np.isnan(prediction)):
-                warnings.warn("NaN spotted in predictions")
+                warnings.warn("NaN spotted in predictions", stacklevel=2)
             predictions.append(prediction)
     ids = pred_loader.dataset.positions[:, 0].astype('int64')
     predictions = np.concatenate(predictions)
@@ -88,21 +87,29 @@ def main(argv=None):
     parser.add_argument('--device', default='auto')
     parser.add_argument('--save-patches', action='store_true')
     parser.add_argument('--aggregate-patches', action='store_true')
+    parser.add_argument('--checkpoint', type=Path)
+    parser.add_argument('--output', type=Path)
     args = parser.parse_args(argv)
     device = resolve_device(args.device)
     with (args.path / 'train_config.yml').open('r', encoding='utf-8') as stream:
         config = yaml.safe_load(stream) or {}
     model = LegacyTextureAutoencoder3D(**config.get('model_kwargs', {})).to(device)
-    load_checkpoint(args.path / 'checkpoints' / 'best.pt', model, device=device)
+    checkpoint = args.checkpoint or args.path / 'checkpoints' / 'best.pt'
+    load_checkpoint(checkpoint, model, device=device)
     model.eval()
     if args.save_patches:
-        destination = args.path / 'encoded_patches.npz'
+        if args.output and not args.aggregate_patches:
+            destination = args.output
+        elif args.output:
+            destination = args.output.with_suffix('.patches.npz')
+        else:
+            destination = args.path / 'encoded_patches.npz'
         predict_patches(model, CellLoaders(args.path / 'test_config_patches.yml'), destination, device)
         if args.aggregate_patches:
-            aggregate_patches(destination)
+            aggregate_patches(destination, output=args.output)
     else:
         predict(model, CellLoaders(args.path / 'test_config.yml'),
-                args.path / 'avg_encoded.npy', device)
+                args.output or args.path / 'avg_encoded.npy', device)
 
 
 if __name__ == '__main__':

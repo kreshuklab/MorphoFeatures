@@ -9,9 +9,19 @@ paths:
   output_root: outputs/smoke
 
 mae:
-  input_shape: [16, 16, 16]
+  architecture_version: position-aware-3d-v2
+  input_shape: [8, 8, 8]
   patch_size: [4, 4, 4]
-  embedding_dim: 32
+  embedding_dim: 16
   encoder_depth: 1
   encoder_heads: 4
   mask_ratio: 0.5
+
+training:
+  epochs: 1
+  batch_size: 2
+  learning_rate: 0.001
+  validation_fraction: 0.25
+
+inference:
+  batch_size: 4

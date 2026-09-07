@@ -1,0 +1,163 @@
+# Site-specific example for the read-only data audited on the EMBL cluster.
+# Keep large data external; only resolved run artifacts are written below outputs/.
+seed: 42
+device: cuda
+active_profile: full
+
+data:
+  source: n5_masked_patches
+  patches_container: /g/kreshuk/mansaray/raw_patches_masked.n5
+  patches_key: patches
+  positions_container: /g/kreshuk/mansaray/abs_crop_centers_radius4_only_nucl.n5
+  positions_key: positions
+  ids_key: ids
+  # Optional, read-only provenance/QC source. It is never used as a training target.
+  qc_raw_container: /g/kreshuk/data/arendt/platyneris_v1/data.n5
+  qc_raw_key: volumes/raw/s1
+  position_radius_zyx: [4, 4, 4]
+  position_to_raw_scale_zyx: [4, 4, 4]
+  modality: EM
+  biological_unit: nucleus
+  axes: zyx
+  resolution_zyx_um: [0.025, 0.020, 0.020]
+  position_resolution_zyx_um: [0.100, 0.080, 0.080]
+  patch_shape_zyx: [32, 32, 32]
+  mask_mode: nonzero
+  normalization: dtype
+  min_foreground_fraction: 0.01
+  # One sample is a spatial group of complete 32^3 patches from one nucleus.
+  group_size: 200
+  # Indexed centers lie on an 8-voxel low-resolution lattice.
+  position_stride_zyx: [8, 8, 8]
+
+split:
+  train_fraction: 0.8
+  validation_fraction: 0.1
+  test_fraction: 0.1
+  max_labels: null
+
+augmentation:
+  random_flip: false
+  random_rot90: false
+
+mae:
+  architecture_version: grouped-nucleus-patches-v3
+  input_channels: 1
+  input_shape: [32, 32, 32]
+  reconstruction_shape: [8, 8, 8]
+  patch_encoder: linear
+  resnet_channels: [16, 32, 64]
+  resnet_blocks: [1, 1, 1]
+  embedding_dim: 80
+  encoder_depth: 4
+  encoder_heads: 8
+  decoder_dim: 80
+  decoder_depth: 8
+  decoder_heads: 4
+  norm_pix_loss: true
+  mask_ratio: 0.75
+
+training:
+  epochs: 200
+  batch_size: 16
+  workers: 16
+  pin_memory: true
+  learning_rate: 0.001
+  weight_decay: 0.05
+  scheduler: cosine
+  warmup_epochs: 0
+  min_learning_rate: 0.000001
+  scheduler_step_size: 25
+  scheduler_gamma: 0.5
+  mixed_precision: true
+  checkpoint_interval: 10
+  progress_interval_batches: 25
+  early_stopping:
+    enabled: True
+    patience: 10
+    min_delta: 0.000001
+    restore_best: true
+  resume_from: null
+
+inference:
+  batch_size: 16
+  workers: 16
+  split: all
+
+annotations:
+  cell_table: /g/kreshuk/mansaray/platy_data/1.0.1/tables/sbem-6dpf-1-whole-segmented-cells/default.tsv
+  cell_to_nucleus: /g/kreshuk/mansaray/platy_data/1.0.1/tables/sbem-6dpf-1-whole-segmented-cells/cells_to_nuclei.tsv
+  symmetric_cells: /g/kreshuk/mansaray/platy_data/1.0.1/tables/sbem-6dpf-1-whole-segmented-cells/symmetric_cells.tsv
+
+paths:
+  run_dir: ../../outputs/real_mae/platynereis_nucleus_texture
+
+# Deliberately non-institutional placeholders; copy a real profile outside Git.
+slurm:
+  partition: gpu-el8
+  account: kreshuk
+  qos: normal
+  nodes: 1
+  ntasks: 16
+  ntasks_per_node: 16
+  time: 5:00:00
+  memory: 128G
+  cpus: 20
+  gpus: 1
+  gpu_directive: gres
+  python_executable: /g/kreshuk/frazer/miniforge3/envs/MorphoFeats_dev/bin/python3.11
+  cpu_thread_env: true
+  local_runtime_directories: [wandb, matplotlib]
+  log_job_context: true
+  # To request notifications in a private config, set both of these:
+  mail_types: [END, FAIL]
+  mail_user: seth.frazer@embl.de
+  # Replace these placeholders in a private cluster profile. Arbitrary shell
+  # fragments are deliberately rejected by the maintained SLURM renderer.
+  setup:
+    - [module, load, CUDA/12.8]
+profiles:
+  quick:
+    split:
+      max_labels: 1000
+    data:
+      group_size: 64
+    mae:
+      embedding_dim: 160
+      encoder_depth: 4
+      encoder_heads: 8
+      decoder_dim: 160
+      decoder_depth: 4
+      decoder_heads: 4
+    training:
+      epochs: 50
+      batch_size: 8
+      workers: 16
+      pin_memory: true
+      mixed_precision: true
+      checkpoint_interval: 10
+    inference:
+      batch_size: 16
+      workers: 16
+  full:
+    split:
+      max_labels: null
+    data:
+      group_size: 200
+    mae:
+      embedding_dim: 160
+      encoder_depth: 4
+      encoder_heads: 8
+      decoder_dim: 160
+      decoder_depth: 8
+      decoder_heads: 4
+    training:
+      epochs: 200
+      batch_size: 16
+      workers: 16
+      pin_memory: true
+      mixed_precision: true
+      checkpoint_interval: 10
+    inference:
+      batch_size: 16
+      workers: 16

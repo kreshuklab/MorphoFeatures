@@ -1,0 +1,62 @@
+# Replace all /path/to values. Remove the DINOv3 stage and its from_embeddings
+# entry if you do not have an authorized DINOv3 checkpoint.
+stages:
+  - action: extract
+    name: MorphoFeatures
+    model: mae
+    config: &target /path/to/model_and_target_data.yaml
+    checkpoint: /path/to/mae_checkpoint.pt
+    cache: &cache /path/to/embedding_cache
+    data_version: '1'
+  - action: extract
+    name: DINOv2
+    model: dinov2
+    variant: dinov2_vits14
+    config: *target
+    model_repository: /path/to/dinov2
+    checkpoint: /path/to/dinov2_vits14_pretrain.pth
+    cache: *cache
+    data_version: '1'
+    views: &views
+      axes: [0, 1, 2]
+      fractions: [0.25, 0.5, 0.75]
+      normalization: foreground_percentile
+      percentiles: [1, 99]
+      mask: true
+      size: 224
+      resize: letterbox
+      feature: cls
+      aggregation: mean
+      batch_size: 16
+  - action: extract
+    name: DINOv3
+    model: dinov3
+    variant: dinov3_vits16
+    config: *target
+    model_repository: /path/to/dinov3
+    checkpoint: /path/to/dinov3_vits16_pretrain_lvd1689m.pth
+    cache: *cache
+    data_version: '1'
+    views: *views
+  - action: compare
+    from_embeddings: [MorphoFeatures, DINOv2, DINOv3]
+    # Optional TSV/CSV: unique label_id, label, and specimen columns.
+    annotations: null
+    label_column: label
+    group_column: specimen
+    folds: 5
+    knn_k: 5
+    linear_c: 1.0
+    evaluation_pca: null
+    normalization: standardize
+    umap: true
+    neighbors: 15
+    min_dist: 0.1
+    clusters: 8
+    seed: 42
+slurm:
+  partition: gpu
+  cpus: 4
+  gpus: 1
+  memory: 16G
+  time: '02:00:00'

@@ -57,6 +57,23 @@ python -m morphofeatures synthetic outputs/synthetic --seed 7
 
 This writes aligned `raw.npy`, `cells.npy`, `nuclei.npy`, `cell_to_nucleus.tsv`, `metadata.tsv`, and label-first `embeddings.npy`. The committed test fixture under `tests/fixtures/synthetic` uses the same generator.
 
+## Inspectable MAE crop preparation
+
+`morphofeatures.data.crops` keeps spatial preprocessing outside model callbacks. It can map a
+bounded Paintera/N5 fragment ROI through a one-dimensional fragment-to-segment assignment,
+summarize label bounds/centroids/border contact, extract fixed centroid-aligned crops, normalize
+intensity explicitly, and save crops, masks, raw QC windows, a manifest, and provenance.
+
+The model input is intensity zeroed outside the target cell. Save the binary masks separately and
+set `data.loss_masks` for MAE training so reconstruction error is computed only for cell-interior
+voxels in masked patches. This prevents a sparse crop's zero background from dominating MSE. It
+does not make segmentation errors harmless: inspect crop coverage, occupancy, disconnected
+pieces, size outliers, and source-volume overlays.
+
+See notebook 04 and the [local Platynereis audit](platyneris_data_inventory.md) for one concrete
+N5 mapping route. It is dataset-specific evidence, not a universal replacement for authoritative
+cell–nucleus mappings and physical bounding-box/anchor tables.
+
 ## Shape input manifest
 
 Shape training accepts `.npy`/`.npz` point clouds or OFF/PLY/OBJ meshes. A TSV manifest is recommended:

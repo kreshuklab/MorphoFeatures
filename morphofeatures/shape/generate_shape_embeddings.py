@@ -42,6 +42,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--save-to", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path)
     args = parser.parse_args(argv)
     with args.config.open("r", encoding="utf-8") as stream:
         config = yaml.safe_load(stream)
@@ -51,6 +52,8 @@ def main(argv=None):
             value = Path(config["data"][key])
             if not value.is_absolute():
                 config["data"][key] = str(base / value)
+    if args.checkpoint is not None:
+        config["model"]["checkpoint"] = str(args.checkpoint.resolve())
     checkpoint = Path(config["model"]["checkpoint"])
     if not checkpoint.is_absolute():
         config["model"]["checkpoint"] = str(base / checkpoint)

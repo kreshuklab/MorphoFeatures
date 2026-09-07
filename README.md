@@ -15,6 +15,9 @@ The result is a label-first `(n_cells, 481)` array: column 0 is `label_id`, and 
 
 ## What works now
 
+- [Dataset workspace workflows](docs/workspace_workflows.md): persistent MAE configuration,
+  local/SLURM pipelines, cached MAE/DINO embeddings, matched comparisons, bounded instance
+  preprocessing, and mesh intensity visualization/export.
 - Installable package with one `morphofeatures` CLI.
 - Exact validation of all bundled NumPy and MoBIE artifacts.
 - Deterministic logistic-regression evaluation, UMAP, Leiden, and K-means workflows.
@@ -27,6 +30,10 @@ The result is a label-first `(n_cells, 481)` array: column 0 is `label_id`, and 
 - Pragmatic 3D MAE with the same train, encode, aggregate, export, and evaluate interface.
 - Deterministic synthetic 3D fixture generator and automated smoke tests.
 - Streamlit workspace for analysis, feature building, configuration, and documentation.
+- SLURM-safe experiment previews/submission, SQLite job persistence, scheduler refresh,
+  bounded log tails, structured metrics, and explicit artifact inspection.
+- Ordered, visualization-rich notebooks for contracts, CPU MAE training/encoding, biological
+  analysis, and an optional bounded real-data N5 workflow.
 
 Raw PlatyBrowser EM volumes, original training configs, and original checkpoints are not bundled. Published downstream analysis is reproducible immediately; full model retraining requires external raw and segmentation volumes.
 
@@ -70,6 +77,9 @@ python -m pip install -e ".[modern-training]"
 # Streamlit workflow workspace
 python -m pip install -e ".[ui]"
 
+# Executable notebook collection
+python -m pip install -e ".[analysis,modern-training,notebooks]"
+
 # Development and tests
 python -m pip install -e ".[analysis,dev]"
 ```
@@ -77,6 +87,24 @@ python -m pip install -e ".[analysis,dev]"
 CUDA is optional. Install the Torch build matching the host CUDA driver before installing the training groups. Historical N5/BDV input can use `pybdv` and `zarr`; exact old z5 containers may additionally require `z5py` from conda-forge.
 
 See [installation](docs/installation.md) for environment details.
+
+## End-to-end notebooks
+
+Start Jupyter from the repository root and follow [the notebook guide](notebooks/README.md):
+
+1. [Data preparation and contracts](notebooks/01_data_preparation_and_contracts.ipynb)
+2. [CPU MAE training and encoding](notebooks/02_cpu_mae_training_and_encoding.ipynb)
+3. [Biological analysis and interpretation](notebooks/03_biological_analysis_and_interpretation.ipynb)
+4. [Real Platynereis MAE workflow](notebooks/04_real_platynereis_mae_workflow.ipynb)
+
+The second notebook is the complete automated CPU workflow on segmented synthetic cells and
+shows crop masks, token masks, reconstruction, losses, checkpoints, and embeddings. The third
+uses bundled published embeddings and metadata. The fourth uses a canonical YAML plus explicit
+notebook overrides to inspect, train, reconstruct, encode, and analyze 11,382 indexed real
+Platynereis nuclei through lazy N5 reads. Its output is accurately scoped as nucleus-derived
+texture. See the [legacy code/data inventory](docs/legacy_workspaces_inventory.md), the earlier
+[whole-volume ROI audit](docs/platyneris_data_inventory.md), and [notebook workflows](docs/notebooks.md).
+Generated files go below the configured output root.
 
 ## Repository data
 
@@ -109,12 +137,15 @@ morphofeatures project         UMAP plus Leiden or K-means
 morphofeatures combine         concatenate aligned feature groups
 morphofeatures context         aggregate neighbor features
 morphofeatures synthetic       create a small 3D fixture
+morphofeatures n5-inventory    inspect N5 metadata without reading chunks
 morphofeatures shape-train     train DeepGCN shape embeddings
 morphofeatures shape-encode    export shape embeddings
 morphofeatures texture-train   train coarse/fine texture embeddings
 morphofeatures texture-encode  export or aggregate texture embeddings
 morphofeatures mae-train       train a 3D masked autoencoder
 morphofeatures mae-encode      export MAE embeddings
+morphofeatures mae-sweep-prepare  resolve a bounded MAE ablation manifest
+morphofeatures mae-sweep-compare  compare sweep losses and curves
 morphofeatures doctor          report optional runtime capabilities
 morphofeatures ui              open the Streamlit workspace
 ```
@@ -138,9 +169,59 @@ python -m morphofeatures mae-encode --config configs/smoke.yaml \
   --checkpoint outputs/mae/checkpoint.pt --output outputs/mae/embeddings.npy
 ```
 
-The smoke config generates random crops when `data.crops` is absent. Full experiments set `data.crops` to an `(n, z, y, x)` or `(n, c, z, y, x)` NumPy array and preserve label IDs in the export step.
+The smoke config generates random crops when `data.crops` is absent. Full experiments set
+`data.crops` to an `(n, z, y, x)` or `(n, c, z, y, x)` NumPy array and `data.label_ids` to one
+finite, unique segmentation ID per crop. Smoke-only IDs default to `1..n` (zero remains
+background).
 
-For legacy training, see [training new embeddings](docs/training_new_embeddings.md). For MAE comparisons, see [modern MAE workflow](docs/modern_mae_workflow.md).
+For segmentation-masked crops, also set `data.loss_masks` to `(n,z,y,x)` or `(n,1,z,y,x)`
+foreground masks. The MAE then computes masked-patch reconstruction loss only inside the target
+cell/nucleus, avoiding a background-dominated MSE while leaving inference inputs unchanged.
+
+The generic crop MAE checkpoint contract is `position-aware-3d-v2`: masking replaces voxel-patch
+content but retains explicit `z,y,x` position. The audited nucleus-patch N5 route uses the separate
+`grouped-nucleus-patches-v3` contract. There, one token is a complete stored `32³` texture patch,
+one sample is a spatial group from one cell-associated nucleus, and the target is a downsampled
+hidden patch. Checkpoints cannot cross these contracts. Structured metrics report model MSE and a
+visible-patch mean baseline; judge a run by held-out improvement, reconstructions, and embedding QC.
+
+For the indexed real-patch route, start from the portable
+[`mae_nucleus_patches_template.yaml`](configs/mae_nucleus_patches_template.yaml) or the separate
+site example under `configs/sites/`. It validates N5 keys, `(z,y,x)` resolution, parent IDs,
+grouped splits, lazy central patch groups, whole-patch masking, checkpoint resume, and label-first
+nucleus-level export. The site config contains external cluster paths but no copied data,
+credentials, or institutional scheduler values.
+
+For legacy training, see [training new embeddings](docs/training_new_embeddings.md). For MAE
+comparisons, see [modern MAE workflow](docs/modern_mae_workflow.md). To adapt new inputs, follow
+[mapping a new dataset](morphofeatures/howto_new_dataset.md).
+
+## SLURM workspace
+
+The Streamlit lifecycle is:
+
+```text
+validate inputs → configure → preview → submit → monitor → encode → inspect → analyze/export
+```
+
+`Train and encode` supports shape, texture, and MAE training/encoding. It previews the exact
+argument-list-derived command and SLURM script, saves immutable configuration snapshots, and
+defaults to a non-executing dry run. `Experiments` reads the persistent SQLite registry below
+the output root, refreshes active jobs through `squeue`/`sacct`, displays JSONL loss curves and
+bounded log tails, and passes completed embeddings into the existing analysis pages. Real
+submission occurs only after pressing **Submit to SLURM**; widget reruns never submit jobs.
+
+For real-data MAE training, the page also supports a bounded, allowlisted soft grid. The default
+one-at-a-time mode can compare learning rates/schedulers, linear versus 3D ResNet patch encoders,
+embedding and reconstruction dimensions, and normalization without hiding settings in callbacks.
+Each variant is a normal persistent job; optional encoding is queued with an `afterok` dependency.
+See `configs/mae_nucleus_soft_grid.example.yaml` and the real-data notebook for metric,
+reconstruction, and shallow cell-type-probe comparisons.
+
+Start with the placeholder-only [profile example](configs/slurm_profiles.example.yaml) and the
+[SLURM workspace guide](docs/slurm_workflow.md), including its mapping from a conventional cluster
+batch script to structured profile fields. No live SLURM success is implied by this
+repository's fake-backend and dry-run tests.
 
 ## Reproducibility
 

@@ -1,0 +1,45 @@
+# Placeholder profiles only. Copy this file outside source control or edit a local
+# deployment copy with values supplied by your cluster documentation.
+profiles:
+  cpu-short:
+    partition: compute
+    account: null
+    qos: null
+    nodes: 1
+    ntasks: 1
+    ntasks_per_node: 1
+    time: "00:30:00"
+    memory: 8G
+    cpus: 4
+    gpus: 0
+    cpu_thread_env: true
+    log_job_context: true
+    setup: []
+
+  gpu-standard:
+    partition: gpu
+    account: null
+    qos: null
+    nodes: 1
+    ntasks: 1
+    ntasks_per_node: 1
+    time: "04:00:00"
+    memory: 32G
+    cpus: 8
+    gpus: 1
+    # Use `gres` for clusters requesting GPUs as --gres=gpu:N. Switch to
+    # `gpus` only when the local scheduler expects --gpus=N.
+    gpu_directive: gres
+    # An explicit interpreter is robust when activated environments are not
+    # inherited by sbatch. Replace this placeholder in a private profile.
+    python_executable: /g/kreshuk/frazer/miniforge3/envs/MorphoFeats_dev/bin/python3.11
+    cpu_thread_env: true
+    local_runtime_directories: [wandb, matplotlib]
+    log_job_context: true
+    # Enable these together in a private profile if notifications are wanted:
+    # mail_types: [END, FAIL]
+    # mail_user: researcher@example.org
+    # Setup is deliberately structured, not arbitrary shell text. Supported
+    # entries are [module, load|purge|use, ...] and [source, /path/to/activate].
+    setup:
+      - [module, load, CUDA/12.8]

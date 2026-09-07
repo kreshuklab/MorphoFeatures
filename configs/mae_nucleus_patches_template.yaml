@@ -1,0 +1,173 @@
+# Portable template for one nucleus-derived texture embedding group.
+# Set the two environment variables below or replace them in a site-only config.
+seed: 42
+device: auto
+active_profile: quick
+
+data:
+  source: n5_masked_patches
+  patches_container: ${MORPHOFEATURES_NUCLEUS_PATCHES_N5}
+  patches_key: patches
+  positions_container: ${MORPHOFEATURES_NUCLEUS_POSITIONS_N5}
+  positions_key: positions
+  ids_key: ids
+  # Optional QC fields for recovering the unmasked raw crop. Uncomment only when
+  # the indexed centers are verified against that raw pyramid.
+  # qc_raw_container: /path/to/raw.n5
+  # qc_raw_key: volumes/raw/s1
+  # position_radius_zyx: [4, 4, 4]
+  # position_to_raw_scale_zyx: [4, 4, 4]
+  modality: EM
+  biological_unit: nucleus
+  axes: zyx
+  # The stored 32^3 patches came from raw pyramid s1.
+  resolution_zyx_um: [0.025, 0.020, 0.020]
+  # Position rows refer to the aligned low-resolution grid and are multiplied by four.
+  position_resolution_zyx_um: [0.100, 0.080, 0.080]
+  patch_shape_zyx: [32, 32, 32]
+  mask_mode: nonzero
+  normalization: dtype
+  min_foreground_fraction: 0.01
+  # One model sample groups complete stored patches from one biological parent.
+  group_size: 200
+  position_stride_zyx: [8, 8, 8]
+
+split:
+  train_fraction: 0.8
+  validation_fraction: 0.1
+  test_fraction: 0.1
+  max_labels: null
+
+augmentation:
+  random_flip: false
+  random_rot90: false
+
+mae:
+  # v3 masks complete stored patches in a spatial nucleus group. Earlier v1/v2
+  # checkpoints used a different objective and cannot be resumed.
+  architecture_version: grouped-nucleus-patches-v3
+  input_channels: 1
+  input_shape: [32, 32, 32]
+  reconstruction_shape: [8, 8, 8]
+  # linear exactly matches the maintained v3 baseline. resnet3d adds a local,
+  # hierarchical 3D convolutional inductive bias before the group transformer.
+  patch_encoder: linear
+  resnet_channels: [16, 32, 64]
+  resnet_blocks: [1, 1, 1]
+  embedding_dim: 80
+  encoder_depth: 4
+  encoder_heads: 8
+  decoder_dim: 80
+  decoder_depth: 8
+  decoder_heads: 4
+  norm_pix_loss: true
+  mask_ratio: 0.75
+
+training:
+  epochs: 200
+  batch_size: 16
+  workers: 16
+  pin_memory: true
+  learning_rate: 0.001
+  weight_decay: 0.05
+  scheduler: cosine
+  warmup_epochs: 0
+  min_learning_rate: 0.000001
+  scheduler_step_size: 25
+  scheduler_gamma: 0.5
+  mixed_precision: true
+  checkpoint_interval: 10
+  # Write bounded batch-level throughput/ETA events; set 0 to retain epoch-only metrics.
+  progress_interval_batches: 25
+  # Validation-loss early stopping is opt-in. With restore_best enabled, the final
+  # checkpoint contains the best model/optimizer state and checkpoint-best.pt is retained.
+  early_stopping:
+    enabled: false
+    patience: 10
+    min_delta: 0.000001
+    restore_best: true
+  resume_from: null
+
+inference:
+  batch_size: 16
+  workers: 16
+  split: all
+
+# Optional label-first tables for interpretation. Keep them outside the repository
+# when they belong to an external dataset release.
+annotations: {}
+
+paths:
+  run_dir: ../outputs/real_mae/platynereis_nucleus_texture
+
+# Placeholder scheduler values: copy and adapt them to the target cluster.
+slurm:
+  partition: gpu-partition
+  account: project-account
+  qos: normal
+  nodes: 1
+  ntasks: 1
+  ntasks_per_node: 1
+  time: 3-00:00:00
+  memory: 128G
+  cpus: 20
+  gpus: 1
+  gpu_directive: gres
+  python_executable: /path/to/morphofeatures-environment/bin/python
+  cpu_thread_env: true
+  local_runtime_directories: [wandb, matplotlib]
+  log_job_context: true
+  # To request notifications in a private config, set both of these:
+  # mail_types: [END, FAIL]
+  # mail_user: researcher@example.org
+  # Each setup entry is an argument list. Only module operations and sourcing a
+  # reviewed activation script are accepted by the safe SLURM renderer.
+  setup:
+    - [module, load, CUDA]
+    - [source, /path/to/activate-morphofeatures.sh]
+
+profiles:
+  quick:
+    split:
+      max_labels: 24
+    data:
+      group_size: 8
+    mae:
+      embedding_dim: 160
+      encoder_depth: 2
+      encoder_heads: 4
+      decoder_dim: 160
+      decoder_depth: 2
+      decoder_heads: 4
+    training:
+      epochs: 2
+      batch_size: 4
+      workers: 0
+      pin_memory: false
+      mixed_precision: false
+      checkpoint_interval: 1
+    inference:
+      batch_size: 8
+      workers: 0
+  full:
+    split:
+      max_labels: null
+    data:
+      group_size: 200
+    mae:
+      embedding_dim: 80
+      encoder_depth: 4
+      encoder_heads: 8
+      decoder_dim: 80
+      decoder_depth: 8
+      decoder_heads: 4
+    training:
+      epochs: 200
+      batch_size: 16
+      workers: 16
+      pin_memory: true
+      mixed_precision: true
+      checkpoint_interval: 10
+    inference:
+      batch_size: 16
+      workers: 16

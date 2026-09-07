@@ -18,3 +18,7 @@ data:
   cell_to_nucleus: null
   cell_table: null
   nucleus_table: null
+
+slurm:
+  # Replace in a deployment config or MORPHOFEATURES_SLURM_PROFILES.
+  profiles: configs/slurm_profiles.example.yaml

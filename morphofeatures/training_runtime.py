@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any
 
 
 def resolve_device(requested: str = "auto"):
@@ -22,11 +23,11 @@ def unwrap_model(model):
     return model.module if hasattr(model, "module") else model
 
 
-def portable_state_dict(model) -> Dict[str, Any]:
+def portable_state_dict(model) -> dict[str, Any]:
     return unwrap_model(model).state_dict()
 
 
-def normalize_state_dict_keys(state_dict: Mapping[str, Any]) -> Dict[str, Any]:
+def normalize_state_dict_keys(state_dict: Mapping[str, Any]) -> dict[str, Any]:
     if state_dict and all(key.startswith("module.") for key in state_dict):
         return {key[len("module.") :]: value for key, value in state_dict.items()}
     return dict(state_dict)
@@ -37,16 +38,17 @@ def save_checkpoint(
     model,
     optimizer=None,
     scheduler=None,
+    scaler=None,
     epoch: int = 0,
     step: int = 0,
-    config: Optional[Mapping[str, Any]] = None,
-    metrics: Optional[Mapping[str, float]] = None,
+    config: Mapping[str, Any] | None = None,
+    metrics: Mapping[str, float] | None = None,
 ) -> Path:
     import torch
 
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "epoch": int(epoch),
         "step": int(step),
         "model": portable_state_dict(model),
@@ -57,22 +59,40 @@ def save_checkpoint(
         payload["optimizer"] = optimizer.state_dict()
     if scheduler is not None:
         payload["scheduler"] = scheduler.state_dict()
+    if scaler is not None:
+        payload["scaler"] = scaler.state_dict()
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     torch.save(payload, temporary)
     os.replace(str(temporary), str(destination))
     return destination
 
 
-def load_checkpoint(path: Path, model, device="cpu", optimizer=None, scheduler=None, strict=True):
+def load_checkpoint(
+    path: Path,
+    model,
+    device="cpu",
+    optimizer=None,
+    scheduler=None,
+    scaler=None,
+    strict=True,
+    validate_payload=None,
+):
     import torch
 
-    payload = torch.load(Path(path), map_location=device)
+    try:
+        payload = torch.load(Path(path), map_location=device, weights_only=True)
+    except TypeError:  # pragma: no cover - compatibility with torch before weights_only
+        payload = torch.load(Path(path), map_location=device)
+    if validate_payload is not None:
+        validate_payload(payload)
     state_dict = payload.get("model", payload)
     unwrap_model(model).load_state_dict(normalize_state_dict_keys(state_dict), strict=strict)
     if optimizer is not None and "optimizer" in payload:
         optimizer.load_state_dict(payload["optimizer"])
     if scheduler is not None and "scheduler" in payload:
         scheduler.load_state_dict(payload["scheduler"])
+    if scaler is not None and "scaler" in payload:
+        scaler.load_state_dict(payload["scaler"])
     return payload
 
 
@@ -88,7 +108,7 @@ class ExperimentLogger:
                 raise RuntimeError("WandB logging requires morphofeatures[wandb]") from error
             self.run = wandb.init(project=project, **kwargs)
 
-    def log(self, values: Mapping[str, Any], step: Optional[int] = None) -> None:
+    def log(self, values: Mapping[str, Any], step: int | None = None) -> None:
         if self.run is not None:
             self.run.log(dict(values), step=step)
 

@@ -10,6 +10,7 @@ import yaml
 from tqdm import tqdm
 
 from morphofeatures.losses import nt_xent_loss
+from morphofeatures.metrics import MetricWriter, configured_metrics_path
 from morphofeatures.shape.loader import get_train_val_loaders
 from morphofeatures.shape.network import DeepGCN
 from morphofeatures.training_runtime import ExperimentLogger, resolve_device, save_checkpoint
@@ -24,6 +25,9 @@ class ShapeTrainer:
         loaders = get_train_val_loaders(config["data"], config["loader"])
         self.train_loader, self.val_loader = loaders["train"], loaders["val"]
         self.epoch, self.step, self.best_val_loss = 0, 0, None
+        self.metric_writer = MetricWriter(
+            configured_metrics_path(config, Path(config["experiment_dir"]) / "metrics.jsonl")
+        )
         self._build_model()
 
     def _build_model(self):
@@ -89,35 +93,54 @@ class ShapeTrainer:
         return float(sum(losses) / max(1, len(losses)))
 
     def checkpoint(self, name, metrics):
-        return save_checkpoint(
+        path = save_checkpoint(
             self.checkpoint_dir / name, self.model, optimizer=self.optimizer,
             scheduler=self.scheduler, epoch=self.epoch, step=self.step,
             config=self.config, metrics=metrics,
         )
+        self.metric_writer.write(
+            "checkpoint", path=str(path), epoch=self.epoch + 1, step=self.step, metrics=metrics
+        )
+        return path
 
     def run(self):
         training = self.config.get("training", {})
         wandb_config = self.config.get("wandb", {})
-        with ExperimentLogger(enabled=bool(wandb_config.get("enabled", False)),
-                              project=wandb_config.get("project", "MorphoFeatures"),
-                              config=self.config) as logger:
-            for self.epoch in tqdm(range(int(training.get("epochs", 10))), desc="epochs"):
-                train_loss = self.train_epoch(logger)
-                metrics = {"train_loss": train_loss}
-                if self.epoch % int(training.get("validate_every", 1)) == 0:
-                    validation_loss = self.validate_epoch()
-                    metrics["validation_loss"] = validation_loss
-                    logger.log(metrics, step=self.step)
-                    if self.best_val_loss is None or validation_loss < self.best_val_loss:
-                        self.best_val_loss = validation_loss
-                        self.checkpoint("best.pt", metrics)
-                if self.scheduler is not None:
-                    if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                        self.scheduler.step(metrics.get("validation_loss", train_loss))
-                    else:
-                        self.scheduler.step()
-                if (self.epoch + 1) % int(training.get("checkpoint_every", 1)) == 0:
-                    self.checkpoint("epoch_{:04d}.pt".format(self.epoch + 1), metrics)
+        self.metric_writer.write(
+            "started", workflow="shape_train", device=str(self.device),
+            epochs=int(training.get("epochs", 10)),
+        )
+        try:
+            with ExperimentLogger(enabled=bool(wandb_config.get("enabled", False)),
+                                  project=wandb_config.get("project", "MorphoFeatures"),
+                                  config=self.config) as logger:
+                for self.epoch in tqdm(range(int(training.get("epochs", 10))), desc="epochs"):
+                    train_loss = self.train_epoch(logger)
+                    metrics = {"train_loss": train_loss}
+                    if self.epoch % int(training.get("validate_every", 1)) == 0:
+                        validation_loss = self.validate_epoch()
+                        metrics["validation_loss"] = validation_loss
+                        logger.log(metrics, step=self.step)
+                        if self.best_val_loss is None or validation_loss < self.best_val_loss:
+                            self.best_val_loss = validation_loss
+                            self.checkpoint("best.pt", metrics)
+                    self.metric_writer.write(
+                        "epoch", epoch=self.epoch + 1, step=self.step,
+                        train_loss=train_loss,
+                        validation_loss=metrics.get("validation_loss"),
+                        learning_rate=float(self.optimizer.param_groups[0]["lr"]),
+                    )
+                    if self.scheduler is not None:
+                        if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                            self.scheduler.step(metrics.get("validation_loss", train_loss))
+                        else:
+                            self.scheduler.step()
+                    if (self.epoch + 1) % int(training.get("checkpoint_every", 1)) == 0:
+                        self.checkpoint("epoch_{:04d}.pt".format(self.epoch + 1), metrics)
+            self.metric_writer.write("completed", workflow="shape_train", epoch=self.epoch + 1)
+        except Exception as error:
+            self.metric_writer.write("failed", workflow="shape_train", error=str(error))
+            raise
 
 
 def main(argv=None):

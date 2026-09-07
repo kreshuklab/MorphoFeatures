@@ -1,0 +1,17 @@
+# A bounded, interpretable ablation for the real nucleus-patch MAE.
+# `one_at_a_time` changes one setting relative to the selected base profile.
+# Use a new name for every submission: manifests and run snapshots are immutable.
+sweep:
+  name: nucleus-local-texture-ablation
+  mode: one_at_a_time
+  include_base: true
+  max_runs: 16
+  parameters:
+    training.learning_rate: [0.0003, 0.001]
+    training.scheduler: [constant, cosine]
+    mae.patch_encoder: [linear, resnet3d]
+    mae.embedding_dim: [80, 128]
+    mae.reconstruction_shape:
+      - [8, 8, 8]
+      - [16, 16, 16]
+    data.normalization: [dtype, foreground_percentile]

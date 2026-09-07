@@ -1,0 +1,21 @@
+# Runnable CPU integration smoke: eight synthetic crops, one training epoch.
+# Paths in pipeline files are relative to this YAML file.
+stages:
+  - action: train
+    config: smoke.yaml
+  - action: extract
+    name: MorphoFeatures
+    model: mae
+    from_training: true
+  - action: analyze
+    from_extraction: true
+    normalization: standardize
+    umap: false
+    clusters: 2
+    seed: 42
+slurm:
+  partition: compute
+  cpus: 2
+  gpus: 0
+  memory: 4G
+  time: '00:10:00'
