@@ -45,13 +45,24 @@ stages:
     label_column: label
     group_column: specimen
     folds: 5
+    classify: true
+    classifier_models: [logistic, knn]  # mlp uses the same network as Tools
+    prediction_model: logistic
+    predict_unlabeled: true
+    minimum_class_count: 2
+    fold_policy: reduce
+    class_weight: balanced
+    hidden_dimensions: [64]
     knn_k: 5
     linear_c: 1.0
     evaluation_pca: null
     normalization: standardize
     umap: true
     neighbors: 15
-    min_dist: 0.1
+    min_dist: 0.0
+    umap_epochs: 50
+    subset: 0
+    unlabeled_opacity: 0.15
     clusters: 8
     seed: 42
 slurm:

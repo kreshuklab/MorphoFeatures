@@ -1,7 +1,7 @@
 """Stream aligned raw/instance volumes into ID-indexed, masked MAE crops.
 
 Volume scans use bounded tiles and a disk-backed object index. Extraction
-allocates one fixed-size crop at a time; final arrays are written with memmaps.
+allocates one fixed-size crop at a time; outputs use memmaps or chunked containers.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv
 import itertools
 import sqlite3
+from contextlib import ExitStack
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +17,7 @@ import yaml
 from scipy import ndimage
 
 from morphofeatures.artifacts import write_json_atomic
+from morphofeatures.data.crop_storage import crop_storage_backend
 from morphofeatures.data.crops import _normalize_crop
 from morphofeatures.data.volumes import open_volume
 from morphofeatures.representations import fingerprint_file
@@ -33,6 +35,7 @@ def triple(value, name, *, integer=False, positive=True):
 
 
 def validate_preprocessing(settings):
+    crop_storage_backend(settings.get("output_format", "npy"))
     for key in ("raw", "segmentation"):
         if not Path(settings.get(key, "")).exists() or not settings.get(key):
             raise ValueError(f"{key} container does not exist")
@@ -151,6 +154,66 @@ def _index_objects(segmentation, roi_start, roi_stop, block_shape, db, progress)
         db.commit()
         if progress:
             progress(phase="scan", blocks=count, total_blocks=total)
+
+
+def _save_crops(staging, destination, count, shape, settings):
+    """Consolidate temporary crops one row at a time into the selected storage."""
+    output_format = settings.get("output_format", "npy")
+    backend = crop_storage_backend(output_format)
+    dimensions = (count, *(int(s) for s in shape))
+    specifications = {
+        "crops": ("crops", np.float32, dimensions),
+        "loss_masks": ("masks", np.uint8 if output_format == "n5" else bool, dimensions),
+        "label_ids": ("label_ids", np.int64, (count,)),
+    }
+    data, arrays = {}, {}
+    with ExitStack() as stack:
+        store = None
+        if backend is not None:
+            path = destination / f"crops.{output_format}"
+            store = stack.enter_context(backend.File(str(path), "x"))
+            store.attrs.update(
+                {
+                    "schema": "morphofeatures.masked_crops.v1",
+                    "unit": settings["unit"],
+                    "spacing_zyx": list(settings["spacing_zyx"]),
+                    "origin_zyx": list(settings.get("origin_zyx", [0, 0, 0])),
+                    "normalization": settings.get("normalization", "dtype"),
+                    "background": float(settings.get("background", 0)),
+                }
+            )
+        for field, (key, dtype, dims) in specifications.items():
+            if store is None:
+                path = destination / f"{key}.npy"
+                array = np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=dims)
+                stack.callback(array._mmap.close)
+                stack.callback(array.flush)
+            else:
+                chunks = (
+                    (1, *(min(s, 64) for s in dims[1:])) if len(dims) > 1 else (min(count, 4096),)
+                )
+                array = store.create_dataset(
+                    key, shape=dims, dtype=dtype, chunks=chunks, compression="gzip"
+                )
+                array.attrs["axes"] = "nzyx" if len(dims) == 4 else "n"
+                data[field + "_key"] = key
+            data[field] = str(path)
+            arrays[field] = array
+        # Write each compressed ID chunk once instead of recompressing it for
+        # every object. Pixel memory remains bounded by a single crop.
+        for first in range(0, count, 4096):
+            stop = min(first + 4096, count)
+            label_ids = np.empty(stop - first, dtype=np.int64)
+            for index in range(first, stop):
+                temporary = staging / f"{index}.npz"
+                with np.load(temporary, allow_pickle=False) as patch:
+                    arrays["crops"][index] = patch["crop"]
+                    arrays["loss_masks"][index] = patch["mask"]
+                    label_ids[index - first] = patch["label_id"]
+                temporary.unlink()
+            arrays["label_ids"][first:stop] = label_ids
+    staging.rmdir()
+    return data
 
 
 def preprocess(settings, destination, progress=None):
@@ -322,41 +385,22 @@ def preprocess(settings, destination, progress=None):
         "mask": "exact instance equality, independent of raw zero intensity",
         "selection_scope": "ROI",
         "crop_shape": shape.tolist(),
+        "output_format": settings.get("output_format", "npy"),
     }
     write_json_atomic(destination / "preprocessing.json", metadata)
     if not summary["processed"]:
         raise ValueError(
             f"No objects processed; see {destination / 'objects.tsv'} for skipped/failed reasons"
         )
-    crops = np.lib.format.open_memmap(
-        destination / "crops.npy",
-        mode="w+",
-        dtype=np.float32,
-        shape=(summary["processed"], *(int(s) for s in shape)),
-    )
-    masks = np.lib.format.open_memmap(
-        destination / "masks.npy", mode="w+", dtype=bool, shape=crops.shape
-    )
-    ids = np.lib.format.open_memmap(
-        destination / "label_ids.npy", mode="w+", dtype=np.int64, shape=(len(crops),)
-    )
-    for index in range(len(crops)):
-        temporary = staging / f"{index}.npz"
-        with np.load(temporary, allow_pickle=False) as patch:
-            crops[index], masks[index], ids[index] = patch["crop"], patch["mask"], patch["label_id"]
-        temporary.unlink()
-    crops.flush()
-    masks.flush()
-    ids.flush()
-    staging.rmdir()
+    data = _save_crops(staging, destination, summary["processed"], shape, settings)
+    metadata["arrays"] = data
+    write_json_atomic(destination / "preprocessing.json", metadata)
     config = {
         "seed": 42,
         "device": "auto",
         "data": {
             "source": "masked_crops",
-            "crops": str(destination / "crops.npy"),
-            "label_ids": str(destination / "label_ids.npy"),
-            "loss_masks": str(destination / "masks.npy"),
+            **data,
             "preprocessing": str(destination / "preprocessing.json"),
         },
         "mae": {

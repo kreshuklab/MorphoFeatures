@@ -13,11 +13,17 @@ from sklearn.metrics import (
     accuracy_score,
     adjusted_rand_score,
     balanced_accuracy_score,
-    silhouette_score,
 )
-from sklearn.preprocessing import StandardScaler, normalize
+from sklearn.preprocessing import StandardScaler
 
-from morphofeatures.analysis.projection import cluster_embeddings, compute_umap
+from morphofeatures.analysis.annotations import join_labels, read_annotations
+from morphofeatures.analysis.classification import LEGACY_CELL_TYPES, configured_classifier
+
+# Public aliases retained for callers; both UI routes use the same implementation.
+from morphofeatures.analysis.projection import normalize_features as transformed
+from morphofeatures.analysis.projection import project_embeddings as project_table
+from morphofeatures.analysis.visualization import label_palette
+from morphofeatures.analysis.visualization import save_projection_figure as save_figure
 from morphofeatures.artifacts import write_json_atomic
 from morphofeatures.data.io import export_embeddings, load_embeddings
 from morphofeatures.representations import fingerprint_file
@@ -39,83 +45,12 @@ def package_results(destination):
     return archive
 
 
-def transformed(features, normalization):
-    if normalization == "standardize":
-        return StandardScaler().fit_transform(features)
-    if normalization == "l2":
-        return normalize(features)
-    if normalization == "none":
-        return np.asarray(features)
-    raise ValueError("normalization must be standardize, l2, or none")
-
-
-def project_table(ids, features, settings):
-    if len(ids) < 3 or features.shape[1] < 2:
-        raise ValueError("Analysis requires at least three objects and two features")
-    seed = int(settings.get("seed", 42))
-    data = transformed(features, settings.get("normalization", "standardize"))
-    projection = PCA(n_components=2, random_state=seed).fit_transform(data)
-    clusters = cluster_embeddings(
-        data,
-        method=settings.get("cluster_method", "kmeans"),
-        n_clusters=int(settings.get("clusters", 8)),
-        n_neighbors=int(settings.get("neighbors", 15)),
-        resolution=float(settings.get("resolution", 0.004)),
-        seed=seed,
-    )
-    frame = pd.DataFrame(
-        {"label_id": ids, "cluster": clusters, "pca_1": projection[:, 0], "pca_2": projection[:, 1]}
-    )
-    if settings.get("umap", True):
-        if len(ids) < 4:
-            raise ValueError(
-                "UMAP requires at least four objects; disable umap for smaller subsets"
-            )
-        reduced = compute_umap(
-            data,
-            n_neighbors=int(settings.get("neighbors", 15)),
-            min_dist=float(settings.get("min_dist", 0.1)),
-            seed=seed,
-            n_epochs=settings.get("umap_epochs"),
-        )
-        frame["umap_1"], frame["umap_2"] = reduced.T
-    diagnostics = {"clusters_observed": int(len(np.unique(clusters)))}
-    if 1 < len(np.unique(clusters)) < len(ids):
-        try:
-            diagnostics["silhouette"] = float(
-                silhouette_score(data, clusters, sample_size=min(2000, len(ids)), random_state=seed)
-            )
-        except ValueError as error:
-            diagnostics["silhouette_unavailable"] = str(error)
-    return frame, diagnostics
-
-
-def save_figure(frame, destination, title):
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    methods = ["pca"] + (["umap"] if "umap_1" in frame else [])
-    fig, axes = plt.subplots(1, len(methods), figsize=(6 * len(methods), 5), squeeze=False)
-    for axis, method in zip(axes[0], methods):
-        axis.scatter(
-            frame[f"{method}_1"], frame[f"{method}_2"], c=frame.cluster, s=12, cmap="tab20"
-        )
-        axis.set(xlabel=method.upper() + " 1", ylabel=method.upper() + " 2", title=title)
-    fig.tight_layout()
-    fig.savefig(destination)
-    plt.close(fig)
-
-
 def analyze(embedding, destination, settings):
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
     table = load_embeddings(embedding).sorted()
     frame, diagnostics = project_table(table.label_ids, table.features, settings)
-    frame.to_csv(destination / "coordinates.tsv", sep="\t", index=False)
     export_embeddings(destination / "embeddings.npz", table.label_ids, table.features)
-    save_figure(frame, destination / "projection.svg", "Exploratory morphology")
     result = {
         "schema": "morphofeatures.analysis.v1",
         "settings": settings,
@@ -125,9 +60,28 @@ def analyze(embedding, destination, settings):
         "embedding": "embeddings.npz",
         "interpretation": "Projection and clustering are exploratory; biological predictive value is untested.",
     }
+    labels = join_labels(table.label_ids, settings)
+    if settings.get("annotations") and settings.get("classify", True):
+        result["classification"] = classify_embedding(table, destination, settings)
+        labels = pd.read_csv(
+            destination / "object_labels.tsv", sep="\t", dtype={"label_id": np.int64}
+        )
+        result["interpretation"] = (
+            "Projections are exploratory. Classification scores use held-out annotations and "
+            "training-fold-only scaling; generalization to independent specimens depends on "
+            "the grouping and representation pretraining exposure."
+        )
     metadata = Path(embedding).with_suffix(".metadata.json")
     if metadata.exists():
         result["extraction"] = json.loads(metadata.read_text())
+    frame = frame.merge(labels, on="label_id", how="left", validate="one_to_one")
+    result["class_colors"] = frame.attrs["class_colors"] = label_palette(labels)
+    labels.merge(frame[["label_id", "cluster"]], on="label_id", how="left").to_csv(
+        destination / "object_labels.tsv", sep="\t", index=False
+    )
+    result["object_labels"] = "object_labels.tsv"
+    frame.to_csv(destination / "coordinates.tsv", sep="\t", index=False)
+    save_figure(frame, destination / "projection.svg", "Exploratory morphology", settings)
     path = write_json_atomic(destination / "analysis.json", result)
     package_results(destination)
     return path
@@ -136,7 +90,9 @@ def analyze(embedding, destination, settings):
 def evaluation_splits(ids, annotations, settings):
     from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 
-    column = settings.get("label_column", "label")
+    column = (
+        "known_label" if "known_label" in annotations else settings.get("label_column", "label")
+    )
     group_column = settings.get("group_column")
     if column not in annotations:
         raise ValueError(f"Annotations require label column {column!r}")
@@ -145,6 +101,8 @@ def evaluation_splits(ids, annotations, settings):
         raise ValueError("Evaluation requires labels for every evaluated object")
     y = matched[column].astype(str).to_numpy()
     folds = int(settings.get("folds", 5))
+    if settings.get("fold_policy", "reduce") == "reduce":
+        folds = min(folds, int(pd.Series(y).value_counts().min()))
     if folds < 2 or pd.Series(y).value_counts().min() < folds:
         raise ValueError(
             "Each class needs at least folds objects; reduce folds or provide more labels"
@@ -177,9 +135,8 @@ def evaluation_splits(ids, annotations, settings):
     return y, groups, split
 
 
-def evaluate_features(features, y, splits, settings):
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.neighbors import KNeighborsClassifier, NearestNeighbors
+def evaluate_features(features, y, splits, settings, *, predictions=None):
+    from sklearn.neighbors import NearestNeighbors
 
     scores = []
     for fold, (train, test) in enumerate(splits):
@@ -218,16 +175,29 @@ def evaluate_features(features, y, splits, settings):
             "k": k,
             "test_objects_with_class_absent_from_training": int((available == 0).sum()),
         }
-        for name, estimator in {
-            "knn": KNeighborsClassifier(n_neighbors=k),
-            "linear": LogisticRegression(
-                C=float(settings.get("linear_c", 1.0)),
-                max_iter=int(settings.get("max_iter", 2000)),
-                random_state=int(settings.get("seed", 42)),
-                class_weight="balanced",
-            ),
-        }.items():
-            predicted = estimator.fit(x_train, y[train]).predict(x_test)
+        classes = [name for name in LEGACY_CELL_TYPES if name in set(y)]
+        classes.extend(sorted(set(y) - set(classes)))
+        encoded = np.asarray([classes.index(value) for value in y])
+        for model_name in settings.get("classifier_models", ["logistic", "knn"]):
+            name = "linear" if model_name == "logistic" else model_name
+            estimator = configured_classifier(model_name, settings, train_count=len(train))
+            estimator.fit(features[train], encoded[train])
+            predicted = np.asarray(classes)[estimator.predict(features[test])]
+            confidence = estimator.predict_proba(features[test]).max(axis=1)
+            if predictions is not None:
+                predictions.extend(
+                    {
+                        "fold": fold,
+                        "classifier": name,
+                        "row": int(index),
+                        "actual": str(actual),
+                        "predicted": str(value),
+                        "confidence": float(probability),
+                    }
+                    for index, actual, value, probability in zip(
+                        test, y[test], predicted, confidence
+                    )
+                )
             row[name + "_accuracy"] = float(accuracy_score(y[test], predicted))
             row[name + "_balanced_accuracy"] = float(balanced_accuracy_score(y[test], predicted))
         model = KMeans(
@@ -235,9 +205,127 @@ def evaluate_features(features, y, splits, settings):
             n_init=10,
             random_state=int(settings.get("seed", 42)),
         ).fit(x_train)
-        row["test_cluster_ari"] = float(adjusted_rand_score(y[test], model.predict(x_test)))
+        row["test_kmeans_ari"] = float(adjusted_rand_score(y[test], model.predict(x_test)))
         scores.append(row)
     return scores
+
+
+def classify_embedding(table, destination, settings):
+    """Evaluate one representation on ID-joined annotations and retain OOF evidence."""
+    from sklearn.metrics import classification_report, confusion_matrix
+
+    path = Path(settings["annotations"])
+    annotations = read_annotations(path, settings)
+    if (
+        "label_id" not in annotations
+        or annotations.label_id.isna().any()
+        or annotations.label_id.duplicated().any()
+    ):
+        raise ValueError("Annotations need unique, nonmissing label_id values")
+    column = "known_label"
+    if column not in annotations:
+        raise ValueError(f"Missing annotation column: {column}")
+    annotated = set(annotations.loc[annotations[column].notna(), "label_id"])
+    indices = np.flatnonzero(np.isin(table.label_ids, list(annotated)))
+    if not len(indices):
+        raise ValueError("No embedding object IDs match labeled annotations")
+    matched_labels = annotations.set_index("label_id").loc[table.label_ids[indices], column]
+    counts = matched_labels.value_counts()
+    retained = counts[counts >= max(2, int(settings.get("minimum_class_count", 2)))].index
+    indices = indices[matched_labels.isin(retained).to_numpy()]
+    if len(retained) < 2:
+        raise ValueError(
+            "At least two matched cell types need two or more examples; disable classification to show labels only"
+        )
+    ids = table.label_ids[indices]
+    y, groups, splits = evaluation_splits(ids, annotations, settings)
+    predictions = []
+    scores = evaluate_features(
+        table.features[indices], y, splits, settings, predictions=predictions
+    )
+    split_rows = [
+        {
+            "fold": fold,
+            "role": role,
+            "label_id": int(ids[i]),
+            "label": y[i],
+            "group": groups[i] if groups is not None else None,
+        }
+        for fold, (train, test) in enumerate(splits)
+        for role, rows in (("train", train), ("test", test))
+        for i in rows
+    ]
+    pd.DataFrame(split_rows).to_csv(destination / "splits.tsv", sep="\t", index=False)
+    for row in predictions:
+        row["label_id"] = int(ids[row.pop("row")])
+    pd.DataFrame(predictions).to_csv(destination / "predictions.tsv", sep="\t", index=False)
+    classes = sorted(set(y))
+    details = {}
+    for name in dict.fromkeys(row["classifier"] for row in predictions):
+        rows = [row for row in predictions if row["classifier"] == name]
+        actual, predicted = [row["actual"] for row in rows], [row["predicted"] for row in rows]
+        details[name] = {
+            "classes": classes,
+            "confusion_matrix": confusion_matrix(actual, predicted, labels=classes).tolist(),
+            "per_class": classification_report(
+                actual, predicted, labels=classes, output_dict=True, zero_division=0
+            ),
+        }
+    score_frame = pd.DataFrame(scores)
+    metrics = [
+        key for key in score_frame if key not in {"fold", "train_objects", "test_objects", "k"}
+    ]
+    models = settings.get("classifier_models", ["logistic", "knn"])
+    if not models:
+        raise ValueError("Select at least one classifier, or disable classification")
+    prediction_model = settings.get("prediction_model", models[0])
+    if prediction_model not in models:
+        raise ValueError("prediction_model must be one of classifier_models")
+    chosen = "linear" if prediction_model == "logistic" else prediction_model
+    labels = join_labels(table.label_ids, settings)
+    labels["predicted_label"] = pd.Series(pd.NA, index=labels.index, dtype="string")
+    labels["prediction_source"] = pd.Series(pd.NA, index=labels.index, dtype="string")
+    labels["prediction_confidence"] = np.nan
+    oof = pd.DataFrame([row for row in predictions if row["classifier"] == chosen]).set_index(
+        "label_id"
+    )
+    for name, source in (("predicted_label", "predicted"), ("prediction_confidence", "confidence")):
+        labels.loc[np.isin(table.label_ids, ids), name] = oof.loc[ids, source].to_numpy()
+    labels.loc[np.isin(table.label_ids, ids), "prediction_source"] = "held_out_fold"
+    unseen = np.flatnonzero(~np.isin(table.label_ids, ids))
+    if len(unseen) and settings.get("predict_unlabeled", True):
+        estimator = configured_classifier(prediction_model, settings, train_count=len(ids))
+        ordered = [name for name in LEGACY_CELL_TYPES if name in set(y)]
+        ordered.extend(sorted(set(y) - set(ordered)))
+        encoded = np.asarray([ordered.index(value) for value in y])
+        estimator.fit(table.features[indices], encoded)
+        labels.loc[unseen, "predicted_label"] = np.asarray(ordered)[
+            estimator.predict(table.features[unseen])
+        ]
+        labels.loc[unseen, "prediction_confidence"] = estimator.predict_proba(
+            table.features[unseen]
+        ).max(1)
+        labels.loc[unseen, "prediction_source"] = "fit_on_labeled_objects"
+    labels["prediction_classifier"] = prediction_model
+    labels.to_csv(destination / "object_labels.tsv", sep="\t", index=False)
+    return {
+        "evaluated_objects": len(ids),
+        "excluded_object_ids": [int(i) for i in table.label_ids if i not in set(ids)],
+        "effective_folds": len(splits),
+        "prediction_model": prediction_model,
+        "prediction_protocol": "Evaluated objects use held-out predictions; other objects use a model fitted on all eligible labeled objects. Confidence is not calibrated.",
+        "annotation_source": fingerprint_file(path),
+        "grouping": settings.get("group_column")
+        or "object-level; related-object leakage remains untested",
+        "learned_preprocessing": "training fold only",
+        "representation_training_exposure": "not inferred; assess pretraining and specimen overlap separately",
+        "fold_metrics": scores,
+        "mean_metrics": {key: float(score_frame[key].mean()) for key in metrics},
+        "std_metrics": {key: float(score_frame[key].std(ddof=0)) for key in metrics},
+        "classifiers": details,
+        "predictions": "predictions.tsv",
+        "splits": "splits.tsv",
+    }
 
 
 def compare(embeddings, destination, settings):
@@ -273,35 +361,9 @@ def compare(embeddings, destination, settings):
         name: sorted(int(i) for i in set(t.label_ids) - set(ids)) for name, t in tables.items()
     }
     annotation_excluded = []
-    y = groups = splits = None
-    evaluation_indices = np.arange(len(ids))
-    if settings.get("annotations"):
-        path = Path(settings["annotations"])
-        annotations = pd.read_csv(path, sep="\t" if path.suffix == ".tsv" else ",")
-        if "label_id" not in annotations or annotations.label_id.duplicated().any():
-            raise ValueError("Annotations need unique label_id values")
-        label_column = settings.get("label_column", "label")
-        if label_column not in annotations:
-            raise ValueError(f"Missing annotation column: {label_column}")
-        annotated = set(annotations.loc[annotations[label_column].notna(), "label_id"])
-        evaluation_indices = np.asarray([i for i, value in enumerate(ids) if value in annotated])
-        evaluation_ids = ids[evaluation_indices]
-        annotation_excluded = sorted(int(i) for i in set(ids) - annotated)
-        y, groups, splits = evaluation_splits(evaluation_ids, annotations, settings)
-        split_rows = []
-        for fold, (train, test) in enumerate(splits):
-            for role, indices in (("train", train), ("test", test)):
-                split_rows.extend(
-                    {
-                        "fold": fold,
-                        "role": role,
-                        "label_id": int(evaluation_ids[i]),
-                        "label": y[i],
-                        "group": groups[i] if groups is not None else None,
-                    }
-                    for i in indices
-                )
-        pd.DataFrame(split_rows).to_csv(destination / "splits.tsv", sep="\t", index=False)
+    splits = None
+    # Classification is shared with standalone analysis, including rare-class
+    # filtering, ID-sorted fold assignment, and out-of-fold predictions.
     report = {
         "schema": "morphofeatures.comparison.v1",
         "settings": settings,
@@ -330,10 +392,6 @@ def compare(embeddings, destination, settings):
         features = table.features[np.searchsorted(table.label_ids, ids)]
         export_embeddings(sub / "embeddings.npz", ids, features)
         frame, diagnostics = project_table(ids, features, settings)
-        frame.to_csv(sub / "coordinates.tsv", sep="\t", index=False)
-        save_figure(frame, sub / "projection.svg", name)
-        frame["representation"] = name
-        frames.append(frame)
         result = {
             "directory": sub.name,
             "source": fingerprint_file(embeddings[name]),
@@ -344,10 +402,30 @@ def compare(embeddings, destination, settings):
         metadata = Path(embeddings[name]).with_suffix(".metadata.json")
         if metadata.exists():
             result["extraction"] = json.loads(metadata.read_text())
-        if splits:
-            result["evaluation"] = evaluate_features(
-                features[evaluation_indices], y, splits, settings
+        labels = join_labels(ids, settings)
+        if settings.get("annotations") and settings.get("classify", True):
+            from morphofeatures.data.contracts import EmbeddingTable
+
+            result["classification"] = classify_embedding(
+                EmbeddingTable(ids, features), sub, settings
             )
+            result["evaluation"] = result["classification"]["fold_metrics"]
+            labels = pd.read_csv(sub / "object_labels.tsv", sep="\t", dtype={"label_id": np.int64})
+            if index == 0:
+                (destination / "splits.tsv").write_bytes((sub / "splits.tsv").read_bytes())
+                report["excluded_from_evaluation"] = result["classification"]["excluded_object_ids"]
+                report["interpretation"] = (
+                    "Matched representations use identical held-out folds. Projections remain exploratory."
+                )
+        frame = frame.merge(labels, on="label_id", how="left", validate="one_to_one")
+        result["class_colors"] = frame.attrs["class_colors"] = label_palette(labels)
+        labels.merge(frame[["label_id", "cluster"]], on="label_id", how="left").to_csv(
+            sub / "object_labels.tsv", sep="\t", index=False
+        )
+        frame.to_csv(sub / "coordinates.tsv", sep="\t", index=False)
+        save_figure(frame, sub / "projection.svg", name, settings)
+        frame["representation"] = name
+        frames.append(frame)
         report["representations"][name] = result
     pd.concat(frames).to_csv(destination / "coordinates.tsv", sep="\t", index=False)
     if settings.get("annotations"):
@@ -357,7 +435,7 @@ def compare(embeddings, destination, settings):
         "",
         report["interpretation"],
         "",
-        f"Matched objects: {len(ids)}. Objects without evaluation labels: {len(annotation_excluded)}.",
+        f"Matched objects: {len(ids)}. Objects without evaluation labels: {len(report['excluded_from_evaluation'])}.",
         "",
         "The same folds and one fixed downstream parameter set are used for every representation. "
         "Scaling and optional evaluation PCA are fitted on training folds only. "

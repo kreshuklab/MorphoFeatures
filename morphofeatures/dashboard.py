@@ -13,13 +13,11 @@ from typing import Dict, Optional
 import numpy as np
 import pandas as pd
 import streamlit as st
-from sklearn.preprocessing import StandardScaler
 
 from morphofeatures.analysis.classification import (
     evaluate_embedding_classifier,
 )
 from morphofeatures.analysis.context import agglomerate_features, aggregate_neighbors
-from morphofeatures.analysis.projection import cluster_embeddings, compute_umap
 from morphofeatures.analysis.validation import validate_bundled_artifacts, validate_mobie_tables
 from morphofeatures.artifacts import inspect_checkpoint, inspect_embedding, tail_text
 from morphofeatures.config import load_config, repository_root
@@ -52,11 +50,10 @@ DOCS = {
     "Legacy reproduction": ROOT / "docs" / "legacy_reproduction.md",
     "Training embeddings": ROOT / "docs" / "training_new_embeddings.md",
     "Modern MAE": ROOT / "docs" / "modern_mae_workflow.md",
-    "Notebooks": ROOT / "docs" / "notebooks.md",
+    "Notebooks": ROOT / "notebooks" / "README.md",
     "SLURM workspace": ROOT / "docs" / "slurm_workflow.md",
     "Analysis and MoBIE": ROOT / "docs" / "analysis_and_mobie.md",
     "Troubleshooting": ROOT / "docs" / "troubleshooting.md",
-    "Reproducibility report": ROOT / "docs" / "reproducibility_report.md",
 }
 PAGES = ("Workflow", "Runs", "Results", "Tools", "Workspace settings", "Help")
 CACHE_DATA = st.cache_data if hasattr(st, "cache_data") else st.experimental_memo
@@ -296,83 +293,57 @@ def _projection(config) -> None:
             _display_path(config.paths.analysis_data / "class_labels.tsv"),
         )
         subset_column, method_column, cluster_column = st.columns(3)
-        subset = subset_column.number_input("Subset cells (0 = all)", min_value=0, value=256, step=64)
+        subset = subset_column.number_input("Subset cells (0 = all)", min_value=0, value=0, step=64)
         method = method_column.selectbox("Cluster method", ("kmeans", "leiden"))
         clusters = cluster_column.number_input("K-means clusters", min_value=2, value=8)
         neighbor_column, epoch_column, seed_column = st.columns(3)
         neighbors = neighbor_column.number_input("UMAP neighbors", min_value=2, value=15)
         epochs = epoch_column.number_input("UMAP epochs", min_value=10, value=50, step=10)
         seed = seed_column.number_input("Projection seed", min_value=0, value=int(config.seed))
+        min_dist = st.number_input("UMAP minimum distance", min_value=0.0, max_value=1.0, value=0.0)
+        resolution = st.number_input("Leiden resolution", min_value=0.000001, value=0.004, format="%.6f")
         submitted = st.form_submit_button("Run projection")
     if submitted:
         try:
             with st.spinner("Computing standardized UMAP and clusters..."):
                 table = load_embeddings(_resolve(embedding_value))
-                rng = np.random.default_rng(int(seed))
-                count = int(subset)
-                if count and count < len(table.label_ids):
-                    selected = np.sort(rng.choice(len(table.label_ids), size=count, replace=False))
-                    ids, features = table.label_ids[selected], table.features[selected]
-                else:
-                    ids, features = table.label_ids, table.features
-                features = StandardScaler().fit_transform(features)
-                projection = compute_umap(
-                    features,
-                    n_neighbors=int(neighbors),
-                    seed=int(seed),
-                    n_epochs=int(epochs),
+                from morphofeatures.analysis.annotations import join_labels
+                from morphofeatures.analysis.projection import project_embeddings
+                from morphofeatures.analysis.visualization import label_palette
+
+                settings = {
+                    "subset": int(subset), "cluster_method": method, "clusters": int(clusters),
+                    "neighbors": int(neighbors), "min_dist": float(min_dist),
+                    "resolution": float(resolution), "umap_epochs": int(epochs),
+                    "seed": int(seed), "umap": True,
+                }
+                if annotation_value.strip():
+                    settings["annotations"] = str(_resolve(annotation_value))
+                result_frame, _ = project_embeddings(table.label_ids, table.features, settings)
+                all_labels = join_labels(table.label_ids, settings)
+                result_frame = result_frame.merge(all_labels, on="label_id", validate="one_to_one")
+                result_frame.attrs["class_colors"] = label_palette(all_labels)
+                destination = _resolve(output_value)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                coordinate_columns = ["cluster", "pca_1", "pca_2", "umap_1", "umap_2"]
+                export_embeddings(
+                    destination, result_frame.label_id.to_numpy(),
+                    result_frame[coordinate_columns].to_numpy(), coordinate_columns,
                 )
-                labels = cluster_embeddings(
-                    features,
-                    method=method,
-                    n_neighbors=int(neighbors),
-                    n_clusters=int(clusters),
-                    seed=int(seed),
+                result_frame.to_csv(
+                    destination.with_name(destination.stem + "_labels.tsv"), sep="\t", index=False
                 )
-            result_frame = pd.DataFrame(
-                {"label_id": ids, "cluster": labels, "umap_1": projection[:, 0], "umap_2": projection[:, 1]}
-            )
-            if annotation_value.strip():
-                annotation_path = _resolve(annotation_value)
-                separator = "\t" if annotation_path.suffix.lower() == ".tsv" else ","
-                annotations = pd.read_csv(annotation_path, sep=separator)
-                if "label_id" not in annotations or annotations["label_id"].duplicated().any():
-                    raise ValueError("Biological metadata requires unique label_id values")
-                result_frame = result_frame.merge(
-                    annotations, on="label_id", how="left", validate="one_to_one"
-                )
-            destination = export_embeddings(
-                _resolve(output_value),
-                ids,
-                np.column_stack((labels, projection)),
-                ("cluster", "umap_1", "umap_2"),
-            )
             st.session_state["projection_result"] = result_frame
             st.success("Saved {}".format(_display_path(destination)))
         except Exception as error:
             st.error(str(error))
     result = st.session_state.get("projection_result")
     if result is not None:
-        color_options = ["cluster"]
-        color_options.extend(
-            column for column in result.columns if column not in {"label_id", "cluster", "umap_1", "umap_2"}
-        )
-        color_field = st.selectbox("Color points by", color_options)
-        tooltips = ["label_id", "cluster", "umap_1", "umap_2"]
-        if color_field not in tooltips:
-            tooltips.append(color_field)
-        st.vega_lite_chart(
-            result,
-            {
-                "mark": {"type": "point", "filled": True, "size": 45, "opacity": 0.75},
-                "encoding": {
-                    "x": {"field": "umap_1", "type": "quantitative"},
-                    "y": {"field": "umap_2", "type": "quantitative"},
-                    "color": {"field": color_field, "type": "nominal"},
-                    "tooltip": tooltips,
-                },
-                "height": 500,
-            },
+        from morphofeatures.analysis.visualization import interactive_projection
+
+        opacity = st.slider("Unlabeled point opacity", 0.0, 1.0, 0.15, key="tools:opacity")
+        st.plotly_chart(
+            interactive_projection(result, "umap", unlabeled_opacity=opacity),
             use_container_width=True,
         )
         _show_dataframe(result.head(100))
@@ -484,16 +455,6 @@ def _profiles(config) -> Dict[str, ClusterProfile]:
         return load_cluster_profiles(profile_path)
     except Exception:
         return {"dry-run": ClusterProfile("dry-run", partition="compute")}
-
-
-def _train_encode(config) -> None:
-    from morphofeatures.workspace_ui import training_page
-
-    training_tab, legacy_tab = st.tabs(("Persistent training configuration", "Legacy workflows and sweeps"))
-    with training_tab:
-        training_page(config)
-    with legacy_tab:
-        _legacy_train_encode(config)
 
 
 def _legacy_train_encode(config) -> None:
@@ -1151,9 +1112,18 @@ def _workspace_settings(config, config_path):
 def _tools(config, config_path):
     _header("Tools", "Specialist workflows, data inspection, and published feature processing.")
     tool = st.selectbox("Tool", ("Choose a tool", "Published shape / texture workflows and MAE sweeps",
-        "Feature assembly", "Classification and projection tools", "Mesh inspection", "Data inspection and synthetic fixtures", "Runtime and bundled-data checks"))
+        "DINO features", "Feature assembly", "Classification and projection tools", "Mesh inspection", "Data inspection and synthetic fixtures", "Runtime and bundled-data checks"))
     if tool == "Published shape / texture workflows and MAE sweeps":
         _legacy_train_encode(config)
+    elif tool == "DINO features":
+        st.write("Extract pretrained DINOv2 or DINOv3 features from prepared object intensity crops and masks, then visualize embeddings and test classification against your annotations.")
+        st.caption("Supply an official local model checkout and matching pretrained weights. The workflow uses the same review, local/Slurm execution, and Results pages as MAE.")
+        if st.button("Create DINO features workflow", type="primary"):
+            from morphofeatures.workflow_ui import navigate, use_draft
+            from morphofeatures.workspace_state import new_draft
+
+            use_draft(config, new_draft("dino"), "Analyze")
+            navigate("Workflow")
     elif tool == "Feature assembly":
         _build_features(config)
     elif tool == "Classification and projection tools":

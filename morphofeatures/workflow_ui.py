@@ -13,9 +13,14 @@ import streamlit as st
 import yaml
 
 from morphofeatures.config import repository_root
-from morphofeatures.configuration_editor import load_document, parse_document
+from morphofeatures.configuration_editor import (
+    load_document,
+    parse_document,
+    training_form_defaults,
+)
 from morphofeatures.registry import JobRegistry
 from morphofeatures.slurm import SlurmScheduler, load_cluster_profiles
+from morphofeatures.ui_settings import setting_help
 from morphofeatures.workflows import format_command
 from morphofeatures.workspace_jobs import (
     plan_workspace_job,
@@ -86,7 +91,9 @@ def _put(values, path, value):
     values[path[-1]] = value
 
 
-def field(draft, path, label, default=None, *, options=None, help=None, optional=False):
+def field(
+    draft, path, label, default=None, *, options=None, help=None, optional=False, multiple=False
+):
     """Widgets mirror the draft; their cleanup on navigation cannot delete settings."""
     missing = object()
     value = _get(draft, path, missing)
@@ -123,8 +130,17 @@ def field(draft, path, label, default=None, *, options=None, help=None, optional
         _put(draft, path, None if optional and replacement == "" else replacement)
         touch(draft)
 
+    if help is None:
+        help = setting_help(path)
+        if path[-1] == "normalization" and len(path) > 2 and path[1] == "stages":
+            action = draft["document"]["stages"][path[2]].get("action")
+            if action == "preprocess":
+                help = "Crop intensity scaling: dtype maps the integer data range to [0,1] (float input must already be in [0,1]); percentile maps the object's 1st–99th intensity percentiles to [0,1]; none preserves intensities."
     kwargs = {"key": key, "on_change": changed, "help": help}
-    if options is not None:
+    if multiple:
+        choices = list(dict.fromkeys([*(options or []), *(value or [])]))
+        st.multiselect(label, choices, **kwargs)
+    elif options is not None:
         choices = list(options)
         if value not in choices:
             choices.insert(0, value)
@@ -172,7 +188,6 @@ def advanced_fields(draft, path, excluded=()):
                 path + [key],
                 key.replace("_", " ").capitalize(),
                 value,
-                help="Configuration field: " + ".".join(map(str, path[1:] + [key])),
             )
 
 
@@ -228,7 +243,9 @@ def _start(config, draft):
     st.write(
         {
             "raw": "Prepare crops → train a model → extract embeddings → analyze.",
+            "preprocess": "Prepare object crops, IDs and masks only. You can train or extract DINO features from these saved outputs later.",
             "crops": "Use your prepared data → train → extract embeddings → analyze.",
+            "dino": "Use pretrained DINOv2 or DINOv3 → extract object features → visualize and optionally evaluate known classes. No MAE training is needed.",
             "checkpoint": "Use a matching model and data configuration → extract → analyze.",
             "embeddings": "Analyze one saved embedding or compare several representations.",
             "demo": "Train on eight generated synthetic crops, then extract and analyze. A short CPU demonstration.",
@@ -243,7 +260,7 @@ def _start(config, draft):
             config,
             new_draft(start),
             "Prepare data"
-            if start == "raw"
+            if start in {"raw", "preprocess"}
             else "Train"
             if start in {"crops", "demo"}
             else "Analyze",
@@ -339,11 +356,32 @@ def _start(config, draft):
 
 
 def _load_stage_config(draft, index):
-    with st.expander("Load model / data settings"):
+    stage = draft["document"]["stages"][index]
+    dino = stage.get("action") == "extract" and stage.get("model") in {"dinov2", "dinov3"}
+    with st.expander("Load model / data settings", expanded=dino):
+        if dino:
+            st.info(
+                "Load mae_config.yaml from Prepare data to fill in crop paths and HDF5/N5 "
+                "dataset keys. Already using grouped N5 patches for MAE? Load that same "
+                "MAE YAML here to supply the patch container, positions/ID index and sampling. "
+                "Your selected DINO weights, backbone and view settings are kept."
+            )
         source = retained_input(
-            "Model / data YAML path", "configs/smoke.yaml", f"stage:{index}:source"
+            "Model / data YAML path",
+            "" if dino else "configs/smoke.yaml",
+            f"stage:{draft['id']}:{index}:source",
+            help="Load the generated mae_config.yaml for prepared crops. For the grouped Platynereis N5 inputs, use configs/sites/mae_platynereis_nuclei_embl.yaml. This field expects a YAML file."
+            if dino
+            else "YAML file containing this stage's model and input-data settings.",
         )
-        profile = retained_input("Training profile", "", f"stage:{index}:profile")
+        profile = retained_input(
+            "Data profile (optional)" if dino else "Training profile",
+            "",
+            f"stage:{draft['id']}:{index}:profile",
+            help="Blank uses the file's active profile. Profiles also control which object IDs and how many patches per object are selected."
+            if dino
+            else "Blank uses the file's active training profile.",
+        )
         st.caption("This replaces this stage's model/data settings. It does not submit a job.")
         if st.button("Load settings into this stage", key=f"load-stage:{index}"):
             try:
@@ -373,10 +411,23 @@ def _data_fields(draft, index, *, training=False):
         st.info("Input: crops, object IDs and masks from Prepare data in this workflow.")
         return
     data = _get(draft, path, {})
+    dino = stage.get("action") == "extract" and stage.get("model") in {"dinov2", "dinov3"}
     if data.get("source") == "n5_masked_patches":
-        st.info("Input contract: grouped N5 patches. Keep this model paired with grouped data.")
+        st.info(
+            "Input: existing grouped N5 patches. DINO encodes views of the stored patches and "
+            "combines them into one feature vector per parent object ID from the positions index."
+            if dino
+            else "Input contract: grouped N5 patches. Keep this model paired with grouped data."
+        )
         field(draft, path + ["patches_container"], "N5 patch container", "")
         field(draft, path + ["positions_container"], "N5 positions container", "")
+        if dino:
+            st.caption(
+                f"Dataset keys: patches={data.get('patches_key', 'patches')}, "
+                f"positions={data.get('positions_key', 'positions')}, IDs={data.get('ids_key', 'ids')}. "
+                f"Sampling uses {data.get('group_size', 200)} patches per object and "
+                f"split={stage.get('config', {}).get('inference', {}).get('split', 'all')}."
+            )
     elif draft.get("allow_synthetic") and not data.get("crops"):
         st.info(
             "Synthetic demonstration: eight generated crops. No biological dataset is selected."
@@ -385,9 +436,35 @@ def _data_fields(draft, index, *, training=False):
         st.caption(
             "Input contract: whole-object crops. Crops, object IDs and masks must use the same row order."
         )
-        field(draft, path + ["crops"], "Prepared crops (.npy)", None, optional=True)
-        field(draft, path + ["label_ids"], "Object IDs (.npy)", None, optional=True)
-        field(draft, path + ["loss_masks"], "Object masks (.npy, optional)", None, optional=True)
+        if dino:
+            st.caption(
+                "Input: one crop per object, stored as NumPy, HDF5 or N5. For grouped N5 patches, load their MAE data YAML above."
+            )
+        for name, label, key_label in (
+            ("crops", "Prepared crops (.npy / .h5 / .n5)", "Crop dataset key"),
+            ("label_ids", "Object IDs (.npy / .h5 / .n5)", "Object ID dataset key"),
+            ("loss_masks", "Object masks (optional)", "Mask dataset key"),
+        ):
+            field(draft, path + [name], label, None, optional=True)
+            value = data.get(name)
+            if isinstance(value, str) and Path(value).suffix.lower() in {
+                ".h5",
+                ".hdf5",
+                ".hdf",
+                ".n5",
+            }:
+                field(draft, path + [name + "_key"], key_label, None, optional=True)
+        if (
+            dino
+            and data.get("crops")
+            and Path(data["crops"]).suffix.lower() == ".n5"
+            and not data.get("crops_key")
+        ):
+            st.warning(
+                "N5 crops need a dataset key: load the mae_config.yaml produced by Prepare data. "
+                "For grouped N5 patches, load their MAE YAML instead; the positions/ID index "
+                "is needed alongside the patches. No additional preprocessing is required."
+            )
 
 
 def _prepare(draft, index):
@@ -405,6 +482,7 @@ def _prepare(draft, index):
             )
             field(draft, path + [kind + "_axes"], label + " axis order", "zyxc")
             field(draft, path + [kind + "_channel"], label + " channel", 0)
+    metadata = _inspect_preparation(draft, index)
     roi = _get(draft, path + ["roi"])
     if isinstance(roi, list) and len(roi) == 2:
         triple_field(draft, path + ["roi", 0], "ROI start (inclusive)", [0, 0, 0])
@@ -417,7 +495,16 @@ def _prepare(draft, index):
             None,
             help="null scans the full volume; use [[z0,y0,x0],[z1,y1,x1]] to bound it.",
         )
+    if metadata:
+        _preparation_preview(draft, index, metadata)
     triple_field(draft, path + ["crop_shape"], "Crop shape", [32, 32, 32])
+    field(draft, path + ["output_format"], "Output format", "npy", options=["npy", "h5", "n5"])
+    output_format = _get(draft, path + ["output_format"], "npy")
+    st.caption(
+        "Saves crops.npy, masks.npy and label_ids.npy."
+        if output_format == "npy"
+        else f"Saves crops.{output_format} with compressed crops, masks and label_ids datasets."
+    )
     field(draft, path + ["max_objects"], "Maximum objects (0 means all)", 8)
     field(
         draft,
@@ -428,9 +515,10 @@ def _prepare(draft, index):
     )
     triple_field(draft, path + ["spacing_zyx"], "Voxel spacing", [1.0, 1.0, 1.0])
     st.caption(
-        "Produces crops.npy, label_ids.npy, masks.npy and a model-ready data configuration. Objects touching ROI boundaries are skipped unless explicitly allowed."
+        "Every format includes mae_config.yaml with the paths and dataset keys needed by MAE, DINO and object previews. Objects touching ROI boundaries are skipped unless explicitly allowed."
     )
     with st.expander("Advanced preparation settings"):
+        field(draft, path + ["object_ids"], "Specific object IDs (optional)", [])
         advanced_fields(
             draft,
             path,
@@ -446,14 +534,183 @@ def _prepare(draft, index):
                 "segmentation_channel",
                 "roi",
                 "crop_shape",
+                "output_format",
                 "max_objects",
                 "unit",
                 "spacing_zyx",
+                "object_ids",
             },
         )
+    if len(draft["document"]["stages"]) > 1:
+        if st.button(
+            "Just Run Preprocessing",
+            key=f"prepare-only:{index}",
+            help="Keep this preparation stage and go to review. Later stages are removed from the draft; Undo last stage change restores them.",
+        ):
+            draft.setdefault("stage_history", []).append(deepcopy(draft["document"]))
+            _replace_document(
+                draft,
+                {**draft["document"], "stages": [deepcopy(draft["document"]["stages"][index])]},
+            )
+            st.session_state["workflow_step"] = "Review & run"
+            rerun()
+
+
+def _inspect_preparation(draft, index):
+    from morphofeatures.data.volumes import inspect_volume
+
+    stage = draft["document"]["stages"][index]
+    keys = (
+        "raw",
+        "segmentation",
+        "raw_key",
+        "segmentation_key",
+        "raw_axes",
+        "segmentation_axes",
+        "raw_channel",
+        "segmentation_channel",
+    )
+    signature = tuple(stage.get(key) for key in keys)
+    key = f"volume-metadata:{draft['id']}:{index}"
+    st.markdown("**Inspect data and choose a region**")
+    st.caption(
+        "Read dimensions first, then choose an ROI. Inspection reads metadata; the image preview reads one bounded slice."
+    )
+    if st.button("Inspect data dimensions", key=key + ":load"):
+        metadata = {}
+        for kind in ("raw", "segmentation"):
+            try:
+                if not stage.get(kind):
+                    raise ValueError("Select a volume path first.")
+                metadata[kind] = inspect_volume(
+                    repository_root() / Path(stage[kind]).expanduser(),
+                    stage.get(kind + "_key"),
+                    stage.get(kind + "_axes", "zyx"),
+                    stage.get(kind + "_channel", 0),
+                )
+            except Exception as error:
+                metadata[kind] = {"error": str(error)}
+        st.session_state[key] = (signature, metadata)
+    stored = st.session_state.get(key)
+    if not stored or stored[0] != signature:
+        return None
+    metadata = stored[1]
+    for kind, value in metadata.items():
+        if "error" in value:
+            st.error(kind.capitalize() + ": " + value["error"])
+    rows = [
+        {
+            "Volume": kind.capitalize(),
+            "Stored dimensions": str(value["stored_shape"]),
+            "Axis order": value["axes"],
+            "Spatial Z, Y, X": str(value["spatial_shape"]),
+            "Data type": value["dtype"],
+            "Channel": value["channel"],
+        }
+        for kind, value in metadata.items()
+        if "error" not in value
+    ]
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True)
+    if any("error" in value for value in metadata.values()):
+        return None
+    if metadata["raw"]["spatial_shape"] != metadata["segmentation"]["spatial_shape"]:
+        st.error(
+            "The spatial dimensions differ. Select aligned volumes at the same resolution before preprocessing."
+        )
+        return None
+    if st.button("Use full volume ROI", key=key + ":full"):
+        document = deepcopy(draft["document"])
+        document["stages"][index]["roi"] = [[0, 0, 0], list(metadata["raw"]["spatial_shape"])]
+        _replace_document(draft, document)
+        rerun()
+    return metadata
+
+
+def _preparation_preview(draft, index, metadata):
+    import numpy as np
+
+    from morphofeatures.data.volumes import preview_volume_pair
+
+    stage = draft["document"]["stages"][index]
+    key = f"volume-preview:{draft['id']}:{index}"
+    if not st.checkbox("Show ROI image preview", value=True, key=key):
+        return
+    try:
+        shape = metadata["raw"]["spatial_shape"]
+        bounds = np.asarray(stage.get("roi") or [[0, 0, 0], list(shape)])
+        if (
+            bounds.shape != (2, 3)
+            or not np.isfinite(bounds).all()
+            or not np.equal(bounds, np.floor(bounds)).all()
+        ):
+            raise ValueError("Enter integer ROI start and stop coordinates.")
+        start, stop = bounds.astype(int)
+        if np.any(start < 0) or np.any(stop > shape) or np.any(stop <= start):
+            raise ValueError(f"ROI bounds must be nonempty and inside {shape} (Z, Y, X).")
+        st.caption("Selected ROI dimensions (Z, Y, X): " + str(tuple((stop - start).tolist())))
+        axis = st.selectbox(
+            "Preview slice axis",
+            [0, 1, 2],
+            format_func=lambda value: "ZYX"[value],
+            key=key + ":axis",
+        )
+        lower, upper = int(start[axis]), int(stop[axis]) - 1
+        plane = (
+            st.slider(
+                "Preview slice index",
+                lower,
+                upper,
+                (lower + upper) // 2,
+                key=f"{key}:slice:{axis}:{lower}:{upper}",
+            )
+            if lower < upper
+            else lower
+        )
+        settings = deepcopy(stage)
+        for kind in ("raw", "segmentation"):
+            settings[kind] = str(repository_root() / Path(stage[kind]).expanduser())
+        preview = preview_volume_pair(settings, axis=axis, index=plane)
+        intensity, labels = preview["raw"], preview["segmentation"]
+        if not np.isfinite(intensity).all():
+            raise ValueError("The preview contains nonfinite raw intensities.")
+        low, high = np.percentile(intensity, [1, 99])
+        gray = np.clip((intensity.astype(float) - low) / max(float(high - low), 1e-8), 0, 1)
+        ids, inverse = np.unique(labels, return_inverse=True)
+        # Color indices are separate from scientific IDs, including large int64 IDs.
+        import matplotlib.pyplot as plt
+
+        colors = plt.get_cmap("tab20")(np.arange(len(ids)) % 20)[:, :3]
+        colors[ids == 0] = 0
+        colored = colors[inverse].reshape((*labels.shape, 3))
+        overlay = np.repeat(gray[..., None], 3, axis=2)
+        foreground = labels != 0
+        overlay[foreground] = 0.55 * overlay[foreground] + 0.45 * colored[foreground]
+        for column, image, caption in zip(
+            st.columns(3),
+            (gray, colored, overlay),
+            ("Raw intensity", "Instance labels", "Alignment overlay"),
+        ):
+            with column:
+                st.image(image, caption=caption, use_container_width=True, clamp=True)
+        st.caption(
+            f"Slice {'ZYX'[axis]}={plane}; displayed voxel window {preview['start']} → {preview['stop']}. "
+            f"{int(np.count_nonzero(ids))} nonzero IDs intersect this slice; this is not a full object count."
+        )
+        if preview["cropped"]:
+            st.info(
+                "This ROI is larger than the preview limit. The image shows a central window of at most 512 × 512 pixels; preprocessing still uses the full selected ROI."
+            )
+    except Exception as error:
+        st.error("Data preview: " + str(error))
 
 
 def _train(draft, index):
+    stage = draft["document"]["stages"][index]
+    complete = training_form_defaults(stage.get("config", {}))
+    if complete != stage.get("config"):
+        stage["config"] = complete
+        touch(draft)
     _artifact_picker(draft, index, "data")
     _load_stage_config(draft, index)
     _data_fields(draft, index, training=True)
@@ -465,19 +722,45 @@ def _train(draft, index):
     field(draft, path + ["training", "batch_size"], "Batch size", 4)
     field(draft, path + ["training", "learning_rate"], "Learning rate", 0.001)
     field(draft, path + ["device"], "Compute device", "auto", options=["auto", "cpu", "cuda"])
-    with st.expander("Advanced model, data and training settings"):
-        _model_advanced(draft, index, {"training", "device", "slurm"})
+    grouped = complete.get("data", {}).get("source") == "n5_masked_patches"
+    _model_advanced(draft, index, {"training", "device", "slurm"})
+    with st.expander("Optimization and data loading"):
+        if grouped:
+            field(
+                draft,
+                path + ["training", "scheduler"],
+                "Learning-rate schedule",
+                "constant",
+                options=["constant", "cosine", "step"],
+            )
         advanced_fields(
-            draft, path + ["training"], {"epochs", "batch_size", "learning_rate", "resume_from"}
-        )
-        field(
             draft,
-            path + ["training", "resume_from"],
-            "Resume checkpoint (grouped N5 only)",
-            None,
-            optional=True,
-            help="Loading settings does not resume a model. This path explicitly requests checkpoint resume.",
+            path + ["training"],
+            {
+                "epochs",
+                "batch_size",
+                "learning_rate",
+                "resume_from",
+                "early_stopping",
+                "validation_fraction",
+            }
+            | ({"scheduler"} if grouped else set()),
         )
+    with st.expander("Validation, early stopping and resume"):
+        if grouped:
+            advanced_fields(draft, path + ["training", "early_stopping"])
+            field(
+                draft,
+                path + ["training", "resume_from"],
+                "Resume checkpoint (grouped N5 only)",
+                None,
+                optional=True,
+            )
+        else:
+            field(draft, path + ["training", "validation_fraction"], "Validation fraction", 0.25)
+            st.caption(
+                "Crop MAE trains for the requested epochs. Checkpoint resume and early stopping are available in the grouped N5 trainer."
+            )
     st.caption(
         "Produces a checkpoint and resolved model configuration. Linked extraction uses them automatically."
     )
@@ -486,42 +769,120 @@ def _train(draft, index):
 def _model_advanced(draft, index, excluded=()):
     path = ["document", "stages", index, "config"]
     linked = draft["document"]["stages"][index].get("from_preprocessing")
-    advanced_fields(draft, path, set(excluded) | {"data", "mae", "config_schema", "resolved_profile"})
-    with st.expander("MAE architecture"):
+    with st.expander("Additional configuration, paths and reproducibility"):
+        advanced_fields(
+            draft,
+            path,
+            set(excluded) | {"data", "mae", "config_schema", "resolved_profile", "profiles"},
+        )
+        if _get(draft, path + ["profiles"]):
+            st.caption(
+                "Alternative profiles remain in the exported YAML. The resolved active settings above are the ones used for this run."
+            )
+    mae_path = path + ["mae"]
+    mae = _get(draft, mae_path, {})
+    grouped = _get(draft, path + ["data", "source"]) == "n5_masked_patches"
+    with st.expander("MAE encoder and input geometry"):
         if linked:
             st.caption("Input shape follows the crop shape in Prepare data.")
-        advanced_fields(draft, path + ["mae"], {"input_shape"} if linked else ())
+        if mae.get("architecture_version"):
+            st.caption("Checkpoint contract: " + mae["architecture_version"])
+        if grouped:
+            field(
+                draft,
+                mae_path + ["patch_encoder"],
+                "Patch encoder",
+                "linear",
+                options=["linear", "resnet3d"],
+            )
+        decoder = {
+            "decoder_dim",
+            "decoder_depth",
+            "decoder_heads",
+            "reconstruction_shape",
+            "norm_pix_loss",
+        }
+        advanced_fields(
+            draft,
+            mae_path,
+            decoder
+            | {"architecture_version"}
+            | ({"patch_encoder"} if grouped else set())
+            | ({"input_shape"} if linked else set()),
+        )
+    with st.expander("MAE decoder and reconstruction"):
+        st.caption(
+            "Grouped MAE reconstructs hidden stored patches using a transformer decoder."
+            if grouped
+            else "Crop MAE uses a fixed two-layer MLP decoder. Its hidden width is configurable; it has no decoder attention heads."
+        )
+        for key in (
+            "decoder_dim",
+            "decoder_depth",
+            "decoder_heads",
+            "reconstruction_shape",
+            "norm_pix_loss",
+        ):
+            if key in mae:
+                field(draft, mae_path + [key], key.replace("_", " ").capitalize(), mae[key])
     with st.expander("Additional data settings"):
         advanced_fields(
             draft,
             path + ["data"],
-            {"crops", "label_ids", "loss_masks", "patches_container", "positions_container"},
+            {
+                "crops",
+                "label_ids",
+                "loss_masks",
+                "crops_key",
+                "label_ids_key",
+                "loss_masks_key",
+                "patches_container",
+                "positions_container",
+            },
         )
 
 
 def _extract(draft, index):
     path = ["document", "stages", index]
     stage = draft["document"]["stages"][index]
-    if not stage.get("from_training"):
-        _artifact_picker(draft, index, "checkpoint")
-        _load_stage_config(draft, index)
-    _data_fields(draft, index)
     if stage.get("from_training"):
         st.caption("Model: MAE · checkpoint from the preceding training stage.")
     else:
         field(
             draft, path + ["model"], "Embedding model", "mae", options=["mae", "dinov2", "dinov3"]
         )
-        field(draft, path + ["checkpoint"], "Model checkpoint", "")
-    if stage.get("model", "mae") != "mae":
+    dino = stage.get("model", "mae") != "mae"
+    if not stage.get("from_training"):
+        _artifact_picker(draft, index, "data" if dino else "checkpoint")
+        _load_stage_config(draft, index)
+    _data_fields(draft, index)
+    if not stage.get("from_training"):
+        field(
+            draft,
+            path + ["checkpoint"],
+            "Pretrained DINO weights" if dino else "Model checkpoint",
+            "",
+            help="Local backbone state dictionary matching the selected DINO family and variant. The workflow loads these frozen weights; it does not train DINO."
+            if dino
+            else None,
+        )
+    if dino:
         from morphofeatures.dino import VARIANTS
 
+        st.info(
+            "DINO features: convert each intensity crop into 2D views, encode with a frozen pretrained backbone, and combine the view vectors into one embedding per object. Supply intensity crops and aligned masks, rather than instance-label values as intensities."
+        )
         field(draft, path + ["model_repository"], "Official local model repository", "")
+        default_variant = "dinov2_vits14" if stage["model"] == "dinov2" else "dinov3_vits16"
+        if stage.get("variant") in set.union(*VARIANTS.values()) - VARIANTS[stage["model"]]:
+            stage["variant"] = default_variant
+            _replace_document(draft, draft["document"])
+            rerun()
         field(
             draft,
             path + ["variant"],
             "Backbone variant",
-            sorted(VARIANTS[stage["model"]])[0],
+            default_variant,
             options=sorted(VARIANTS[stage["model"]]),
         )
         if "views" not in stage:
@@ -529,6 +890,44 @@ def _extract(draft, index):
 
             stage["views"] = extraction_defaults()["views"]
             touch(draft)
+        field(
+            draft,
+            path + ["config", "device"],
+            "DINO compute device",
+            "auto",
+            options=["auto", "cpu", "cuda"],
+        )
+        with st.expander("DINO views and feature aggregation", expanded=True):
+            views = path + ["views"]
+            field(
+                draft,
+                views + ["normalization"],
+                "DINO intensity normalization",
+                "foreground_percentile",
+                options=["foreground_percentile", "unit", "dtype"],
+            )
+            field(
+                draft,
+                views + ["feature"],
+                "Feature vector per view",
+                "cls",
+                options=["cls", "patch_mean"],
+            )
+            field(
+                draft,
+                views + ["aggregation"],
+                "Combine views per object",
+                "mean",
+                options=["mean", "max"],
+            )
+            field(
+                draft,
+                views + ["resize"],
+                "Resize slices",
+                "stretch",
+                options=["letterbox", "stretch"],
+            )
+            advanced_fields(draft, views, {"normalization", "feature", "aggregation", "resize"})
     with st.expander("Advanced extraction settings"):
         field(
             draft,
@@ -561,10 +960,33 @@ def _extract(draft, index):
                 "sequential_ids",
                 "config",
                 "cache",
+                "views",
             },
         )
         if "config" in stage:
-            _model_advanced(draft, index)
+            if dino:
+                advanced_fields(
+                    draft,
+                    path + ["config"],
+                    {"data", "mae", "training", "slurm", "device", "profiles"},
+                )
+                with st.expander("Additional DINO data settings"):
+                    advanced_fields(
+                        draft,
+                        path + ["config", "data"],
+                        {
+                            "crops",
+                            "label_ids",
+                            "loss_masks",
+                            "crops_key",
+                            "label_ids_key",
+                            "loss_masks_key",
+                            "patches_container",
+                            "positions_container",
+                        },
+                    )
+            else:
+                _model_advanced(draft, index)
     st.caption(
         "Produces ID-preserving embeddings. Analyze uses this output automatically when linked."
     )
@@ -581,7 +1003,7 @@ def _analyze(draft, index):
         )
         advanced_fields(draft, path + ["embeddings"])
         field(draft, path + ["annotations"], "Annotation table (optional)", None, optional=True)
-        field(draft, path + ["label_column"], "Label column", "label")
+        field(draft, path + ["label_column"], "Label column", "auto")
         field(
             draft,
             path + ["group_column"],
@@ -602,7 +1024,7 @@ def _analyze(draft, index):
         "kmeans",
         options=["kmeans", "leiden"],
     )
-    field(draft, path + ["clusters"], "Number of clusters", 2)
+    field(draft, path + ["clusters"], "Number of clusters", 8)
     field(
         draft,
         path + ["normalization"],
@@ -610,6 +1032,71 @@ def _analyze(draft, index):
         "standardize",
         options=["standardize", "l2", "none"],
     )
+    with st.expander(
+        "Classification check against known labels", expanded=bool(stage.get("annotations"))
+    ):
+        st.caption(
+            "Join known cell types by label_id for side-by-side cluster/class plots. Enable classification to evaluate the same logistic or MLP probes as Tools, plus optional K-nearest neighbors. Scaling and optional PCA are fitted within each training fold."
+        )
+        if stage["action"] != "compare":
+            field(draft, path + ["annotations"], "Annotation table (optional)", None, optional=True)
+            field(draft, path + ["label_column"], "Label column", "auto")
+            field(
+                draft,
+                path + ["group_column"],
+                "Specimen / acquisition group column (optional)",
+                None,
+                optional=True,
+            )
+        field(draft, path + ["folds"], "Evaluation folds", 5)
+        field(draft, path + ["classify"], "Evaluate classifiers", True)
+        field(
+            draft,
+            path + ["classifier_models"],
+            "Classifiers",
+            ["logistic", "knn"],
+            options=["logistic", "mlp", "knn"],
+            multiple=True,
+        )
+        field(draft, path + ["minimum_class_count"], "Minimum matched cells per type", 2)
+        field(
+            draft,
+            path + ["fold_policy"],
+            "Insufficient examples per fold",
+            "reduce",
+            options=["reduce", "strict"],
+        )
+        field(
+            draft,
+            path + ["class_weight"],
+            "Logistic class weights",
+            "balanced",
+            options=["balanced", None],
+        )
+        field(draft, path + ["hidden_dimensions"], "MLP hidden layer dimensions", [64])
+        field(draft, path + ["predict_unlabeled"], "Predict cell types for unlabeled objects", True)
+        models = stage.get("classifier_models") or ["logistic"]
+        if stage.get("prediction_model") not in models:
+            stage["prediction_model"] = models[0]
+        field(
+            draft,
+            path + ["prediction_model"],
+            "Classifier for label plots and volume export",
+            models[0],
+            options=models,
+        )
+        field(draft, path + ["unlabeled_opacity"], "Unlabeled point opacity", 0.15)
+        field(
+            draft,
+            path + ["input_config"],
+            "Input data YAML for object inspection (optional)",
+            None,
+            optional=True,
+        )
+        field(draft, path + ["knn_k"], "Evaluation neighbors (K)", 5)
+        field(draft, path + ["linear_c"], "Linear classifier inverse regularization", 1.0)
+        field(draft, path + ["max_iter"], "Classifier maximum iterations", 2000)
+        field(draft, path + ["evaluation_pca"], "Evaluation PCA dimensions (null disables)", None)
     with st.expander("Advanced analysis and evaluation settings"):
         advanced_fields(
             draft,
@@ -631,17 +1118,86 @@ def _analyze(draft, index):
                 "seed",
                 "folds",
                 "knn_k",
+                "linear_c",
+                "max_iter",
+                "evaluation_pca",
+                "classify",
+                "classifier_models",
+                "minimum_class_count",
+                "fold_policy",
+                "class_weight",
+                "hidden_dimensions",
+                "predict_unlabeled",
+                "prediction_model",
+                "unlabeled_opacity",
+                "input_config",
+                "subset",
+                "umap_epochs",
+                "resolution",
             },
         )
         field(draft, path + ["neighbors"], "UMAP neighbors", 15)
-        field(draft, path + ["min_dist"], "UMAP minimum distance", 0.1)
+        field(draft, path + ["min_dist"], "UMAP minimum distance", 0.0)
+        field(draft, path + ["umap_epochs"], "UMAP epochs (null uses automatic)", 50)
+        field(draft, path + ["resolution"], "Leiden resolution", 0.004)
+        field(draft, path + ["subset"], "Projection subset (0 means all)", 0)
         field(draft, path + ["seed"], "Random seed", 42)
-        if stage["action"] == "compare":
-            field(draft, path + ["folds"], "Evaluation folds", 5)
-            field(draft, path + ["knn_k"], "Evaluation neighbors (K)", 5)
     st.caption(
         "Produces a saved report, coordinates, clusters and exports. Results reopens these without repeating computation."
     )
+
+
+def _export_labels(draft, index):
+    path = ["document", "stages", index]
+    st.caption(
+        "Write categorical label volumes on the original segmentation grid. Zero means background or unassigned; lookup tables preserve class colors and original object IDs. This runs as a reviewed local/Slurm job."
+    )
+    for key, label, default in (
+        ("labels", "Object label table", ""),
+        ("segmentation", "Original instance segmentation", ""),
+        ("segmentation_key", "Segmentation dataset key", "exported_data"),
+        ("segmentation_axes", "Segmentation axis order", "zyx"),
+        ("segmentation_channel", "Segmentation channel", 0),
+    ):
+        field(draft, path + [key], label, default)
+    field(
+        draft,
+        path + ["layers"],
+        "Label volumes to write",
+        ["known_label", "predicted_label", "cluster"],
+        options=["known_label", "predicted_label", "cluster"],
+        multiple=True,
+    )
+    field(
+        draft,
+        path + ["output_format"],
+        "Volume output format",
+        "h5",
+        options=["h5", "zarr2", "zarr3"],
+        help="HDF5 file or a Zarr v2/v3 directory containing categorical label volumes and lookup metadata. V3 needs zarr-python 3 or a recent z5py backend.",
+    )
+    field(
+        draft,
+        path + ["include_rgb"],
+        "Also write RGB color volumes",
+        False,
+        help="Adds uint8 Z/Y/X/RGB datasets using the exact plot colors. Uses extra disk space; categorical label volumes remain available for label-aware viewers.",
+    )
+    triple_field(draft, path + ["spacing_zyx"], "Voxel spacing", [1.0, 1.0, 1.0])
+    triple_field(draft, path + ["origin_zyx"], "Voxel origin", [0.0, 0.0, 0.0])
+    field(draft, path + ["unit"], "Coordinate unit", "voxel", options=["voxel", "nm", "um"])
+    with st.expander("ID mapping and bounded I/O"):
+        field(
+            draft,
+            path + ["id_mapping"],
+            "Embedding-to-segmentation ID mapping (optional)",
+            None,
+            optional=True,
+        )
+        field(
+            draft, path + ["mapping_column"], "Segmentation ID column in mapping", "segmentation_id"
+        )
+        triple_field(draft, path + ["block_shape"], "Export block shape", [64, 64, 64])
 
 
 def _artifact_picker(draft, index, kind):
@@ -728,6 +1284,28 @@ def _stage_options(draft, step):
         if draft.get("stage_history") and st.button("Undo last stage change"):
             _replace_document(draft, draft["stage_history"].pop())
             rerun()
+        if actions == ["preprocess"]:
+            if st.button("Add MAE training after preprocessing"):
+                from morphofeatures.workspace_state import training_defaults
+
+                change(
+                    stages
+                    + [
+                        {
+                            "action": "train",
+                            "config": training_defaults(),
+                            "from_preprocessing": True,
+                        },
+                        {"action": "extract", "model": "mae", "from_training": True},
+                        analysis_defaults(),
+                    ]
+                )
+                rerun()
+            if st.button("Add DINO features after preprocessing"):
+                dino = new_draft("dino")["document"]["stages"]
+                dino[0]["from_preprocessing"] = True
+                change(stages + dino)
+                rerun()
         if (
             "train" in actions
             and "extract" not in actions
@@ -769,6 +1347,160 @@ def _stage_options(draft, step):
                 rerun()
 
 
+def _execution_fields(draft):
+    path = ["document", "slurm"]
+    if draft["execution"] != "slurm":
+        field(draft, path + ["cpus"], "CPU threads / CPUs per task", 4)
+        st.info(
+            f"A detached process runs on the app host, {socket.gethostname()}. CPU threads are applied; Slurm reservations and environment setup apply only on Slurm."
+        )
+        with st.expander("Local Python environment"):
+            field(
+                draft,
+                path + ["python_executable"],
+                "Worker Python interpreter (optional)",
+                None,
+                optional=True,
+            )
+        return
+
+    st.subheader("Cluster resources")
+    st.caption("One Slurm job runs the stages in order. They share one resource allocation.")
+    with st.expander("Load a cluster resource preset"):
+        source = retained_input(
+            "Cluster presets YAML", "configs/slurm_profiles.example.yaml", "guided:cluster_profiles"
+        )
+        st.caption(
+            "Loading a preset copies its resources and environment into this draft. Example presets need your cluster's partition and account."
+        )
+        try:
+            profiles = load_cluster_profiles(repository_root() / Path(source).expanduser())
+            selected = st.selectbox("Cluster resource preset", list(profiles))
+            if st.button("Use cluster resource preset"):
+                resources = asdict(profiles[selected])
+                resources.pop("name", None)
+                _replace_document(
+                    draft, {**draft["document"], "slurm": json.loads(json.dumps(resources))}
+                )
+                rerun()
+        except Exception as error:
+            st.error(str(error))
+    for columns in (
+        (
+            ("partition", "Partition", "compute"),
+            ("time", "Time limit", "01:00:00"),
+            ("memory", "Memory", "8G"),
+        ),
+        (
+            ("cpus", "CPUs per task", 4),
+            ("gpus", "GPUs", 0),
+            ("account", "Account (optional)", None),
+            ("qos", "QoS (optional)", None),
+        ),
+    ):
+        for column, (key, label, default) in zip(st.columns(len(columns)), columns):
+            with column:
+                field(draft, path + [key], label, default, optional=key in {"account", "qos"})
+    with st.expander("Mail notifications", expanded=True):
+        # The scheduler also accepts comma-separated values from imported YAML.
+        settings = draft["document"].setdefault("slurm", {})
+        if isinstance(settings.get("mail_types"), str):
+            settings["mail_types"] = [
+                v.strip().upper() for v in settings["mail_types"].split(",") if v.strip()
+            ]
+            touch(draft)
+        left, right = st.columns(2)
+        with left:
+            field(
+                draft,
+                path + ["mail_types"],
+                "Notify me when",
+                [],
+                multiple=True,
+                options=[
+                    "END",
+                    "FAIL",
+                    "BEGIN",
+                    "REQUEUE",
+                    "TIME_LIMIT",
+                    "TIME_LIMIT_50",
+                    "TIME_LIMIT_80",
+                    "TIME_LIMIT_90",
+                    "INVALID_DEPEND",
+                    "STAGE_OUT",
+                    "ARRAY_TASKS",
+                    "ALL",
+                    "NONE",
+                ],
+            )
+        with right:
+            field(draft, path + ["mail_user"], "Mail address (optional)", None, optional=True)
+    with st.expander("Advanced scheduler and runtime settings"):
+        for column, (key, label) in zip(
+            st.columns(3),
+            (("nodes", "Nodes"), ("ntasks", "Total tasks"), ("ntasks_per_node", "Tasks per node")),
+        ):
+            with column:
+                field(draft, path + [key], label, 1)
+        field(
+            draft, path + ["gpu_directive"], "GPU request syntax", "gpus", options=["gres", "gpus"]
+        )
+        field(
+            draft,
+            ["dependency"],
+            "Start after successful Slurm job ID (optional)",
+            "",
+            help="Add an afterok dependency: this workflow starts only when the specified Slurm job succeeds.",
+        )
+        field(
+            draft,
+            path + ["python_executable"],
+            "Worker Python interpreter (optional)",
+            None,
+            optional=True,
+        )
+        field(draft, path + ["setup"], "Module / environment setup", [])
+        field(draft, path + ["cpu_thread_env"], "Bind OMP/MKL threads to CPUs per task", False)
+        field(
+            draft,
+            path + ["local_runtime_directories"],
+            "Run-local cache directories",
+            [],
+            options=["wandb", "matplotlib"],
+            multiple=True,
+        )
+        field(
+            draft,
+            path + ["log_job_context"],
+            "Print job ID, host, working directory, and command",
+            False,
+        )
+        advanced_fields(
+            draft,
+            path,
+            {
+                "partition",
+                "time",
+                "memory",
+                "cpus",
+                "gpus",
+                "account",
+                "qos",
+                "nodes",
+                "ntasks",
+                "ntasks_per_node",
+                "gpu_directive",
+                "mail_types",
+                "mail_user",
+                "python_executable",
+                "setup",
+                "cpu_thread_env",
+                "local_runtime_directories",
+                "log_job_context",
+            },
+        )
+
+
 def _review(config, draft):
     st.subheader("Review & run")
     st.caption(
@@ -780,85 +1512,7 @@ def _review(config, draft):
         + str(Path(config.paths.output_root) / "experiments" / draft["run_id"] / "workspace")
     )
     field(draft, ["execution"], "Run on", "local", options=["local", "slurm"])
-    path = ["document", "slurm"]
-    if draft["execution"] == "slurm":
-        with st.expander("Load a cluster resource preset"):
-            source = retained_input(
-                "Cluster presets YAML",
-                "configs/slurm_profiles.example.yaml",
-                "guided:cluster_profiles",
-            )
-            st.caption(
-                "Example presets are placeholders. Loading a preset replaces resources for this workflow."
-            )
-            try:
-                profiles = load_cluster_profiles(repository_root() / Path(source).expanduser())
-                selected = st.selectbox("Cluster resource preset", list(profiles))
-                if st.button("Use cluster resource preset"):
-                    resources = asdict(profiles[selected])
-                    resources.pop("name", None)
-                    # Convert immutable profile tuples to portable YAML lists.
-                    resources = json.loads(json.dumps(resources))
-                    _replace_document(draft, {**draft["document"], "slurm": resources})
-                    rerun()
-            except Exception as error:
-                st.error(str(error))
-    field(draft, path + ["cpus"], "CPU threads / CPUs per task", 4)
-    if draft["execution"] == "slurm":
-        st.info("One Slurm job. Stages run in order and share the same resource allocation.")
-        for key, label, default in (
-            ("partition", "Partition", "compute"),
-            ("account", "Account", None),
-            ("gpus", "GPUs", 0),
-            ("memory", "Memory", "8G"),
-            ("time", "Time limit", "01:00:00"),
-        ):
-            field(draft, path + [key], label, default, optional=key == "account")
-    else:
-        st.info(
-            f"A detached process runs on the app host, {socket.gethostname()}. CPU threads are applied; Slurm reservations and environment setup apply only on Slurm."
-        )
-    with st.expander("Advanced execution settings"):
-        field(
-            draft,
-            path + ["python_executable"],
-            "Worker Python interpreter (optional)",
-            None,
-            optional=True,
-        )
-        if draft["execution"] == "slurm":
-            field(draft, ["dependency"], "Start after successful Slurm job ID (optional)", "")
-            field(draft, path + ["qos"], "Quality of service (optional)", None, optional=True)
-            field(
-                draft,
-                path + ["gpu_directive"],
-                "GPU request syntax",
-                "gpus",
-                options=["gpus", "gres"],
-            )
-            field(
-                draft,
-                path + ["setup"],
-                "Module / environment setup",
-                [],
-                help="Structured argument lists, for example [[module, load, CUDA/12.8]].",
-            )
-        advanced_fields(
-            draft,
-            path,
-            {
-                "cpus",
-                "partition",
-                "account",
-                "gpus",
-                "memory",
-                "time",
-                "python_executable",
-                "qos",
-                "gpu_directive",
-                "setup",
-            },
-        )
+    _execution_fields(draft)
     field(
         draft,
         ["allow_synthetic"],
@@ -1005,7 +1659,21 @@ def workflow_page(config):
         st.session_state["workflow_step"] = "Start"
         st.session_state["step_widget"] = "Start"
         rerun()
+    actions = [s.get("action") for s in draft["document"]["stages"]]
+    steps = tuple(
+        step
+        for step in STEPS
+        if step in {"Start", "Review & run"}
+        or (step == "Prepare data" and "preprocess" in actions)
+        or (step == "Train" and "train" in actions)
+        or (
+            step == "Analyze"
+            and any(a in actions for a in ("extract", "analyze", "compare", "export_labels"))
+        )
+    )
     current = st.session_state.get("workflow_step", "Start")
+    if current not in steps:
+        current = st.session_state["workflow_step"] = steps[1]
     if st.session_state.get("step_widget") != current:
         st.session_state["step_widget"] = current
 
@@ -1013,7 +1681,7 @@ def workflow_page(config):
         st.session_state["workflow_step"] = st.session_state["step_widget"]
 
     step = st.radio(
-        "Workflow steps", STEPS, horizontal=True, key="step_widget", on_change=step_changed
+        "Workflow steps", steps, horizontal=True, key="step_widget", on_change=step_changed
     )
     actions = [s.get("action") for s in draft["document"]["stages"]]
     st.caption(
@@ -1028,7 +1696,7 @@ def workflow_page(config):
         group = {
             "Prepare data": {"preprocess"},
             "Train": {"train"},
-            "Analyze": {"extract", "analyze", "compare"},
+            "Analyze": {"extract", "analyze", "compare", "export_labels"},
         }[step]
         indices = [i for i, s in enumerate(draft["document"]["stages"]) if s.get("action") in group]
         if not indices:
@@ -1044,16 +1712,17 @@ def workflow_page(config):
                 "extract": _extract,
                 "analyze": _analyze,
                 "compare": _analyze,
+                "export_labels": _export_labels,
             }[action](draft, index)
         _stage_options(draft, step)
     yaml_editor(draft)
     previous, following = st.columns(2)
-    position = STEPS.index(step)
-    if position > 0 and previous.button("Back to " + STEPS[position - 1]):
-        st.session_state["workflow_step"] = STEPS[position - 1]
+    position = steps.index(step)
+    if position > 0 and previous.button("Back to " + steps[position - 1]):
+        st.session_state["workflow_step"] = steps[position - 1]
         rerun()
-    if position < len(STEPS) - 1 and following.button("Continue to " + STEPS[position + 1]):
-        st.session_state["workflow_step"] = STEPS[position + 1]
+    if position < len(steps) - 1 and following.button("Continue to " + steps[position + 1]):
+        st.session_state["workflow_step"] = steps[position + 1]
         rerun()
 
 
@@ -1068,12 +1737,15 @@ def continue_from_artifact(config, path, kind=None):
             stage["config"] = load_document(source)
         step = "Analyze"
     elif path.name == "mae_config.yaml":
-        draft = new_draft("crops", source="Prepared data: " + str(path))
+        draft = new_draft(
+            "dino" if kind == "dino" else "crops", source="Prepared data: " + str(path)
+        )
         data = load_document(path)
         model = draft["document"]["stages"][0]["config"]
         model["data"] = data["data"]
-        model["mae"]["input_shape"] = data["mae"]["input_shape"]
-        step = "Train"
+        if kind != "dino":
+            model["mae"]["input_shape"] = data["mae"]["input_shape"]
+        step = "Analyze" if kind == "dino" else "Train"
     else:
         draft = new_draft("embeddings", source="Embedding: " + str(path))
         draft["document"]["stages"][0]["embedding"] = str(path)
@@ -1104,6 +1776,13 @@ def run_actions(config, record):
     )
     if artifacts:
         path = Path(st.selectbox("Continue from an output", artifacts))
+        if path.name == "mae_config.yaml" and st.button(
+            "Extract DINO features from these prepared objects"
+        ):
+            try:
+                continue_from_artifact(config, path, kind="dino")
+            except Exception as error:
+                st.error(str(error))
         if (
             path.suffix in {".pt", ".pth", ".npz", ".npy", ".tsv", ".csv"}
             or path.name == "mae_config.yaml"

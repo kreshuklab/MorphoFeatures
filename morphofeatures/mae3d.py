@@ -17,6 +17,7 @@ except ImportError as error:  # pragma: no cover
     raise RuntimeError("The MAE pathway requires morphofeatures[modern-training]") from error
 
 from morphofeatures.config import load_config
+from morphofeatures.data.crop_storage import load_crop_array
 from morphofeatures.data.io import export_embeddings
 from morphofeatures.embedding_base import EmbeddingMethod
 from morphofeatures.mae_contract import (
@@ -665,7 +666,7 @@ class MAEEmbeddingMethod(EmbeddingMethod):
 def _load_crops(config: dict, seed: int):
     mae_config, data_config = config.get("mae", {}), config.get("data", {})
     if data_config.get("crops"):
-        crops = np.load(Path(data_config["crops"]))
+        crops = load_crop_array(data_config)
     else:
         shape = _triple(mae_config.get("input_shape", (16, 16, 16)))
         crops = np.random.default_rng(seed).normal(size=(8,) + shape).astype(np.float32)
@@ -688,7 +689,7 @@ def _load_label_ids(config: dict, count: int) -> np.ndarray:
     if value is None:
         return np.arange(1, count + 1, dtype=np.int64)
     if isinstance(value, (str, Path)):
-        ids = np.load(Path(value))
+        ids = load_crop_array(config["data"], "label_ids")
     else:
         ids = np.asarray(value)
     ids = np.asarray(ids)
@@ -711,7 +712,11 @@ def _load_loss_masks(config: dict, count: int, crop_shape: Sequence[int]):
     value = config.get("data", {}).get("loss_masks")
     if value is None:
         return None
-    masks = np.load(Path(value)) if isinstance(value, (str, Path)) else np.asarray(value)
+    masks = (
+        load_crop_array(config["data"], "loss_masks")
+        if isinstance(value, (str, Path))
+        else np.asarray(value)
+    )
     if masks.ndim == 4:
         masks = masks[:, None]
     expected = (count, 1) + tuple(int(item) for item in crop_shape)

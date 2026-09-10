@@ -1,0 +1,56 @@
+# Load in Results -> Input data YAML for object inspection.
+# This is an inspection document, not a training configuration.
+schema: morphofeatures.inspection.v1
+
+data:
+  source: n5_masked_patches
+  patches_container: /g/kreshuk/mansaray/raw_patches_masked.n5
+  patches_key: patches
+  positions_container: /g/kreshuk/mansaray/abs_crop_centers_radius4_only_nucl.n5
+  positions_key: positions
+  ids_key: ids
+
+  # Raw slice views use indexed patch positions, expressed on a coarser grid.
+  qc_raw_container: /g/kreshuk/data/arendt/platyneris_v1/data.n5
+  qc_raw_key: volumes/raw/s1
+  position_to_raw_scale_zyx: [4, 4, 4]
+  resolution_zyx_um: [0.025, 0.020, 0.020]
+  position_resolution_zyx_um: [0.100, 0.080, 0.080]
+
+  # Foreground scores only: not nucleus IDs and not per-object data.loss_masks.
+  # Recorded to distinguish this volume from the instance segmentation below.
+  foreground_mask_container: /g/kreshuk/data/arendt/platyneris_v1/data.n5
+  foreground_mask_key: volumes/nuclei/foreground
+  foreground_mask_kind: foreground_scores
+
+inspection:
+  mesh:
+    source: segmentation             # segmentation, prepared, or files
+    # /g/kreshuk/mansaray/copied/mobie_viz/pkd1_ncald/images/ome-zarr - containes raw nuc and segmented nuclei data
+    segmentation: /g/kreshuk/data/arendt/platyneris_v1/data.n5
+    segmentation_key: volumes/paintera/nuclei/data/s2
+    segmentation_axes: zyx
+    segmentation_channel: 0
+    label_kind: instances
+    # The s2 grid is 4x coarser than the base nucleus segmentation grid.
+    # N5 parent resolution is XYZ [80,80,100] nm; values below are ZYX in um.
+    spacing_zyx: [0.400, 0.320, 0.320]
+    origin_zyx: [0.0, 0.0, 0.0]
+    unit: um
+
+    # Patch rows use CELL IDs; this volume uses NUCLEUS IDs. Reuse the site's
+    # explicit label_id -> nucleus_id table; zero denotes no assigned nucleus.
+    # Check on 2026-09-10: all 11,382 patch IDs have unique positive mappings;
+    # 11,381 mapped IDs occur in s2. Nucleus 11486 is absent at this level.
+    # ID agreement alone does not establish spatial/biological correspondence.
+    id_mapping: /g/kreshuk/mansaray/platy_data/1.0.1/tables/sbem-6dpf-1-whole-segmented-cells/cells_to_nuclei.tsv
+    # Optional pre-existing bounds; otherwise the background check builds them.
+    object_index: null
+    sampling_step: 1
+    read_budget_side: 256
+
+  validation:
+    auto: true
+    # Increment after editing volume chunks in place, or click Recheck object IDs.
+    data_version: "1"
+    block_shape: [25, 128, 128]

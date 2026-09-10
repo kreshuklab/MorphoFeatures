@@ -186,6 +186,51 @@ def _write_config(tmp_path: Path, patch_path: Path, position_path: Path):
 
 
 @pytest.mark.optional
+def test_dino_uses_grouped_n5_data_and_preserves_parent_ids(tmp_path):
+    torch = pytest.importorskip("torch")
+    from morphofeatures.configuration_editor import load_document
+    from morphofeatures.dino import extract_dino, validate_dino_settings
+
+    class TinyBackbone(torch.nn.Module):
+        def forward_features(self, batch):
+            return {"x_norm_clstoken": batch.mean((2, 3))}
+
+    patch_path, position_path = _write_n5_fixture(tmp_path)
+    config_path = _write_config(tmp_path, patch_path, position_path)
+    settings = {
+        "model": "dinov2",
+        "config": load_document(config_path),
+        "views": {"size": 28, "axes": [0], "fractions": [0.5], "normalization": "dtype"},
+    }
+    validate_dino_settings(settings)
+    ids, features, excluded = extract_dino(settings, backbone=TinyBackbone())
+    # Eighteen patch rows become six nucleus embeddings, including replacement
+    # of the empty patch without dropping its parent or mixing nuclei.
+    np.testing.assert_array_equal(ids, np.arange(1, 7))
+    assert features.shape == (6, 3)
+    assert np.isfinite(features).all() and not excluded
+    assert (np.diff(features, axis=0) > 0).all()
+
+
+@pytest.mark.optional
+def test_grouped_object_inspection_reads_bounded_raw_volume(tmp_path):
+    from morphofeatures.analysis.object_inspection import read_object_crops
+
+    patch_path, position_path = _write_n5_fixture(tmp_path)
+    raw = np.arange(16**3, dtype=np.uint16).reshape(16, 16, 16)
+    np.save(tmp_path / "raw.npy", raw)
+    config = {"data": {"source": "n5_masked_patches", "patches_container": str(patch_path),
+                       "positions_container": str(position_path), "qc_raw_container": str(tmp_path / "raw.npy"),
+                       "position_to_raw_scale_zyx": [2, 2, 2]}}
+    images = list(read_object_crops(config, [2], source="original", max_side=8))
+    np.testing.assert_array_equal(images[0][1], raw[4:12, 6:14, 8:16])
+    assert "Raw volume" in images[0][2]
+    prepared = list(read_object_crops(config, [2], max_side=8))
+    assert prepared[0][1].shape == (8, 8, 8)
+    assert "Representative" in prepared[0][2]
+
+
+@pytest.mark.optional
 def test_real_mae_resnet_train_checkpoint_reload_and_encode_cycle(tmp_path):
     pytest.importorskip("torch")
     patch_path, position_path = _write_n5_fixture(tmp_path)

@@ -24,10 +24,11 @@ workspace = [
   "streamlit>=1.40,<2",
   "matplotlib>=3.6,<4",
   "h5py>=3.8,<4",
-  "zarr>=2.16,<3",
+  "zarr>=2.16,<4",
   "umap-learn>=0.5.3,<1",
   "trimesh>=4,<5",
-  "plotly>=5,<7",
+  "plotly>=5.15,<7",
+  "scikit-image>=0.21,<1",
 ]
 analysis = [
   "umap-learn>=0.5.3,<1",

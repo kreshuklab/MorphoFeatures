@@ -7,15 +7,97 @@ never downloads code or weights implicitly. See docs/workspace_workflows.md.
 from __future__ import annotations
 
 import tempfile
+from contextlib import ExitStack
 from pathlib import Path
 
 import numpy as np
 import yaml
 
+from morphofeatures.data.crop_storage import open_crop_array
+
 VARIANTS = {
     "dinov2": {"dinov2_vits14", "dinov2_vitb14", "dinov2_vits14_reg", "dinov2_vitb14_reg"},
     "dinov3": {"dinov3_vits16", "dinov3_vitb16"},
 }
+
+
+def validate_dino_settings(settings, *, require_data=True):
+    """Check input contracts and view settings before allocating an extraction run."""
+    family = settings["model"]
+    views = settings.get("views", {})
+    stride = 14 if family == "dinov2" else 16
+    size = views.get("size", 224)
+    if isinstance(size, bool) or int(size) != size or size < stride or size % stride:
+        raise ValueError(f"DINO image size must be a positive multiple of {stride}")
+    if int(views.get("batch_size", 16)) < 1:
+        raise ValueError("DINO view batch size must be positive")
+    if views.get("feature", "cls") not in {"cls", "patch_mean"} or views.get(
+        "aggregation", "mean"
+    ) not in {"mean", "max"}:
+        raise ValueError("DINO feature must be cls/patch_mean and aggregation mean/max")
+    if views.get("resize", "stretch") not in {"stretch", "letterbox"}:
+        raise ValueError("DINO resize must be stretch or letterbox")
+    if views.get("normalization", "foreground_percentile") not in {
+        "foreground_percentile",
+        "dtype",
+        "unit",
+    }:
+        raise ValueError("DINO normalization must be foreground_percentile, dtype, or unit")
+    axes, fractions = views.get("axes", [0, 1, 2]), views.get("fractions", [0.25, 0.5, 0.75])
+    if not axes or any(isinstance(axis, bool) or axis not in (0, 1, 2) for axis in axes):
+        raise ValueError("DINO view axes must select 0=Z, 1=Y, or 2=X")
+    if not fractions or any(not 0 <= float(fraction) <= 1 for fraction in fractions):
+        raise ValueError("DINO slice fractions must lie between 0 and 1")
+    percentiles = views.get("percentiles", [1, 99])
+    if len(percentiles) != 2 or not 0 <= percentiles[0] < percentiles[1] <= 100:
+        raise ValueError("DINO intensity percentiles must be increasing values between 0 and 100")
+    if not require_data:
+        return
+    config = settings.get("config", {})
+    data = config.get("data", {})
+    if data.get("source") == "n5_masked_patches":
+        for key in ("patches_container", "positions_container"):
+            if not data.get(key) or not Path(data[key]).is_dir():
+                raise ValueError(f"DINO requires an existing data.{key}")
+        return
+    if (
+        data.get("crops")
+        and Path(data["crops"]).suffix.lower() == ".n5"
+        and not data.get("crops_key")
+    ):
+        raise ValueError(
+            "An N5 container was entered in data.crops without a crops_key. "
+            "DINO can read your existing grouped N5 patches without another preprocessing run: "
+            "load the grouped N5 model/data YAML used for MAE in the extraction stage. "
+            "It must set data.source=n5_masked_patches, data.patches_container, and the "
+            "matching data.positions_container so patches can be joined to object IDs. "
+            "For whole-object N5 crops from Prepare data, load its generated mae_config.yaml instead."
+        )
+    if not data.get("crops") or not Path(data["crops"]).exists():
+        raise ValueError(
+            "Select existing prepared intensity crops (.npy, HDF5, or N5). "
+            "Load their generated mae_config.yaml under Load model / data settings to fill "
+            "in paths and dataset keys. For grouped N5 patches, load your grouped MAE YAML."
+        )
+    from morphofeatures.mae3d import _load_label_ids
+
+    with open_crop_array(data) as crops:
+        if crops.ndim not in (4, 5) or not len(crops) or (crops.ndim == 5 and crops.shape[1] != 1):
+            raise ValueError("DINO crops must have shape (N,Z,Y,X) or (N,1,Z,Y,X)")
+        if data.get("label_ids") is None and not settings.get("sequential_ids", False):
+            raise ValueError(
+                "DINO requires original object IDs; explicitly enable sequential IDs only when row-number IDs are intended"
+            )
+        _load_label_ids(config, len(crops))
+        if data.get("loss_masks"):
+            with open_crop_array(data, "loss_masks") as masks:
+                expected = (len(crops),) + tuple(crops.shape[-3:])
+                if masks.shape not in (expected, (len(crops), 1) + expected[1:]):
+                    raise ValueError("DINO masks must match the crop count and spatial dimensions")
+        if views.get("normalization") == "dtype" and not np.issubdtype(crops.dtype, np.integer):
+            raise ValueError(
+                "DINO dtype normalization needs integer crops; use unit or foreground_percentile for preprocessed float crops"
+            )
 
 
 def load_backbone(settings):
@@ -143,23 +225,38 @@ def object_readers(config):
 
         if not data.get("crops"):
             raise ValueError("DINO extraction requires data.crops or an N5 patch source")
-        crops = np.load(data["crops"], mmap_mode="r")
-        ids = _load_label_ids(config, len(crops))
-        masks = np.load(data["loss_masks"], mmap_mode="r") if data.get("loss_masks") else None
-        for i, label_id in enumerate(ids):
+        with ExitStack() as stack:
+            crops = stack.enter_context(open_crop_array(data))
+            ids = _load_label_ids(config, len(crops))
+            masks = (
+                stack.enter_context(open_crop_array(data, "loss_masks"))
+                if data.get("loss_masks")
+                else None
+            )
+            for i, label_id in enumerate(ids):
 
-            def read(i=i):
-                raw = np.asarray(crops[i])
-                if raw.ndim == 4 and raw.shape[0] == 1:
-                    raw = raw[0]
-                mask = (
-                    np.asarray(masks[i]).reshape(raw.shape).astype(bool)
-                    if masks is not None
-                    else raw != 0
-                )
-                yield raw, mask
+                def read(i=i):
+                    raw = np.asarray(crops[i])
+                    if raw.ndim == 4 and raw.shape[0] == 1:
+                        raw = raw[0]
+                    if masks is not None:
+                        values = np.asarray(masks[i])
+                        if values.ndim == 4 and values.shape[0] == 1:
+                            values = values[0]
+                        if (
+                            values.shape != raw.shape
+                            or not np.isfinite(values).all()
+                            or np.any(values < 0)
+                        ):
+                            raise ValueError(
+                                "Object mask must be finite, nonnegative and aligned with the raw crop"
+                            )
+                        mask = values.astype(bool)
+                    else:
+                        mask = raw != 0
+                    yield raw, mask
 
-            yield int(label_id), read
+                yield int(label_id), read
 
 
 def extract_dino(settings, progress=None, *, backbone=None):

@@ -15,7 +15,9 @@ from morphofeatures.workspace_jobs import resolve_job
 
 STARTING_POINTS = {
     "raw": "Raw image and instance segmentation",
+    "preprocess": "Just Run Preprocessing",
     "crops": "Prepared crops or grouped N5 patches",
+    "dino": "DINO features from prepared objects",
     "checkpoint": "An existing model checkpoint",
     "embeddings": "Saved embeddings",
     "demo": "Synthetic demonstration (eight crops)",
@@ -26,6 +28,7 @@ STAGE_LABELS = {
     "extract": "Extract embeddings",
     "analyze": "Analyze",
     "compare": "Compare representations",
+    "export_labels": "Export labels to segmentation",
 }
 
 
@@ -57,6 +60,7 @@ def preprocessing_defaults():
         "unit": "voxel",
         "roi": [[0, 0, 0], [64, 64, 64]],
         "crop_shape": [32, 32, 32],
+        "output_format": "npy",
         "max_objects": 8,
         "block_shape": [32, 32, 32],
         "min_voxels": 10,
@@ -75,7 +79,9 @@ def analysis_defaults(*, linked=True):
         **({"from_extraction": True} if linked else {"embedding": ""}),
         "normalization": "standardize",
         "umap": False,
-        "clusters": 2,
+        "clusters": 8,
+        "min_dist": 0.0,
+        "umap_epochs": 50,
         "seed": 42,
     }
 
@@ -83,7 +89,7 @@ def analysis_defaults(*, linked=True):
 def new_draft(start="crops", *, document=None, source=None):
     if document is None:
         stages = []
-        if start == "raw":
+        if start in {"raw", "preprocess"}:
             stages.append(preprocessing_defaults())
         if start in {"raw", "crops", "demo"}:
             stages.append(
@@ -103,7 +109,23 @@ def new_draft(start="crops", *, document=None, source=None):
                     "config": training_defaults(),
                 }
             )
-        stages.append(analysis_defaults(linked=start != "embeddings"))
+        if start == "dino":
+            stages.append(
+                {
+                    "action": "extract",
+                    "model": "dinov2",
+                    "variant": "dinov2_vits14",
+                    "checkpoint": "",
+                    "model_repository": "",
+                    "config": {
+                        "device": "auto",
+                        "seed": 42,
+                        "data": {"crops": None, "label_ids": None, "loss_masks": None},
+                    },
+                }
+            )
+        if start != "preprocess":
+            stages.append(analysis_defaults(linked=start != "embeddings"))
         document = {
             "stages": stages,
             "slurm": {

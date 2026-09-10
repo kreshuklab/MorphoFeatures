@@ -1,0 +1,29 @@
+# Load in Results -> Input data YAML for object inspection, then click
+# Connect to PlatyBrowser. No local patch or whole-volume files are required.
+schema: morphofeatures.inspection.v1
+
+inspection:
+  platybrowser:
+    project_url: https://github.com/mobie/platybrowser-project
+    # Pins metadata/tables; the image URLs are resolved from the published XML.
+    revision: 2d231ac5dcd55d6d97436ad544f8fc5791fab3c7
+    dataset: "1.0.1"
+    # The existing grouped N5 embeddings carry cell IDs. This applies the
+    # project's cells_to_nuclei.tsv. Use nucleus for nucleus IDs directly.
+    object_ids: cell
+    # Raw s3 and nucleus s0 share a [0.100, 0.080, 0.080] um ZYX grid.
+    # Higher levels transfer less data but may lose fine surfaces/small objects.
+    raw_level: 3
+    segmentation_level: 0
+    cache_directory: ../../outputs/remote_cache/platybrowser
+    cache_size_mb: 1024
+    timeout_seconds: 20
+    # Change and reconnect after an in-place update to the hosted data.
+    cache_version: "1"
+  mesh:
+    sampling_step: 1
+    read_budget_side: 256
+  validation:
+    auto: true
+# Background checks compare IDs against the published object catalog. Voxels
+# are verified for selected meshes as they load; no full remote scan is run.

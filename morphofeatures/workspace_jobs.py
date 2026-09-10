@@ -47,6 +47,7 @@ def resolve_job(document, base, *, validate=True):
             "analyze",
             "compare",
             "preprocess",
+            "export_labels",
         }:
             raise ValueError(f"Unsupported stage action: {stage.get('action')}")
         if "config" in stage:
@@ -64,6 +65,9 @@ def resolve_job(document, base, *, validate=True):
             "crops",
             "label_ids",
             "masks",
+            "labels",
+            "id_mapping",
+            "input_config",
             "model_repository",
             "cache",
         ):
@@ -76,6 +80,10 @@ def resolve_job(document, base, *, validate=True):
             }
         if not validate:
             continue
+        if stage["action"] == "export_labels":
+            from morphofeatures.analysis.label_volumes import validate_volume_export
+
+            validate_volume_export(stage)
         if stage["action"] == "train":
             if "config" not in stage:
                 raise ValueError("Training requires config")
@@ -113,7 +121,7 @@ def resolve_job(document, base, *, validate=True):
             ):
                 raise ValueError("Extraction requires the model/data config or from_preprocessing")
             if stage.get("model", "mae") != "mae":
-                from morphofeatures.dino import VARIANTS
+                from morphofeatures.dino import VARIANTS, validate_dino_settings
 
                 if stage.get("variant") not in VARIANTS[stage["model"]]:
                     raise ValueError(
@@ -123,6 +131,11 @@ def resolve_job(document, base, *, validate=True):
                     raise ValueError(
                         "DINO extraction requires model_repository pointing to an official local checkout"
                     )
+                if stage.get("from_training"):
+                    raise ValueError(
+                        "DINO uses pretrained backbone weights, not an MAE training checkpoint"
+                    )
+                validate_dino_settings(stage, require_data=not stage.get("from_preprocessing"))
         if stage["action"] == "analyze" and not stage.get("from_extraction"):
             if not stage.get("embedding") or not Path(stage["embedding"]).is_file():
                 raise ValueError("Analysis requires an existing embedding file or from_extraction")
@@ -205,7 +218,16 @@ def plan_workspace_job(
         document, output_root=output_root, run_id=run_id, execution=execution, dependency=dependency
     )
     document = resolve_job(document, base or repository_root())
-    profile = ClusterProfile.from_mapping("workspace", document.get("slurm", {}))
+    resources = document.get("slurm", {})
+    if execution == "local":
+        # Only interpreter and CPU threads apply locally. Incomplete cluster mail
+        # or account settings must not prevent switching a draft to local execution.
+        resources = {
+            "partition": "local",
+            "cpus": resources.get("cpus", 4),
+            "python_executable": resources.get("python_executable"),
+        }
+    profile = ClusterProfile.from_mapping("workspace", resources)
     output_root = Path(output_root).expanduser().resolve()
     folder = output_root / "experiments" / run_id / "workspace"
     source = folder / "job.yaml"
@@ -399,6 +421,12 @@ def run_job(path):
                 from morphofeatures.representation_analysis import compare
 
                 result = compare(stage["embeddings"], destination, stage)
+            elif action == "export_labels":
+                from morphofeatures.analysis.label_volumes import export_label_volumes
+
+                result = export_label_volumes(
+                    stage, destination, progress=lambda **v: writer.write("volume_export", **v)
+                )
             else:
                 from morphofeatures.data.preprocessing import preprocess
 

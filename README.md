@@ -77,7 +77,7 @@ snapshot without executing it. Follow progress in **Runs** and reopen outputs
 in **Results**. Specialist workflows and sweeps remain in **Tools**.
 
 See [the workspace guide](docs/workspace_workflows.md) and
-[UI design notes](docs/ui_redesign.md).
+[workspace interaction guide](docs/workspace_workflows.md).
 
 ## Installation groups
 
@@ -120,7 +120,7 @@ uses bundled published embeddings and metadata. The fourth uses a canonical YAML
 notebook overrides to inspect, train, reconstruct, encode, and analyze 11,382 indexed real
 Platynereis nuclei through lazy N5 reads. Its output is accurately scoped as nucleus-derived
 texture. See the [legacy code/data inventory](docs/legacy_workspaces_inventory.md), the earlier
-[whole-volume ROI audit](docs/platyneris_data_inventory.md), and [notebook workflows](docs/notebooks.md).
+[whole-volume ROI audit](docs/platyneris_data_inventory.md), and [notebook workflows](notebooks/README.md).
 Generated files go below the configured output root.
 
 ## Repository data
@@ -242,6 +242,6 @@ repository's fake-backend and dry-run tests.
 
 ## Reproducibility
 
-The published arrays and tables are preserved unchanged. New outputs follow the same `label_id` convention, deterministic seeds are exposed by CLI/config, and checkpoints store model state without `DataParallel` prefixes. The full status and validation boundaries are recorded in [the reproducibility report](docs/reproducibility_report.md).
+The published arrays and tables are preserved unchanged. New outputs follow the same `label_id` convention, deterministic seeds are exposed by CLI/config, and checkpoints store model state without `DataParallel` prefixes. Scientific reproduction limits are described in [the reproduction guide](docs/legacy_reproduction.md); bounded real-data evidence is retained in the data inventories linked above.
 
 This repository accompanies the [MorphoFeatures paper](https://www.biorxiv.org/content/10.1101/2022.05.07.490949v1). Repository documents and publications describe scientific context; runtime behavior is defined by the package code, configs, tests, and data contracts.

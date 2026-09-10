@@ -15,7 +15,7 @@ from sklearn.metrics import confusion_matrix
 from sklearn.model_selection import StratifiedKFold
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import Normalizer, StandardScaler
 
 from morphofeatures.data.contracts import EmbeddingTable
 from morphofeatures.data.io import load_embeddings
@@ -29,6 +29,73 @@ LEGACY_CELL_TYPES = (
     "ciliated",
     "dark",
 )
+
+
+def classifier_pipeline(
+    model="logistic",
+    *,
+    normalization="standardize",
+    evaluation_pca=None,
+    seed=42,
+    max_iter=2000,
+    c=1.0,
+    class_weight="balanced",
+    hidden_dimensions=(64,),
+    knn_k=5,
+):
+    """The shared Tools/workflow estimator; fit preprocessing on training rows only."""
+    from sklearn.decomposition import PCA
+    from sklearn.neighbors import KNeighborsClassifier
+
+    steps = []
+    if normalization == "standardize":
+        steps.append(StandardScaler())
+    elif normalization == "l2":
+        steps.append(Normalizer())
+    elif normalization != "none":
+        raise ValueError("normalization must be standardize, l2, or none")
+    if evaluation_pca:
+        steps.append(PCA(n_components=int(evaluation_pca), random_state=int(seed)))
+    if model in {"logistic", "linear"}:
+        estimator = LogisticRegression(
+            C=float(c),
+            solver="lbfgs",
+            max_iter=int(max_iter),
+            random_state=int(seed),
+            class_weight=class_weight,
+        )
+    elif model == "mlp":
+        hidden = tuple(int(v) for v in hidden_dimensions)
+        if not hidden or min(hidden) < 1:
+            raise ValueError("hidden_dimensions must contain positive integers")
+        estimator = MLPClassifier(
+            hidden_layer_sizes=hidden,
+            activation="relu",
+            alpha=1e-4,
+            max_iter=int(max_iter),
+            random_state=int(seed),
+        )
+    elif model == "knn":
+        if int(knn_k) < 1:
+            raise ValueError("knn_k must be positive")
+        estimator = KNeighborsClassifier(n_neighbors=int(knn_k))
+    else:
+        raise ValueError("model must be logistic, mlp, or knn")
+    return make_pipeline(*steps, estimator)
+
+
+def configured_classifier(model, settings, *, train_count):
+    return classifier_pipeline(
+        model,
+        normalization=settings.get("normalization", "standardize"),
+        evaluation_pca=settings.get("evaluation_pca"),
+        seed=settings.get("seed", 42),
+        max_iter=settings.get("max_iter", 2000),
+        c=settings.get("linear_c", 1.0),
+        class_weight=settings.get("class_weight", "balanced"),
+        hidden_dimensions=settings.get("hidden_dimensions", [64]),
+        knn_k=min(int(settings.get("knn_k", 5)), train_count),
+    )
 
 
 @dataclass(frozen=True)
@@ -62,7 +129,11 @@ class ClassificationResult:
 def load_class_labels(
     path: Path, skip_types: Iterable[str] | None = None
 ) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]]:
-    frame = pd.read_csv(path, sep="\t")
+    from morphofeatures.analysis.annotations import read_annotations
+
+    frame = read_annotations(path, {"label_column": "cell_type"})
+    frame = frame[frame.known_label.notna()].copy()
+    frame["cell_type"] = frame.known_label
     required = {"label_id", "cell_type"}
     if not required.issubset(frame.columns):
         raise ValueError("Classification table requires label_id and cell_type columns")
@@ -147,28 +218,14 @@ def cross_validate_shallow_classifier(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=ConvergenceWarning)
         for train_indices, test_indices in splitter.split(features, labels):
-            if model == "logistic":
-                estimator = LogisticRegression(
-                    C=float(c),
-                    solver="lbfgs",
-                    max_iter=int(max_iter),
-                    random_state=seed,
-                    class_weight=class_weight,
-                )
-            elif model == "mlp":
-                hidden = tuple(int(value) for value in hidden_dimensions)
-                if not hidden or any(value <= 0 for value in hidden):
-                    raise ValueError("hidden_dimensions must contain positive integers")
-                estimator = MLPClassifier(
-                    hidden_layer_sizes=hidden,
-                    activation="relu",
-                    alpha=1e-4,
-                    max_iter=int(max_iter),
-                    random_state=seed,
-                )
-            else:
-                raise ValueError("model must be logistic or mlp")
-            pipeline = make_pipeline(StandardScaler(), estimator)
+            pipeline = classifier_pipeline(
+                model,
+                seed=seed,
+                max_iter=max_iter,
+                c=c,
+                class_weight=class_weight,
+                hidden_dimensions=hidden_dimensions,
+            )
             pipeline.fit(features[train_indices], labels[train_indices])
             fold_predictions = pipeline.predict(features[test_indices])
             predictions[test_indices] = fold_predictions
@@ -219,6 +276,12 @@ def evaluate_embedding_classifier(
     matched_ids = matched_ids[retained_mask]
     matched_labels = matched_labels[retained_mask]
     features = features[retained_mask]
+    order = np.argsort(matched_ids)
+    matched_ids, matched_labels, features = (
+        matched_ids[order],
+        matched_labels[order],
+        features[order],
+    )
     if len(retained) < 2:
         raise ValueError("At least two matched cell types need two or more examples")
     remap = {int(old): new for new, old in enumerate(retained)}
@@ -249,9 +312,7 @@ def evaluate_embedding_classifier(
             {
                 "label_id": result.label_ids,
                 "true_cell_type": [result.class_names[value] for value in result.labels],
-                "predicted_cell_type": [
-                    result.class_names[value] for value in result.predictions
-                ],
+                "predicted_cell_type": [result.class_names[value] for value in result.predictions],
             }
         ).to_csv(output / "cross_validated_predictions.tsv", sep="\t", index=False)
         summary = {
@@ -264,7 +325,8 @@ def evaluate_embedding_classifier(
             "mean_accuracy": result.mean_accuracy,
             "std_accuracy": result.std_accuracy,
             "per_class_recall": {
-                name: float(value) for name, value in zip(result.class_names, result.per_class_recall)
+                name: float(value)
+                for name, value in zip(result.class_names, result.per_class_recall)
             },
             "caveat": (
                 "Cross-validation measures association and predictive separability; it does not "

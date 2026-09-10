@@ -15,6 +15,7 @@ stages:
     unit: voxel
     roi: [[0, 0, 0], [64, 64, 64]]
     crop_shape: [16, 16, 16]
+    output_format: npy  # npy, h5 (one file), or n5 (a container directory)
     block_shape: [32, 32, 32]
     max_objects: 4
     min_voxels: 10

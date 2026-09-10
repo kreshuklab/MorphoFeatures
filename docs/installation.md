@@ -37,7 +37,7 @@ python -m pip install -e ".[analysis,modern-training,notebooks]"
 jupyter lab
 ```
 
-Start Jupyter from the repository root. See `docs/notebooks.md`.
+Start Jupyter from the repository root. See [the notebook guide](../notebooks/README.md).
 
 ## Training environments
 

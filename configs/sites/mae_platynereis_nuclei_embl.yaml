@@ -6,6 +6,10 @@ active_profile: full
 
 data:
   source: n5_masked_patches
+  foreground_mask_container: /g/kreshuk/data/arendt/platyneris_v1/data.n5
+  foreground_mask_key: volumes/nuclei/foreground 
+  masks_container: /g/kreshuk/data/arendt/platyneris_v1/data.n5
+  mask_key: volumes/paintera/nuclei/data/s2
   patches_container: /g/kreshuk/mansaray/raw_patches_masked.n5
   patches_key: patches
   positions_container: /g/kreshuk/mansaray/abs_crop_centers_radius4_only_nucl.n5

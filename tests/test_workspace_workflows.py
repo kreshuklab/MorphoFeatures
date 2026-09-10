@@ -166,46 +166,164 @@ def test_dino_views_and_object_failures(tmp_path):
     assert next(microscopy_views(gradient, gradient > 0, {"size": 28})).dtype == torch.float32
 
 
-def test_training_ui_retains_navigation_state(tmp_path, monkeypatch, repo_root):
-    pytest.importorskip("streamlit.testing.v1")
-    from streamlit.testing.v1 import AppTest
+@pytest.mark.parametrize("axis", [0, 1, 2])
+def test_volume_preview_preserves_axes_ids_and_bounds(tmp_path, monkeypatch, axis):
+    from morphofeatures.data.volumes import SpatialVolume, inspect_volume, preview_volume_pair
 
-    script = tmp_path / "app.py"
-    script.write_text("""import streamlit as st
-from morphofeatures.config import load_config
-from morphofeatures.workspace_ui import training_page
-page = st.radio("Page", ["Training", "Elsewhere"])
-if page == "Training":
-    training_page(load_config())
-""")
-    app = AppTest.from_file(str(script)).run(timeout=30)
-    assert not app.exception
-    epochs = next(widget for widget in app.number_input if widget.label == "training.epochs")
-    epochs.set_value(13).run()
-    next(w for w in app.text_input if w.label == "Output root").set_value(
-        str(tmp_path / "runs")
-    ).run()
-    next(w for w in app.button if w.label == "Save dry run").click().run()
-    assert not app.error
-    first = tmp_path / "runs/experiments/training-001/workspace/job.yaml"
-    assert yaml.safe_load(first.read_text())["stages"][0]["config"]["training"]["epochs"] == 13
-    app.radio[0].set_value("Elsewhere").run()
-    app.radio[0].set_value("Training").run()
-    assert not app.exception
-    assert (
-        next(widget for widget in app.number_input if widget.label == "training.epochs").value == 13
+    raw = np.arange(24 * 32 * 40, dtype=np.uint16).reshape(24, 32, 40)
+    labels = np.full(raw.shape, 2**60 + 1, dtype=np.int64)
+    np.save(tmp_path / "raw.npy", raw.transpose(2, 0, 1))
+    np.save(tmp_path / "labels.npy", labels)
+    settings = {
+        "raw": str(tmp_path / "raw.npy"),
+        "segmentation": str(tmp_path / "labels.npy"),
+        "raw_axes": "xzy",
+        "segmentation_axes": "zyx",
+        "roi": [[2, 4, 6], [20, 28, 36]],
+    }
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            SpatialVolume,
+            "read",
+            lambda *args: pytest.fail("Metadata inspection must not read pixels"),
+        )
+        info = inspect_volume(settings["raw"], axes="xzy")
+    assert info["stored_shape"] == (40, 24, 32)
+    assert info["spatial_shape"] == (24, 32, 40)
+    preview = preview_volume_pair(settings, axis=axis, max_side=8)
+    assert preview["raw"].shape == (8, 8) and preview["cropped"]
+    slices = tuple(slice(a, b) for a, b in zip(preview["start"], preview["stop"]))
+    np.testing.assert_array_equal(preview["raw"], np.take(raw[slices], 0, axis=axis))
+    np.testing.assert_array_equal(
+        preview["segmentation"], np.full((8, 8), 2**60 + 1, dtype=np.int64)
     )
-    next(w for w in app.text_input if w.label.startswith("Experiment / run ID")).set_value(
-        "variant-002"
-    ).run()
-    next(w for w in app.button if w.label == "Save dry run").click().run()
-    assert not app.error
-    second = tmp_path / "runs/experiments/variant-002/workspace/job.yaml"
-    assert yaml.safe_load(second.read_text())["stages"][0]["config"]["training"]["epochs"] == 13
+    with pytest.raises(ValueError, match="inside"):
+        preview_volume_pair({**settings, "roi": [[0, 0, 0], [25, 32, 40]]})
 
 
-def test_preprocessing_alignment_masks_and_training_inputs(tmp_path):
+def test_dino_pipeline_exports_visualization_and_held_out_classification(tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    torch.set_num_threads(1)
+
+    class TinyBackbone(torch.nn.Module):
+        def forward_features(self, batch):
+            vector = batch.mean((2, 3))
+            return {"x_norm_clstoken": vector, "x_norm_patchtokens": vector[:, None]}
+
+    monkeypatch.setattr("morphofeatures.dino.load_backbone", lambda settings: TinyBackbone())
+    ids = np.arange(13, dtype=np.int64) + 2**60
+    intensities = np.tile([20, 200], 7)[:13].astype(np.uint8)
+    crops = np.broadcast_to(intensities[:, None, None, None], (13, 8, 8, 8)).copy()
+    np.save(tmp_path / "crops.npy", crops)
+    np.save(tmp_path / "ids.npy", ids)
+    torch.save({}, tmp_path / "weights.pt")
+    repository = tmp_path / "backbone"
+    repository.mkdir()
+    (repository / "hubconf.py").write_text(
+        "# Fixture: the backbone loader is replaced in this test.\n"
+    )
+    pd.DataFrame(
+        {
+            "label_id": ids[:12],
+            "cell_type": np.tile(["a", "b"], 6),
+            "specimen": np.repeat(np.arange(6), 2),
+        }
+    ).to_csv(tmp_path / "labels.tsv", sep="\t", index=False)
+    document = {
+        "stages": [
+            {
+                "action": "extract",
+                "model": "dinov2",
+                "variant": "dinov2_vits14",
+                "model_repository": str(repository),
+                "checkpoint": str(tmp_path / "weights.pt"),
+                "views": {"normalization": "dtype", "size": 28, "fractions": [0.5]},
+                "config": {
+                    "device": "cpu",
+                    "data": {
+                        "crops": str(tmp_path / "crops.npy"),
+                        "label_ids": str(tmp_path / "ids.npy"),
+                    },
+                },
+            },
+            {
+                "action": "analyze",
+                "from_extraction": True,
+                "umap": False,
+                "clusters": 2,
+                "annotations": str(tmp_path / "labels.tsv"),
+                "label_column": "cell_type",
+                "group_column": "specimen",
+                "folds": 3,
+                "knn_k": 1,
+            },
+        ]
+    }
+    record = submit_job(document, output_root=tmp_path / "runs", run_id="dino", execution="dry-run")
+    status = json.loads(run_job(record.config_snapshot).read_text())
+    assert status["state"] == "completed"
+    np.testing.assert_array_equal(load_embeddings(status["stages"][0]["result"]).label_ids, ids)
+    path = Path(status["stages"][1]["result"])
+    result = json.loads(path.read_text())
+    evaluation = result["classification"]
+    assert evaluation["evaluated_objects"] == 12
+    assert evaluation["excluded_object_ids"] == [int(ids[-1])]
+    assert evaluation["mean_metrics"]["linear_accuracy"] == 1
+    assert evaluation["mean_metrics"]["knn_accuracy"] == 1
+    assert evaluation["classifiers"]["linear"]["confusion_matrix"] == [[6, 0], [0, 6]]
+    predictions = pd.read_csv(path.parent / "predictions.tsv", sep="\t")
+    assert predictions.groupby(["classifier", "label_id"]).size().eq(1).all()
+    assert set(predictions.label_id) == set(ids[:12])
+    splits = pd.read_csv(path.parent / "splits.tsv", sep="\t")
+    for _, fold in splits.groupby("fold"):
+        assert not set(fold[fold.role == "train"].group) & set(fold[fold.role == "test"].group)
+    assert (path.parent / "projection.svg").exists()
+    import zipfile
+
+    with zipfile.ZipFile(path.parent / "export.zip") as archive:
+        assert {
+            "predictions.tsv",
+            "splits.tsv",
+            "analysis.json",
+            "coordinates.tsv",
+            "projection.svg",
+        } <= set(archive.namelist())
+
+
+def test_dino_invalid_inputs_fail_before_allocating_a_run(tmp_path):
+    from morphofeatures.dino import validate_dino_settings
+
+    np.save(tmp_path / "crops.npy", np.ones((4, 8, 8, 8), dtype=np.float32))
+    np.save(tmp_path / "ids.npy", np.arange(4))
+    settings = {
+        "model": "dinov2",
+        "config": {
+            "data": {"crops": str(tmp_path / "crops.npy"), "label_ids": str(tmp_path / "ids.npy")}
+        },
+    }
+    with pytest.raises(ValueError, match="multiple of 14"):
+        validate_dino_settings({**settings, "views": {"size": 225}})
+    with pytest.raises(ValueError, match="integer crops"):
+        validate_dino_settings({**settings, "views": {"normalization": "dtype"}})
+    np.save(tmp_path / "masks.npy", np.ones((3, 8, 8, 8), dtype=bool))
+    settings["config"]["data"]["loss_masks"] = str(tmp_path / "masks.npy")
+    with pytest.raises(ValueError, match="crop count"):
+        validate_dino_settings(settings)
+    n5 = tmp_path / "raw_patches_masked.n5"
+    n5.mkdir()
+    settings["config"]["data"] = {"crops": str(n5)}
+    with pytest.raises(ValueError, match="load the grouped N5 model/data YAML") as error:
+        validate_dino_settings(settings)
+    assert "data.positions_container" in str(error.value)
+
+
+@pytest.mark.parametrize("output_format", ["npy", "h5", "n5"])
+def test_preprocessing_alignment_masks_and_training_inputs(tmp_path, output_format):
     h5py = pytest.importorskip("h5py")
+    if output_format == "n5":
+        pytest.importorskip("z5py")
+    from morphofeatures.configuration_editor import validate_training
+    from morphofeatures.data.crop_storage import open_crop_array
     from morphofeatures.data.preprocessing import preprocess
     from morphofeatures.mae3d import _load_crops, _load_label_ids, _load_loss_masks
 
@@ -231,12 +349,14 @@ def test_preprocessing_alignment_masks_and_training_inputs(tmp_path):
         "crop_shape": [8, 8, 8],
         "block_shape": [3, 5, 7],
         "normalization": "none",
+        "output_format": output_format,
     }
     path = preprocess(settings, tmp_path / "prepared")
     config = load_document(path)
     crops = _load_crops(config, 42)
     ids = _load_label_ids(config, len(crops))
     masks = _load_loss_masks(config, len(crops), crops.shape[-3:])
+    validate_training(config, path.parent)
     assert ids.tolist() == [100, 2**53 + 17]
     assert crops.shape == (2, 1, 8, 8, 8)
     assert masks[0].sum() == 100
@@ -246,8 +366,111 @@ def test_preprocessing_alignment_masks_and_training_inputs(tmp_path):
     first = manifest.iloc[0]
     assert first.bbox_min_z == 1 and first.bbox_max_z == 5
     assert first.crop_center_coordinate_z == 16
+    with open_crop_array(config["data"]) as stored:
+        assert stored.dtype == np.dtype("float32")
+        np.testing.assert_array_equal(stored[0], crops[0, 0])
+        if output_format != "npy":
+            assert stored.chunks == (1, 8, 8, 8)
+            assert stored.compression == "gzip"
+            assert stored.attrs["axes"] == "nzyx"
+    metadata = json.loads((path.parent / "preprocessing.json").read_text())
+    assert metadata["output_format"] == output_format
+    if output_format != "npy":
+        assert not list(path.parent.glob("*.npy"))
+        assert (
+            config["data"]["crops"] == config["data"]["label_ids"] == config["data"]["loss_masks"]
+        )
+        assert config["data"]["source"] == "masked_crops"
+    assert not (path.parent / ".patches").exists()
+    with pytest.raises(ValueError, match="output_format"):
+        preprocess({**settings, "output_format": "invalid"}, tmp_path / "invalid")
+    assert not (tmp_path / "invalid").exists()
     with pytest.raises(ValueError, match="spacing differ"):
         preprocess({**settings, "raw_spacing_zyx": [1, 1, 1]}, tmp_path / "bad")
+
+
+@pytest.mark.parametrize("output_format", ["h5", "n5"])
+def test_container_preprocessing_feeds_linked_mae_and_dino(
+    tmp_path, repo_root, monkeypatch, output_format
+):
+    pytest.importorskip("h5py" if output_format == "h5" else "z5py")
+    torch = pytest.importorskip("torch")
+    torch.set_num_threads(1)
+    from morphofeatures.dino import validate_dino_settings
+
+    class TinyBackbone(torch.nn.Module):
+        def forward_features(self, batch):
+            return {"x_norm_clstoken": batch.mean((2, 3))}
+
+    monkeypatch.setattr("morphofeatures.dino.load_backbone", lambda settings: TinyBackbone())
+    labels = np.zeros((16, 16, 16), dtype=np.int64)
+    ids = np.arange(8, dtype=np.int64) + 2**53 + 17
+    for label_id, (z, y, x) in zip(ids, np.ndindex(2, 2, 2)):
+        labels[2 + 8 * z : 5 + 8 * z, 2 + 8 * y : 5 + 8 * y, 2 + 8 * x : 5 + 8 * x] = label_id
+    np.save(tmp_path / "raw.npy", np.arange(16**3, dtype=np.uint16).reshape(labels.shape))
+    np.save(tmp_path / "labels.npy", labels)
+    repository = tmp_path / "backbone"
+    repository.mkdir()
+    (repository / "hubconf.py").write_text("# Test backbone is injected; no model download\n")
+    checkpoint = tmp_path / "dino.pth"
+    checkpoint.write_bytes(b"test backbone")
+    record = submit_job(
+        {
+            "stages": [
+                {
+                    "action": "preprocess",
+                    "raw": str(tmp_path / "raw.npy"),
+                    "segmentation": str(tmp_path / "labels.npy"),
+                    "spacing_zyx": [1, 1, 1],
+                    "unit": "voxel",
+                    "crop_shape": [8, 8, 8],
+                    "output_format": output_format,
+                },
+                {
+                    "action": "train",
+                    "from_preprocessing": True,
+                    "config": load_document(repo_root / "configs/smoke.yaml"),
+                },
+                {"action": "extract", "model": "mae", "from_training": True},
+                {
+                    "action": "extract",
+                    "model": "dinov2",
+                    "variant": "dinov2_vits14",
+                    "model_repository": str(repository),
+                    "checkpoint": str(checkpoint),
+                    "from_preprocessing": True,
+                    "config": {"device": "cpu"},
+                    "views": {"size": 28, "axes": [0], "fractions": [0.5], "normalization": "unit"},
+                },
+            ]
+        },
+        output_root=tmp_path,
+        run_id="container",
+        execution="dry-run",
+    )
+    status = json.loads(run_job(record.config_snapshot).read_text())
+    assert status["state"] == "completed"
+    for stage in status["stages"][2:]:
+        table = load_embeddings(stage["result"])
+        np.testing.assert_array_equal(table.label_ids, ids)
+        assert np.isfinite(table.features).all()
+    prepared = load_document(status["stages"][0]["result"])
+    validate_dino_settings({"model": "dinov2", "config": prepared})
+    assert not list(Path(status["stages"][0]["result"]).parent.glob("*.npy"))
+    with pytest.raises(ValueError, match="dataset inside"):
+        validate_dino_settings(
+            {
+                "model": "dinov2",
+                "config": {**prepared, "data": {**prepared["data"], "label_ids_key": None}},
+            }
+        )
+    with pytest.raises(ValueError, match="missing from"):
+        validate_dino_settings(
+            {
+                "model": "dinov2",
+                "config": {**prepared, "data": {**prepared["data"], "crops_key": "missing"}},
+            }
+        )
 
 
 def test_preprocessing_boundary_and_missing_ids_are_reported(tmp_path):
