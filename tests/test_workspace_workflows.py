@@ -546,9 +546,10 @@ def test_local_worker_updates_registry_without_ui(tmp_path, repo_root):
         execution="local",
     )
     status = Path(record.working_directory) / "status.json"
+    registry = JobRegistry.under_output_root(tmp_path)
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
-        if status.exists() and json.loads(status.read_text()).get("state") in {
+        if status.exists() and registry.get(record.id).application_state in {"completed", "failed"} and json.loads(status.read_text()).get("state") in {
             "completed",
             "failed",
         }:

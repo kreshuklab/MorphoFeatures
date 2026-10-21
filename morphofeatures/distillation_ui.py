@@ -74,46 +74,75 @@ def stage_form(draft, index):
 
 
 def results(config, metadata, path):
+    from morphofeatures.artifact_availability import availability_details, available_vectors, probe
     from morphofeatures.dino_experiment_ui import render_analysis
     from morphofeatures.followup_ui import download_file
+    from morphofeatures.result_browser_ui import focus, safe_choice
+    from morphofeatures.result_catalog import vector_artifacts
     from morphofeatures.workspace_navigation import selector_key
 
-    st.info(metadata["interpretation"])
+    st.info(metadata.get("interpretation", "Saved distillation outputs."))
     for warning in metadata.get("warnings", []):
         st.warning(warning)
-    section = st.radio("Distillation results", ["Scores", "Maps & inspection", "Bilateral probe", "Vectors & fitted models"],
-                       horizontal=True, key=selector_key("distillation-section:" + str(path)))
+    vectors = vector_artifacts(metadata, path)
+    availability_details(vectors, key="distillation:" + str(path))
+    available = available_vectors(vectors)
+    sections = []
+    if metadata.get("metrics"):
+        sections.append("Scores")
+    for key, title in (("comparison", "Maps & inspection"), ("bilateral", "Bilateral probe")):
+        if metadata.get(key) and (status := probe(path.parent / metadata[key])).ready and status.kind == "report":
+            sections.append(title)
+    if available:
+        sections.append("Vectors & fitted models")
+    if not sections:
+        st.info("No usable distillation outputs are available. Saved settings remain in Files & provenance.")
+        return
+    key = "distillation-section:" + str(path)
+    if st.session_state.get(key) not in sections:
+        st.session_state.pop(key, None)
+    section = st.radio("Distillation results", sections, horizontal=True, key=selector_key(key))
     if section == "Scores":
         st.dataframe(pd.DataFrame(metadata["metrics"]), hide_index=True)
         validation = metadata["validation"]
         st.caption(f"{validation['training_objects']:,} training / {validation['validation_objects']:,} validation objects · {validation['grouping']}. These scores use the same standardized linear probe for every representation.")
-        method = st.selectbox("Confusion matrix", list(metadata["representations"]),
-                              format_func=lambda m: metadata["representations"][m]["name"], key="distill-confusion:" + str(path))
-        entry = metadata["representations"][method]
-        st.image(entry["confusion"])
-        for suffix in (".png", ".svg"):
-            download_file(Path(entry["confusion"]).with_suffix(suffix), "Download confusion matrix " + suffix)
+        methods = [m for m, entry in metadata.get("representations", {}).items() if entry.get("confusion") and probe(path.parent / entry["confusion"]).ready]
+        if methods:
+            method = safe_choice("Confusion matrix", methods,
+                                 format_func=lambda m: metadata["representations"][m]["name"], key="distill-confusion:" + str(path))
+            entry = metadata["representations"][method]
+            st.image(str(path.parent / entry["confusion"]))
+            for suffix in (".png", ".svg"):
+                download_file((path.parent / entry["confusion"]).with_suffix(suffix), "Download confusion matrix " + suffix)
         for name in ("metrics.tsv", "predictions.tsv", "split.tsv"):
             download_file(path.parent / name, "Download " + name)
     elif section == "Maps & inspection":
-        render_analysis(config, Path(metadata["comparison"]))
+        render_analysis(config, path.parent / metadata["comparison"])
     elif section == "Bilateral probe":
         if metadata.get("bilateral"):
             import json
 
             from morphofeatures.spatial_probe_ui import probe_results
 
-            report = Path(metadata["bilateral"])
+            report = path.parent / metadata["bilateral"]
             st.caption("Search population: " + metadata["settings"]["bilateral_population"])
             probe_results(config, json.loads(report.read_text()), report)
         else:
             st.info("No bilateral probe was requested. Use Follow-up analysis to configure one from these saved vectors.")
     else:
-        method = st.selectbox("Representation", list(metadata["representations"]), key="distill-vectors:" + str(path))
+        methods = [m for m, entry in metadata["representations"].items() if any(
+            str((path.parent / entry.get(field, "")).resolve()) in {str(Path(p).resolve()) for p in available.values()}
+            for field in ("embedding", "held_out")
+        )]
+        method = safe_choice("Representation", methods, key="distill-vectors:" + str(path))
         entry = metadata["representations"][method]
         st.caption("Full vectors include training objects. Held-out vectors exclude every training ID and preserve the fitted coordinate system. Keep each .metadata.json file with its vectors.")
         for field in ("embedding", "held_out"):
-            file = Path(entry[field])
+            if not entry.get(field):
+                continue
+            file = path.parent / entry[field]
             download_file(file, "Download " + field + " vectors")
             download_file(file.with_suffix(".metadata.json"), "Download " + field + " provenance")
+        preferred = {name: p for name, p in available.items() if name.startswith(entry["name"] + " · ") and name.endswith("held-out population")}
+        focus(path, metadata, vectors=preferred or {name: p for name, p in available.items() if name.startswith(entry["name"] + " · ")})
         download_file(path.parent / "export.zip", "Download complete distillation results")

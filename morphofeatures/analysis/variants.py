@@ -348,6 +348,46 @@ def run_configured_variants(parent, settings):
         execute_variant(Path(entry["directory"]) / "variant.json")
 
 
+def validate_saved_variant(stage):
+    """Read-only review for a new run that reuses a saved analysis's cohort."""
+    from morphofeatures.artifact_availability import probe
+    from morphofeatures.result_catalog import vector_artifacts
+
+    parent = Path(stage.get("analysis") or "")
+    metadata = read_json(parent)
+    if metadata.get("schema") not in REPORT_SCHEMAS:
+        raise ValueError("Choose a saved analysis, comparison or joint-analysis report.")
+    variant = stage.get("variant", {})
+    validate_variants({**metadata.get("settings", {}), "analysis_variants": [variant]})
+    paths = vector_artifacts(metadata, parent)
+    if metadata.get("schema") == "morphofeatures.joint_analysis.v1":
+        paths["Pooled vectors"] = parent.parent / metadata.get("embedding", "embeddings.npz")
+    paths["Saved coordinates"] = parent.parent / metadata.get("coordinates", "coordinates.tsv")
+    for name, path in paths.items():
+        status = probe(path)
+        expected = "coordinates" if name == "Saved coordinates" else "vectors"
+        if status.state not in {"ready", "unchecked"} or status.kind != expected:
+            raise ValueError(f"{name}: {status.reason or 'not a valid analysis input'}")
+
+
+def run_saved_variant(stage, destination):
+    """Use the existing variant engine in a new local/SLURM worker directory.
+
+    The source report and its variant index remain untouched. The new report's
+    reanalysis record links to the parent and retains classifier provenance.
+    """
+    validate_saved_variant(stage)
+    parent, destination = Path(stage["analysis"]), Path(destination)
+    variant = stage["variant"]
+    entry = {
+        "id": uuid.uuid4().hex, "name": variant["name"], "state": "running",
+        "origin": "workspace", "parent": str(parent.resolve()),
+        "directory": str(destination.resolve()),
+        "overrides": {k: v for k, v in variant.items() if k != "name"},
+    }
+    return _recompute(parent, destination, entry)
+
+
 def start_variants(parent, variants):
     """Launch a sequential batch on the UI host in a separate, single-threaded process."""
     from morphofeatures.run_deletion import run_write_guard

@@ -87,6 +87,7 @@ def resolve_job(
                 "context",
                 "bilateral",
                 "export_bilateral",
+                "analysis_variant",
             }:
                 raise ValueError(f"Unsupported stage action: {stage.get('action')}")
             if "config" in stage:
@@ -242,8 +243,8 @@ def resolve_job(
                 from morphofeatures.analysis.mobie_export import resolve_mobie_export
 
                 linked = stage.get("from_analysis", False) or stage.get("from_bilateral", False)
-                if stage.get("from_analysis") and not available.intersection({"analyze", "compare"}):
-                    raise ValueError("from_analysis requires an earlier analyze or compare stage")
+                if stage.get("from_analysis") and not available.intersection({"analyze", "compare", "analysis_variant"}):
+                    raise ValueError("from_analysis requires an earlier analyze, compare or saved-map variant stage")
                 # A preceding preparation can supply its spatial source before its
                 # crops/config files exist. Analysis results are resolved by the worker.
                 export_settings = stage
@@ -360,6 +361,11 @@ def resolve_job(
 
                 validate_projection_settings(stage)
                 validate_variants(stage)
+            if stage["action"] == "analysis_variant":
+                from morphofeatures.analysis.variants import validate_saved_variant
+
+                with at_fields("analysis", "variant"):
+                    validate_saved_variant(stage)
             if stage["action"] == "analyze" and not (
                 stage.get("from_extraction") or stage.get("from_embedding")
             ):
@@ -725,6 +731,8 @@ def run_job(path):
             destination = folder / f"{index:02d}-{action}"
             destination.mkdir(exist_ok=True)
             entry = {"index": index, "action": action, "state": "running", "started": utc_now()}
+            if action == "dino_experiment":
+                entry["reports"] = [str(destination / "experiment.json")]
             status["stages"].append(entry)
             write_json_atomic(status_path, status)
             writer.write("stage_started", stage=index, action=action)
@@ -774,6 +782,10 @@ def run_job(path):
                 from morphofeatures.representations import extract_representation
 
                 result = extract_representation(stage, destination, writer=writer)
+            elif action == "analysis_variant":
+                from morphofeatures.analysis.variants import run_saved_variant
+
+                result = run_saved_variant(stage, destination)
             elif action == "analyze":
                 from morphofeatures.representation_analysis import analyze
 
@@ -849,7 +861,7 @@ def run_job(path):
                     stage, destination, progress=lambda **v: writer.write("preprocessing", **v)
                 )
             previous[action] = str(result)
-            if action in {"analyze", "compare"}:
+            if action in {"analyze", "compare", "analysis_variant"}:
                 previous["analysis_result"] = str(result)
             if action in {"extract", "fuse", "context"} and stage.get("name"):
                 previous.setdefault("named_embeddings", {})[stage["name"]] = str(result)
@@ -857,6 +869,12 @@ def run_job(path):
             entry.update(
                 state="completed", result=str(result), seconds=time.perf_counter() - started
             )
+            # Publish completed stages immediately, including when a later stage
+            # is still running or fails. Never advertise an in-progress file.
+            status["artifacts"] = list(artifacts)
+            write_json_atomic(status_path, status)
+            if registry:
+                registry.append_artifacts(worker["record_id"], artifacts)
             if action == "train":
                 previous["training_seconds"] = entry["seconds"]
             writer.write("stage_completed", **entry)

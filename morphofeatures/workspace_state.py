@@ -61,6 +61,7 @@ def with_fusion_comparison(document, index):
     stages[index + 1:index + (2 if reuse else 1)] = [alternative, analysis]
     return result
 STAGE_LABELS = {
+    "analysis_variant": "Change saved map / clustering",
     "distill": "Distill embeddings",
     "export_bilateral": "Export bilateral pairs in 3D",
     "bilateral": "Bilateral-partner retrieval",

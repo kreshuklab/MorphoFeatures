@@ -48,7 +48,6 @@ from morphofeatures.workspace_jobs import (
 )
 from morphofeatures.workspace_state import (
     STAGE_LABELS,
-    STARTING_POINTS,
     analysis_defaults,
     change_summary,
     import_workflow,
@@ -60,7 +59,7 @@ from morphofeatures.workspace_state import (
 )
 from morphofeatures.workspace_ui import retained_input
 
-STEPS = ("Start", "Prepare data", "Train", "Analyze", "Review & run")
+STEPS = ("Start", "Prepare data", "Train", "Extract", "Build features", "Learn", "Analyze", "Export", "Review & run")
 
 
 def rerun():
@@ -77,14 +76,24 @@ def draft_key(config):
 
 
 def active_draft(config):
-    return st.session_state.get(draft_key(config))
+    draft = st.session_state.get(draft_key(config))
+    if draft:
+        st.session_state.setdefault("drafts:" + str(config.paths.output_root), {})[draft["id"]] = draft
+        st.session_state["workflow_active_id"] = draft["id"]
+    return draft
 
 
-def use_draft(config, draft, step="Start"):
-    st.session_state[draft_key(config)] = deepcopy(draft)
-    st.session_state["workflow_step"] = step
-    st.session_state.pop("workspace_plan", None)
-    st.session_state["editor_epoch"] = st.session_state.get("editor_epoch", 0) + 1
+def use_draft(config, draft, step="Start", *, resume=False):
+    from morphofeatures.workflow_catalog import entry_page, retain_draft
+
+    # Older callers used Analyze for every post-training operation.
+    if step == "Analyze" and not resume:
+        step = entry_page(draft["document"]["stages"])
+    previous = st.session_state.get(draft_key(config))
+    if previous:
+        previous["editor_epoch"] = st.session_state.get("editor_epoch", 0)
+    retain_draft(st.session_state, config.paths.output_root, draft, step)
+    st.session_state["editor_epoch"] = draft.get("editor_epoch", 0)
 
 
 def touch(draft):
@@ -171,9 +180,13 @@ def _show_issues(draft, issues, *, context, navigate_to_fields=True):
     for index, issue in enumerate(issues):
         message = _issue_location(draft, issue) + ": " + issue["message"]
         getattr(st, issue.get("severity", "error"))(message)
-        if navigate_to_fields and issue["page"] != st.session_state.get("workflow_step"):
+        stage_key = "workflow-stage:" + draft["id"] + ":" + issue["page"]
+        if navigate_to_fields and (issue["page"] != st.session_state.get("workflow_step") or
+                                  issue.get("stage_index") is not None and st.session_state.get(stage_key) != issue["stage_index"]):
             if st.button("Go to " + issue["page"], key=f"{context}:{draft['id']}:{index}"):
                 st.session_state["workflow_step"] = issue["page"]
+                if issue.get("stage_index") is not None:
+                    st.session_state[stage_key] = issue["stage_index"]
                 rerun()
 
 
@@ -203,9 +216,10 @@ def _form_issues(draft):
         v if isinstance(v, dict) else WorkflowIssue(str(v), "Review & run").to_dict()
         for v in issues
     ]
-    buffer = st.session_state.get("pipeline_buffer:" + draft["id"])
+    editor = draft.get("yaml_editor", {})
+    buffer = st.session_state.get("pipeline_buffer:" + draft["id"], editor.get("buffer"))
     if (
-        st.session_state.get("yaml_enabled:" + draft["id"])
+        st.session_state.get("yaml_enabled:" + draft["id"], editor.get("enabled", False))
         and buffer is not None
         and buffer != yaml.safe_dump(draft["document"], sort_keys=False)
     ):
@@ -407,29 +421,40 @@ def _replace_document(draft, document):
     touch(draft)
     st.session_state["editor_epoch"] = st.session_state.get("editor_epoch", 0) + 1
     st.session_state.pop("workspace_plan", None)
-    st.session_state["guided_errors"] = {}
+    st.session_state["guided_errors"] = {k: v for k, v in st.session_state.get("guided_errors", {}).items() if draft["id"] not in k}
 
 
 def yaml_editor(draft):
+    editor = draft.setdefault("yaml_editor", {})
+    enabled_key = "yaml_enabled:" + draft["id"]
+    st.session_state.setdefault(enabled_key, editor.get("enabled", False))
+
+    def remember_enabled():
+        editor["enabled"] = st.session_state[enabled_key]
+
     with validation_expander(draft, "Advanced: full pipeline YAML"):
         st.caption(
             "All stages and additional settings are preserved. Relative paths use the repository directory."
         )
-        if not st.checkbox("Edit pipeline YAML", key="yaml_enabled:" + draft["id"]):
+        if not st.checkbox("Edit pipeline YAML", key=enabled_key, on_change=remember_enabled):
             st.code(yaml.safe_dump(draft["document"], sort_keys=False), language="yaml")
             return
         key = "pipeline_buffer:" + draft["id"]
         revision_key = key + ":revision"
         if key not in st.session_state:
-            st.session_state[key] = yaml.safe_dump(draft["document"], sort_keys=False)
-            st.session_state[revision_key] = draft["revision"]
+            st.session_state[key] = editor.get("buffer", yaml.safe_dump(draft["document"], sort_keys=False))
+            st.session_state[revision_key] = editor.get("revision", draft["revision"])
+
+        def remember_buffer():
+            editor.update(buffer=st.session_state[key], revision=st.session_state[revision_key])
 
         def reload_yaml():
             st.session_state[key] = yaml.safe_dump(draft["document"], sort_keys=False)
             st.session_state[revision_key] = draft["revision"]
+            remember_buffer()
 
         st.button("Reload YAML from current form settings", on_click=reload_yaml)
-        edited = st.text_area("Pipeline YAML", key=key, height=320)
+        edited = st.text_area("Pipeline YAML", key=key, height=320, on_change=remember_buffer)
         stale = st.session_state[revision_key] != draft["revision"]
         if stale:
             st.warning(
@@ -440,6 +465,7 @@ def yaml_editor(draft):
                 document = resolve_job(parse_document(edited), repository_root(), validate=False)
                 _replace_document(draft, document)
                 st.session_state[revision_key] = draft["revision"]
+                remember_buffer()
                 rerun()
             except Exception as error:
                 st.error(str(error))
@@ -454,18 +480,13 @@ def _preparation_checklist(items):
 
 
 def _start(config, draft):
-    st.subheader("What are you starting with?")
-    st.caption(
-        "Choose an entry point, or load an existing configuration. Continue between stages without losing edits."
-    )
-    start = st.selectbox(
-        "Starting point",
-        list(STARTING_POINTS),
-        format_func=STARTING_POINTS.get,
-        help="Choose the task that matches the data or saved results you already have. The checklist below explains its inputs. Selecting an option shows its description; Create workflow opens an editable draft and does not submit a job.",
-    )
-    st.write(
-        {
+    from morphofeatures.workflow_catalog import entry_page
+    from morphofeatures.workflow_selection_ui import selection
+
+    start, proposed = selection(config)
+    if start is None:
+        return
+    description = {
             "published": "Explore bundled original features, preserve their published UMAP/clusters, and optionally evaluate labels or bilateral partners.",
             "bilateral": "Compare MAE, DINO and published features on the same cell IDs using candidate-partner retrieval ranks. No training is required.",
             "context": "Combine each object's own embedding with its physical neighbors' mean → analyze or compare the resulting context vectors.",
@@ -484,25 +505,25 @@ def _start(config, draft):
             "joint_embeddings": "Pool independent datasets encoded by the same checkpoint → fit one PCA/UMAP and clustering → compare dataset and cell-type distributions. Accepts saved embeddings or new extractions.",
             "demo": "Train on eight generated synthetic crops, then extract and analyze. A short CPU demonstration.",
         }[start]
-    )
-    _preparation_checklist(WORKFLOW_REQUIREMENTS[start])
+    if proposed:
+        st.caption("The plan below starts with your available inputs and includes the operations you selected.")
+    else:
+        st.write(description)
+    _preparation_checklist(workflow_requirements(proposed["document"]["stages"]) if proposed else WORKFLOW_REQUIREMENTS[start])
     from morphofeatures.workflow_outputs import show_expected_outputs
 
-    show_expected_outputs(start=start)
+    if proposed:
+        st.markdown("**Proposed plan:** " + " → ".join(STAGE_LABELS.get(s["action"], s["action"]) for s in proposed["document"]["stages"]))
+        show_expected_outputs(proposed["document"]["stages"])
+    else:
+        show_expected_outputs(start=start)
     if draft:
         st.caption(
-            "Starting again creates a separate draft. Save the current draft above to reopen it later."
+            "Your current draft stays available in this session. Save drafts to retain them after restarting the app."
         )
     if st.button("Create workflow" if not draft else "Create a new workflow", type="primary"):
-        use_draft(
-            config,
-            new_draft(start, model_defaults=st.session_state.get("workspace_dino_defaults")),
-            "Prepare data"
-            if start in {"raw", "preprocess", "platybrowser", "ome_zarr", "dino_experiment"}
-            else "Train"
-            if start in {"crops", "demo"}
-            else "Analyze",
-        )
+        created = proposed or new_draft(start, model_defaults=st.session_state.get("workspace_dino_defaults"))
+        use_draft(config, created, entry_page(created["document"]["stages"]))
         rerun()
     st.subheader("Load settings from a file")
     source = retained_input(
@@ -587,8 +608,7 @@ def _start(config, draft):
             if st.button("Open saved draft"):
                 try:
                     saved = load_draft(config.paths.output_root, identifier)
-                    first = saved["document"]["stages"][0].get("action")
-                    step = {"preprocess": "Prepare data", "train": "Train"}.get(first, "Analyze")
+                    step = entry_page(saved["document"]["stages"])
                     use_draft(config, saved, step)
                     rerun()
                 except Exception as error:
@@ -2312,6 +2332,7 @@ def projection_settings_fields(
     umap_label="Generate UMAP",
     clusters_label="Number of clusters",
     seed_label="Random seed",
+    include_variants=True,
 ):
     """Expose the main transfer/experiment map settings before optional variants."""
     from morphofeatures.analysis_variants_ui import variant_fields
@@ -2343,8 +2364,9 @@ def projection_settings_fields(
             field(draft, path + ["umap_epochs"], "UMAP epochs (null uses automatic)", 50)
         field(draft, path + ["seed"], seed_label, 42)
         field(draft, path + ["unlabeled_opacity"], "Unlabeled point opacity", 0.15)
-    with validation_expander(draft, "Additional analysis combinations"):
-        variant_fields(draft, path)
+    if include_variants:
+        with validation_expander(draft, "Additional analysis combinations"):
+            variant_fields(draft, path)
 
 
 def classifier_input_fields(draft, path):
@@ -2833,17 +2855,23 @@ def _artifact_picker(draft, index, kind):
     if not registry.exists():
         return
     options = {}
-    for record in JobRegistry(registry).list(states=["completed"], limit=500):
-        for item in (*record.artifacts, record.checkpoint_path, record.embedding_path):
+    from morphofeatures.artifact_availability import selected_artifact
+    from morphofeatures.result_catalog import run_artifacts
+
+    for record in JobRegistry(registry).list(limit=500):
+        for item in run_artifacts(record):
             if not item:
                 continue
             path = Path(item)
+            status = selected_artifact(path)
+            if not status.ready:
+                continue
             if (
                 (kind == "data" and path.name in {"mae_config.yaml", "data_config.yaml"})
                 or (kind == "checkpoint" and path.suffix in {".pt", ".pth"})
-                or (kind == "embedding" and path.suffix in {".npz", ".npy", ".tsv", ".csv"})
+                or (kind == "embedding" and status.kind == "vectors")
             ):
-                options[str(path)] = record.run_id + " · " + path.name
+                options[str(path)] = record.display_name + " · " + path.name
     if not options:
         return
     with validation_expander(draft, "Choose " + kind + " from a completed run"):
@@ -2928,7 +2956,7 @@ def _stage_options(draft, step):
             draft.setdefault("stage_history", []).append(deepcopy(document))
             _replace_document(draft, {**document, "stages": stages})
 
-        if step == "Analyze":
+        if step in {"Extract", "Build features", "Learn", "Analyze"}:
             if st.button("Add embedding distillation (adapter / PCA)"):
                 from morphofeatures.analysis.distillation import defaults
 
@@ -3484,6 +3512,13 @@ def workflow_page(config):
     st.session_state["workspace_dino_defaults"] = workspace_defaults(config)
     st.title("Workflow")
     draft = active_draft(config)
+    bank = st.session_state.get("drafts:" + str(config.paths.output_root), {})
+    if len(bank) > 1:
+        with st.expander("Switch draft · edits are kept in this session"):
+            chosen = st.selectbox("Session drafts", list(bank), format_func=lambda i: bank[i]["name"] + " · " + i[:8], key="draft-switch")
+            if st.button("Resume selected draft"):
+                use_draft(config, bank[chosen], bank[chosen].get("last_page", "Start"), resume=True)
+                rerun()
     if not draft:
         _start(config, None)
         return
@@ -3509,46 +3544,22 @@ def workflow_page(config):
         st.session_state["step_widget"] = "Start"
         rerun()
     actions = [s.get("action") for s in draft["document"]["stages"]]
-    steps = tuple(
-        step
-        for step in STEPS
-        if step in {"Start", "Review & run"}
-        or (step == "Prepare data" and any(a in actions for a in ("preprocess", "dino_experiment")))
-        or (step == "Train" and "train" in actions)
-        or (
-            step == "Analyze"
-            and any(
-                a in actions
-                for a in (
-                    "extract",
-                    "analyze",
-                    "compare",
-                    "joint_analyze",
-                    "bilateral",
-                    "export_bilateral",
-                    "context",
-                    "dino_experiment",
-                    "fuse",
-                    "transfer",
-                    "distill",
-                    "export_labels",
-                    "export_mobie",
-                )
-            )
-        )
-    )
+    from morphofeatures.workflow_catalog import PAGE_ACTIONS, workflow_steps
+
+    steps = workflow_steps(draft["document"]["stages"])
     current = st.session_state.get("workflow_step", "Start")
     if current not in steps:
         current = st.session_state["workflow_step"] = steps[1]
     if current != "Start":
-        _preparation_checklist(
-            workflow_requirements(
-                draft["document"]["stages"], allow_synthetic=draft["allow_synthetic"]
+        with st.expander("Workflow prerequisites and expected outputs"):
+            _preparation_checklist(
+                workflow_requirements(
+                    draft["document"]["stages"], allow_synthetic=draft["allow_synthetic"]
+                )
             )
-        )
-        from morphofeatures.workflow_outputs import show_expected_outputs
+            from morphofeatures.workflow_outputs import show_expected_outputs
 
-        show_expected_outputs(draft["document"]["stages"])
+            show_expected_outputs(draft["document"]["stages"])
     if st.session_state.get("step_widget") != current:
         st.session_state["step_widget"] = current
 
@@ -3558,6 +3569,8 @@ def workflow_page(config):
     step = st.radio(
         "Workflow steps", steps, horizontal=True, key="step_widget", on_change=step_changed
     )
+    draft["last_page"] = step
+    draft["editor_epoch"] = st.session_state.get("editor_epoch", 0)
     actions = [s.get("action") for s in draft["document"]["stages"]]
     st.caption(
         "Will run: " + " → ".join(STAGE_LABELS.get(action, str(action)) for action in actions)
@@ -3579,26 +3592,14 @@ def workflow_page(config):
             st.success(
                 "This page passed its checks. Final Review also checks cross-stage inputs and execution settings."
             )
-        group = {
-            "Prepare data": {"preprocess", "dino_experiment"},
-            "Train": {"train"},
-            "Analyze": {
-                "extract",
-                "analyze",
-                "compare",
-                "joint_analyze",
-                "bilateral",
-                "export_bilateral",
-                "context",
-                "dino_experiment",
-                "fuse",
-                "transfer",
-                "distill",
-                "export_labels",
-                "export_mobie",
-            },
-        }[step]
+        group = PAGE_ACTIONS[step]
         indices = [i for i, s in enumerate(draft["document"]["stages"]) if s.get("action") in group]
+        if len(indices) > 1:
+            key = "workflow-stage:" + draft["id"] + ":" + step
+            if st.session_state.get(key) not in indices:
+                st.session_state.pop(key, None)
+            indices = [st.selectbox("Stage to configure", indices, key=key,
+                                   format_func=lambda i: f"{i + 1}. " + _stage_title(draft["document"]["stages"], i))]
         if not indices:
             st.info(
                 f"{step} is not included. This workflow starts from existing inputs or stops before this stage."
@@ -3606,6 +3607,18 @@ def workflow_page(config):
         for index in indices:
             action = draft["document"]["stages"][index]["action"]
             st.subheader(f"Stage {index + 1} · " + _stage_title(draft["document"]["stages"], index))
+            stage = draft["document"]["stages"][index]
+            links = [label for flag, label in (("from_preprocessing", "prepared data"), ("from_training", "trained model"),
+                      ("from_extraction", "extracted vectors"), ("from_embedding", "named vectors"), ("from_analysis", "analysis")) if stage.get(flag)]
+            st.caption("Input: " + ("linked " + ", ".join(links) if links else "existing inputs configured below") + ". Only the stages shown in the plan will run.")
+            if action == "analysis_variant":
+                field(draft, ["document", "stages", index, "analysis"], "Saved parent analysis", "")
+                vp = ["document", "stages", index, "variant"]
+                field(draft, vp + ["name"], "Map / clustering combination name", "New map")
+                field(draft, vp + ["normalization"], "Embedding normalization", "standardize", options=["standardize", "l2", "none"])
+                projection_settings_fields(draft, vp, include_variants=False)
+                st.caption("Exact plotted cohort and saved classifier scores are retained. Only the map and clusters are recomputed.")
+                continue
             if action == "dino_experiment":
                 from morphofeatures.dino_experiment_ui import experiment_form
 
@@ -3671,8 +3684,10 @@ def continue_from_artifact(config, path, kind=None):
         if source.is_file():
             stage["config"] = load_document(source)
         step = "Analyze"
-    elif path.name in {"mae_config.yaml", "data_config.yaml"}:
+    elif path.suffix.lower() in {".yaml", ".yml"}:
         data = load_document(path)
+        if not isinstance(data.get("data"), dict):
+            raise ValueError("Choose a prepared-data configuration with a data section.")
         grouped = data.get("data", {}).get("source") == "grouped_crops"
         if grouped:
             kind = "dino"
@@ -3689,8 +3704,8 @@ def continue_from_artifact(config, path, kind=None):
             draft["document"]["stages"][0].setdefault("views", {}).update(
                 mode="stored", normalization="unit", resize="letterbox", fractions=[0.5]
             )
-        if kind != "dino":
-            model["mae"]["input_shape"] = data["mae"]["input_shape"]
+        if kind != "dino" and data.get("mae"):
+            model["mae"].update(data["mae"])
         step = "Analyze" if kind == "dino" else "Train"
     else:
         draft = new_draft("embeddings", source="Embedding: " + str(path))
@@ -3713,32 +3728,36 @@ def run_actions(config, record):
             navigate("Workflow")
         except Exception as error:
             st.error(str(error))
-    if record.application_state != "completed":
-        return
-    from morphofeatures.workflow_outputs import OUTPUTS, REPORT_ACTIONS, ordered_artifacts
+    from morphofeatures.artifact_availability import probe, selected_artifact
+    from morphofeatures.result_catalog import run_artifacts, run_results
 
-    artifacts = ordered_artifacts(
-        (*record.artifacts, record.checkpoint_path, record.embedding_path)
-    )
+    declared = run_artifacts(record)
+    artifacts = [p for p in declared if probe(p).state not in {"missing", "invalid", "unreadable"}]
+    results, unavailable = run_results(record)
+    if unavailable:
+        with st.expander("Unavailable saved outputs"):
+            st.dataframe([{"Path": item.path, "Status": item.state, "Reason": item.reason} for item in unavailable], hide_index=True)
+            st.caption("Open moved results at their new location in Results. Other completed stages can still be reused.")
 
     def open_result(path):
         st.session_state["value:results:path"] = str(path)
         st.session_state["widget:results:path"] = str(path)
         st.session_state["results:registered"] = "Enter path"
+        st.session_state["results:source"] = "Open a file"
         navigate("Results")
 
     # A completed report must be reachable independently of the advanced artifact
     # selector, whose first entry historically defaulted to job.yaml or a log.
-    reports = [Path(p) for p in artifacts if Path(p).name in REPORT_ACTIONS]
-    if not reports:
-        reports = [Path(p) for p in artifacts if Path(p).suffix in {".npz", ".npy"}]
+    reports = [Path(row["path"]) for row in results if row["kind"] == "report" or
+               (row["kind"] in {"vectors", "coordinates"} and selected_artifact(row["path"]).ready)]
     if reports:
-        st.markdown("**Completed results**")
+        st.markdown("**Available results**")
+        names = {Path(row["path"]): row["name"] for row in results}
         path = reports[0] if len(reports) == 1 else st.selectbox(
             "Completed result", reports, key="run-result-choice:" + record.id,
-            format_func=lambda p: OUTPUTS[REPORT_ACTIONS.get(p.name, "extract")][0] + " · " + p.parent.name,
+            format_func=lambda p: names[p] + " · " + p.parent.name,
         )
-        title = OUTPUTS[REPORT_ACTIONS.get(path.name, "extract")][0]
+        title = names[path]
         if st.button(
             "Open results · " + title,
             key="run-result:" + record.id + ":" + str(path),
@@ -3751,17 +3770,15 @@ def run_actions(config, record):
     if artifacts:
         with st.expander("Other saved outputs and workflow inputs"):
             path = Path(st.selectbox("Continue from an output", artifacts))
-            if path.name in {"mae_config.yaml", "data_config.yaml"} and st.button(
+            artifact_status = selected_artifact(path)
+            if artifact_status.kind == "prepared" and artifact_status.ready and st.button(
                 "Extract DINO features from these prepared objects"
             ):
                 try:
                     continue_from_artifact(config, path, kind="dino")
                 except Exception as error:
                     st.error(str(error))
-            if path.suffix in {".pt", ".pth", ".npz", ".npy", ".tsv", ".csv"} or path.name in {
-                "mae_config.yaml",
-                "data_config.yaml",
-            }:
+            if artifact_status.ready and artifact_status.kind in {"prepared", "checkpoint", "vectors"}:
                 if st.button("Use this output in a new workflow"):
                     try:
                         if not path.exists():
@@ -3769,7 +3786,7 @@ def run_actions(config, record):
                         continue_from_artifact(config, path)
                     except Exception as error:
                         st.error(str(error))
-            if path not in reports and path.suffix in {".json", ".npz", ".npy", ".tsv", ".csv"} and st.button(
+            if path not in reports and probe(path).kind in {"report", "coordinates", "vectors"} and selected_artifact(path).ready and st.button(
                 "Open this output in Results"
             ):
                 open_result(path)

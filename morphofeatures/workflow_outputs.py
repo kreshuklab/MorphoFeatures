@@ -25,6 +25,10 @@ REPORT_ACTIONS = {
 }
 
 OUTPUTS = {
+    "analysis_variant": (
+        "Saved map / clustering variant",
+        "A new analysis report, coordinates, clusters and figures on the parent's exact plotted cohort. Saved vectors, classifier predictions and scores retain their original fitting provenance.",
+    ),
     "distill": (
         "Embedding distillation",
         "`distillation.json` compares original vectors, PCA (centered SVD) and a supervised neural adapter. "

@@ -960,11 +960,10 @@ def render_analysis(config, path):
 
     path = Path(path)
     metadata = json.loads(path.read_text())
-    with st.expander("Follow up on this analysis / change clustering settings"):
-        from morphofeatures.followup_ui import controls
+    from morphofeatures.result_browser_ui import focus
 
-        path, metadata = result_controls(path, metadata)
-        controls(config, metadata, path)
+    path, metadata = result_controls(path, metadata, exploration=False)
+    focus(path, metadata)
     if metadata["schema"] == "morphofeatures.joint_analysis.v1":
         joint_projection_results(config, metadata, path)
     else:
@@ -1033,7 +1032,30 @@ def saved_combination_controls(config, metadata, path):
 
 
 def experiment_results(config, metadata, path):
-    st.info(metadata["interpretation"])
+    from copy import deepcopy
+
+    from morphofeatures.artifact_availability import availability_details, selected_artifact
+    from morphofeatures.result_browser_ui import focus, safe_choice
+    from morphofeatures.result_catalog import report_choices, vector_artifacts
+
+    metadata = deepcopy(metadata)
+    st.info(metadata.get("interpretation", "Saved experiment outputs."))
+    availability_details(vector_artifacts(metadata, path), key="experiment:" + str(path))
+    if metadata.get("execution_state") == "partial":
+        st.info("Partial experiment: completed outputs are available below. Later outputs may still be running or may have failed; inspect Runs for execution status.")
+    if metadata.get("schema") == "morphofeatures.dino_experiment.v1":
+        for category in ("comparisons", "joint_analyses", "transfers"):
+            metadata[category] = report_choices(metadata.get(category, []), path.parent)
+        matched = metadata.get("embeddings", [])
+        original = metadata.get("original_embeddings", [])
+        population = "Matched comparison cohort"
+        if matched and original:
+            population = safe_choice("Vector population", [population, "Original extraction population"], key="experiment-population:" + str(path))
+        if original and (not matched or population == "Original extraction population"):
+            metadata["embeddings"] = original
+            st.caption("Original extraction vectors may cover different objects across methods. A new comparison will match its inputs explicitly.")
+        metadata["embeddings"] = [e for e in metadata.get("embeddings", []) if
+            (status := selected_artifact(path.parent / e["path"])).ready and status.kind == "vectors"]
     if metadata.get("object_selections"):
         with st.expander("Targeted object selection reports"):
             st.caption("Requested IDs are matched before the shared object cap. Later quality exclusions appear in each extraction's coverage/excluded tables; matched analysis cohorts may be smaller again.")
@@ -1086,7 +1108,10 @@ def experiment_results(config, metadata, path):
             "Reference cross-validation",
             key="reference-evaluation:" + str(path),
         )
-        selected = st.selectbox(
+        if not metadata.get("targets"):
+            st.info("No completed target results are available in this report.")
+            return
+        selected = safe_choice(
             "Target dataset and correction",
             range(len(metadata["targets"])),
             format_func=lambda i: (
@@ -1096,7 +1121,7 @@ def experiment_results(config, metadata, path):
                     metadata["targets"][i]["condition"], metadata["targets"][i]["condition"]
                 )
             ),
-            key=selector_key("transfer-artifact:" + str(path)),
+            key="transfer-artifact:" + str(path),
             help="Choose a target dataset and correction condition. Known target labels, when supplied, are used only for evaluation; assignment coverage is not an accuracy score.",
         )
         selected_target = metadata["targets"][selected]
@@ -1127,6 +1152,7 @@ def experiment_results(config, metadata, path):
             key="target-evaluation:" + str(path) + ":" + str(selected),
         )
         folder = path.parent / metadata["targets"][selected]["directory"]
+        focus(path, metadata, vectors={selected_target["name"] + " · " + selected_target["condition"]: str(folder / "embeddings.npz")})
         st.code(str(folder))
         history = folder / "training_history.tsv"
         if history.is_file():
@@ -1149,7 +1175,7 @@ def experiment_results(config, metadata, path):
             "training_history.tsv",
         ):
             artifact = folder / name
-            if artifact.is_file() and artifact.stat().st_size <= 200 * 1024**2:
+            if selected_artifact(artifact).ready and artifact.stat().st_size <= 200 * 1024**2:
                 st.download_button(
                     "Download " + name,
                     artifact.read_bytes(),
@@ -1157,6 +1183,8 @@ def experiment_results(config, metadata, path):
                     key="transfer-download:" + str(artifact),
                 )
         for target in metadata["targets"]:
+            if not report_choices([target], path.parent, key="joint_analysis"):
+                continue
             title = (
                 target["name"]
                 + " · "
@@ -1188,7 +1216,6 @@ def experiment_results(config, metadata, path):
                 "Accuracy and balanced accuracy include unknown rejections. Candidate scores evaluate the proposed labels before rejection, helping distinguish classifier changes from changes in rejection coverage."
             )
     else:
-        saved_combination_controls(config, metadata, path)
         if metadata.get("fusion_recipes"):
             with st.expander("Feature combination recipes used"):
                 st.dataframe(pd.DataFrame(metadata["fusion_recipes"]), hide_index=True)
@@ -1241,11 +1268,12 @@ def experiment_results(config, metadata, path):
                 ):
                     experiment_results(config, json.loads(transfer_path.read_text()), transfer_path)
                     return
-        with st.expander("Download actual embedding vectors", expanded=True):
-            i = st.selectbox(
+        if metadata["embeddings"]:
+            st.markdown("**Saved embedding vectors**")
+            i = safe_choice(
                 "Vector artifact",
                 range(len(metadata["embeddings"])),
-                key=selector_key("experiment-vector:" + str(path)),
+                key="experiment-vector:" + str(path),
                 format_func=lambda i: " · ".join(
                     str(v)
                     for k, v in metadata["embeddings"][i].items()
@@ -1253,10 +1281,13 @@ def experiment_results(config, metadata, path):
                 ),
                 help="Choose a dataset and representation to download its full feature vectors with exact object IDs. Combined vectors contain the weighted fine and coarse features, not their PCA or UMAP coordinates.",
             )
-            embedding = path.parent / metadata["embeddings"][i]["path"]
-            st.code(str(embedding))
+            from morphofeatures.artifact_locations import artifact_path
+
+            embedding = artifact_path(path.parent / metadata["embeddings"][i]["path"])
+            focus(path, metadata, vectors={" · ".join(str(metadata["embeddings"][i].get(k, "")) for k in ("dataset", "representation", "backbone", "scale_um")): str(embedding)})
+            st.caption(str(embedding))
             sidecar = embedding.with_suffix(".metadata.json")
-            if sidecar.is_file() and sidecar.stat().st_size <= 200 * 1024**2:
+            if selected_artifact(sidecar).ready and sidecar.stat().st_size <= 200 * 1024**2:
                 st.download_button(
                     "Download vector metadata (keep beside NPZ)",
                     sidecar.read_bytes(),
@@ -1274,7 +1305,7 @@ def experiment_results(config, metadata, path):
                 with zipfile.ZipFile(embedding) as archive:
                     small_table = sum(item.file_size for item in archive.infolist()) <= 32 * 1024**2
                 saved_tsv = embedding.with_suffix(".tsv")
-                if saved_tsv.is_file() and saved_tsv.stat().st_size <= 200 * 1024**2:
+                if selected_artifact(saved_tsv).ready and saved_tsv.stat().st_size <= 200 * 1024**2:
                     st.download_button(
                         "Download worker TSV vectors", saved_tsv.read_bytes(), saved_tsv.name
                     )
@@ -1298,7 +1329,7 @@ def experiment_results(config, metadata, path):
             else:
                 st.caption(f"This NPZ exceeds the 200 MiB browser download limit. Copy it directly from the worker: {embedding}")
     archive = path.parent / "export.zip"
-    if archive.is_file():
+    if selected_artifact(archive).ready:
         if archive.stat().st_size <= 200 * 1024**2:
             st.download_button(
                 "Download complete experiment report",
@@ -1312,11 +1343,11 @@ def experiment_results(config, metadata, path):
                 f"Copy it directly from the worker: {archive}. Individual vector downloads remain available below that limit."
             )
     if choices:
-        chosen = st.selectbox(
+        chosen = safe_choice(
             "Analysis to display",
             range(len(choices)),
             format_func=lambda i: choices[i][0],
-            key=selector_key("experiment-analysis:" + str(path)),
+            key="experiment-analysis:" + str(path),
             help="Select a within-dataset comparison or a joint map across datasets. Each representation has a separately fitted PCA/UMAP space; coordinates from different representations are not directly interchangeable.",
         )
         render_analysis(config, choices[chosen][1])

@@ -941,7 +941,21 @@ def test_projected_reference_restore_without_refitting(tmp_path, monkeypatch, sp
 
 @pytest.mark.parametrize("pca_components", [None, 3])
 def test_experiment_end_to_end(tmp_path, pca_components, monkeypatch):
+    from morphofeatures import dino_experiments
     from morphofeatures.analysis import projection
+
+    compare = dino_experiments.compare
+    partials = []
+
+    def compare_after_publication(*args, **kwargs):
+        partial = json.loads((tmp_path / "experiment" / "experiment.json").read_text())
+        assert partial["execution_state"] == "partial"
+        assert partial["original_embeddings"] and partial["embeddings"]
+        assert all(Path(entry["path"]).is_file() for entry in partial["embeddings"])
+        partials.append(partial)
+        return compare(*args, **kwargs)
+
+    monkeypatch.setattr(dino_experiments, "compare", compare_after_publication)
 
     # The numerical UMAP fit is covered by projection tests; exercise the full
     # extraction/fusion/comparison/shared-map handoffs here with a cheap reducer.
@@ -983,6 +997,7 @@ def test_experiment_end_to_end(tmp_path, pca_components, monkeypatch):
         dataset["annotations"] = str(labels)
     path = run_experiment(options, tmp_path / "experiment", backbones=[Backbone()])
     report = json.loads(path.read_text())
+    assert report["execution_state"] == "completed" and len(partials) == 2
     assert len(report["embeddings"]) == 13
     assert len(report["joint_analyses"]) == 6
     assert len(report["comparisons"]) == 2

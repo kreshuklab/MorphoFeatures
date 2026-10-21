@@ -4,8 +4,14 @@ import re
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 
-PAGES = {"preprocess": "Prepare data", "train": "Train"}
+PAGES = {
+    "preprocess": "Prepare data", "train": "Train", "extract": "Extract",
+    "fuse": "Build features", "context": "Build features", "distill": "Learn",
+    "transfer": "Learn", "export_labels": "Export", "export_mobie": "Export",
+    "export_bilateral": "Export",
+}
 STAGES = {
+    "analysis_variant": "Change saved map / clustering",
     "distill": "Distill embeddings",
     "export_bilateral": "Export bilateral pairs in 3D",
     "bilateral": "Bilateral-partner retrieval",

@@ -225,7 +225,8 @@ def test_distillation_workflow_controls_and_followup_sections(tmp_path, complete
     widget("radio", "Analysis section").set_value("Objects & meshes").run()
     assert not app.exception and not app.error
     assert widget("radio", "Comparison mode").value == "Nearest neighbors"
-    widget("radio", "Result view").set_value("Follow-up analysis").run()
+    widget("radio", "Result view").set_value("Next steps").run()
+    widget("radio", "Follow-up scope").set_value("Whole result").run()
     assert widget("multiselect", "Input representations for follow-up").value
     widget("multiselect", "Follow-up analyses").set_value(["analyze"]).run()
     widget("button", "Create follow-up workflow draft").click().run()

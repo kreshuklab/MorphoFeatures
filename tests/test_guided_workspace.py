@@ -16,6 +16,7 @@ from morphofeatures.workspace_jobs import (
     submit_workspace_plan,
 )
 from morphofeatures.workspace_state import (
+    STARTING_POINTS,
     import_workflow,
     load_draft,
     new_draft,
@@ -291,6 +292,7 @@ def test_bilateral_saved_run_and_export_controls_preserve_yaml(tmp_path):
     _widget(app, "text_input", "Named saved bilateral reports (YAML)").set_value("Previous DINO: /example/bilateral.json").run()
     _button(app, "Add bilateral 3D export").click().run()
     assert not app.exception
+    app.radio(key="step_widget").set_value("Export").run()
     _widget(app, "checkbox", "Create a MoBIE project with 3D pair views").uncheck().run()
     _widget(app, "number_input", "Maximum pairs per representation / variant").set_value(7).run()
     _widget(app, "text_input", "Physical position table for non-MoBIE geometry (optional)").set_value("/example/default.tsv").run()
@@ -372,7 +374,7 @@ def test_fine_coarse_eligibility_controls_check_bounds_and_persist_policies(tmp_
 
 
 @pytest.mark.parametrize(
-    "route", ["raw", "preprocess", "crops", "dino", "checkpoint", "embeddings", "demo", "dino_experiment", "fusion", "transfer", "platybrowser", "ome_zarr", "joint_embeddings"]
+    "route", list(STARTING_POINTS)
 )
 def test_all_starting_points_and_stages_render(tmp_path, route):
     app = _app(tmp_path)
@@ -380,13 +382,19 @@ def test_all_starting_points_and_stages_render(tmp_path, route):
     assert any("What you should have for this workflow" in item.value for item in app.markdown)
     _button(app, "Create workflow").click().run()
     expected = {
-        "raw": ["Start", "Prepare data", "Train", "Analyze", "Review & run"],
+        "raw": ["Start", "Prepare data", "Train", "Extract", "Analyze", "Review & run"],
         "preprocess": ["Start", "Prepare data", "Review & run"],
         "platybrowser": ["Start", "Prepare data", "Review & run"],
         "ome_zarr": ["Start", "Prepare data", "Review & run"],
         "dino_experiment": ["Start", "Prepare data", "Analyze", "Review & run"],
-        "crops": ["Start", "Train", "Analyze", "Review & run"],
-        "demo": ["Start", "Train", "Analyze", "Review & run"],
+        "crops": ["Start", "Train", "Extract", "Analyze", "Review & run"],
+        "demo": ["Start", "Train", "Extract", "Analyze", "Review & run"],
+        "dino": ["Start", "Extract", "Analyze", "Review & run"],
+        "checkpoint": ["Start", "Extract", "Analyze", "Review & run"],
+        "fusion": ["Start", "Build features", "Analyze", "Review & run"],
+        "context": ["Start", "Build features", "Analyze", "Review & run"],
+        "transfer": ["Start", "Learn", "Review & run"],
+        "distill": ["Start", "Learn", "Review & run"],
     }.get(route, ["Start", "Analyze", "Review & run"])
     assert app.radio(key="step_widget").options == expected
     for step in expected[1:]:
@@ -613,7 +621,7 @@ def test_primary_transfer_and_dino_map_controls_persist_without_variants(tmp_pat
     _widget(app, "selectbox", "Starting point").set_value(route).run()
     _button(app, "Create workflow").click().run()
     if route == "dino_experiment":
-        app.radio(key="step_widget").set_value("Analyze").run()
+        app.radio(key="step_widget").set_value("Analyze" if route == "dino_experiment" else "Learn").run()
     panel = next(w for w in app.expander if w.label == "Clustering, PCA and UMAP")
     assert panel.proto.expanded
     cluster_label = "Embedding clusters" if route == "dino_experiment" else "Number of clusters"
@@ -645,7 +653,7 @@ def test_primary_transfer_and_dino_map_controls_persist_without_variants(tmp_pat
     assert _widget(app, "number_input", "UMAP / Leiden neighbors").value == 25
     assert not any(w.label == cluster_label for w in app.number_input)
     app.radio(key="step_widget").set_value("Review & run").run()
-    app.radio(key="step_widget").set_value("Analyze").run()
+    app.radio(key="step_widget").set_value("Analyze" if route == "dino_experiment" else "Learn").run()
     assert _widget(app, "number_input", "Leiden resolution").value == 0.02
     _widget(app, "selectbox", "Clustering method").set_value("kmeans").run()
     _widget(app, "checkbox", umap_label).check().run()
@@ -693,11 +701,12 @@ def test_results_can_select_rename_and_submit_parameter_combinations(tmp_path, m
     _widget(app, "text_input", "Result display name").set_value("My PCA map").run()
     _button(app, "Save result name").click().run()
     assert json.loads(Path(child).read_text())["display_name"] == "My PCA map"
-    _widget(app, "radio", "Result view").set_value("Follow-up analysis").run()
+    _widget(app, "radio", "Result view").set_value("Next steps").run()
+    _widget(app, "checkbox", "Advanced: existing app-host variant computation").check().run()
     _widget(app, "number_input", "PCA components before clustering (0 = off)").set_value(3).run()
     _button(app, "Compute and save combinations").click().run()
     assert len(captured) == 1
-    assert captured[0][0] == path
+    assert captured[0][0] == Path(child)
     assert captured[0][1][0]["cluster_pca_components"] == 3
     assert not app.exception
 

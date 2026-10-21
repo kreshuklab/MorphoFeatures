@@ -69,3 +69,30 @@ def metric_series(events: Iterable[Mapping[str, Any]]) -> List[Dict[str, Any]]:
         for event in events
         if any(key in event for key in ("train_loss", "validation_loss", "learning_rate"))
     ]
+
+
+# Deliberately opt in to scientific progress columns. New runtime telemetry must
+# not turn the main event table into a very wide resource-monitoring dashboard.
+PROGRESS_COLUMNS = (
+    "timestamp", "event", "stage", "action", "state", "epoch", "step", "phase",
+    "batch", "total_batches", "progress_fraction", "objects", "completed_objects",
+    "total_objects", "processed", "total", "label_id", "train_loss",
+    "validation_loss", "running_loss", "loss", "learning_rate",
+    "train_visible_mean_baseline_loss", "validation_visible_mean_baseline_loss",
+    "validation_improvement_over_visible_mean", "seconds", "eta_seconds", "message", "error",
+)
+
+
+def resource_event(event: Mapping[str, Any]) -> bool:
+    """Resource planning/adjustment belongs in diagnostics, not scientific progress."""
+    name = str(event.get("event", "")).lower()
+    return any(word in name for word in ("memory", "resource", "modulation", "performance", "runtime", "telemetry"))
+
+
+def progress_events(events: Iterable[Mapping[str, Any]], limit: int = 100) -> list[dict[str, Any]]:
+    """A bounded, readable table; the original append-only records stay intact."""
+    rows = [
+        {key: event[key] for key in PROGRESS_COLUMNS if key in event}
+        for event in events if not resource_event(event)
+    ]
+    return rows[-limit:]

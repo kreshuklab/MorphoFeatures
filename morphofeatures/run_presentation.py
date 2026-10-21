@@ -42,6 +42,7 @@ def stage_description(stage):
         }[action]
         return prefix + projection + " & clustering"
     return {
+        "analysis_variant": "Saved map / clustering variant",
         "distill": "Neural adapter / PCA distillation",
         "export_bilateral": "Bilateral 3D export",
         "bilateral": "Bilateral-partner retrieval",

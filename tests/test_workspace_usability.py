@@ -22,7 +22,7 @@ def make_run(root, name, stages):
     config = folder / "job.yaml"
     config.write_text(yaml.safe_dump({"stages": stages}))
     result = folder / "result.json"
-    result.write_text(json.dumps({"schema": "fixture", "run": name}))
+    result.write_text(json.dumps({"schema": "morphofeatures.analysis.v1", "run": name}))
     record = JobRecord(
         run_id=name,
         workflow="workspace_run",
@@ -158,7 +158,7 @@ def test_runs_table_selects_without_dropdown_and_back_restores_run_and_result(tm
     assert not app.exception
     widget(app, "button", "Back").click().run()
     assert app.session_state["runs:selected"] == a.id
-    widget(app, "button", "Open this output in Results").click().run()
+    widget(app, "button", "Open results · Embedding analysis").click().run()
     assert app.radio(key="workspace_navigation").value == "Results"
     manual = "Saved analysis.json, comparison.json, joint_analysis.json, or embedding file"
     assert widget(app, "text_input", manual).value == a.artifacts[0]
@@ -196,8 +196,11 @@ def test_completed_dino_report_opens_without_selecting_past_job_yaml(tmp_path, m
     }))
     # Sparse fixture: ensure browsing never loads an archive above the safeguard.
     archive = folder / "export.zip"
+    import zipfile
     with archive.open("wb") as handle:
-        handle.truncate(201 * 1024**2)
+        handle.seek(201 * 1024**2)
+        with zipfile.ZipFile(handle, "w") as bundle:
+            bundle.writestr("report.txt", "Valid indexed archive following sparse padding")
     read_bytes = Path.read_bytes
 
     def bounded_read(path):
@@ -219,7 +222,8 @@ def test_completed_dino_report_opens_without_selecting_past_job_yaml(tmp_path, m
     widget(app, "button", "Open results · DINO fine/coarse experiment").click().run()
     assert not app.exception and not app.error
     assert app.radio(key="workspace_navigation").value == "Results"
-    assert widget(app, "selectbox", "Vector artifact").value == 0
+    assert not any(w.label == "Vector artifact" for w in app.selectbox)
+    assert any("Vector artifact:" in c.value for c in app.caption)
     labels = {item.label for item in app.get("download_button")}
     assert "Download NPZ vectors and exact object IDs" in labels
     assert "Download vector metadata (keep beside NPZ)" in labels
@@ -320,7 +324,7 @@ def test_cross_source_fusion_declaration_is_editable_and_preserved(tmp_path):
     app = app_at(tmp_path)
     widget(app, "selectbox", "Starting point").set_value("fusion").run()
     widget(app, "button", "Create workflow").click().run()
-    app.radio(key="step_widget").set_value("Analyze").run()
+    app.radio(key="step_widget").set_value("Build features").run()
     widget(app, "checkbox", "I verified matching objects across different source files").check().run()
     widget(app, "text_input", "Shared specimen / dataset name").set_value("Specimen A").run()
     widget(app, "selectbox", "Common embedding ID namespace").set_value("cell").run()
@@ -559,9 +563,9 @@ def test_imported_dino_paths_and_landing_page_with_workspace_defaults(tmp_path, 
     widget(app, "button", "Preview settings to load").click().run()
     widget(app, "button", "Load settings into draft").click().run()
     assert app.radio(key="step_widget").value == (
-        "Prepare data" if route == "dino_experiment" else "Analyze"
+        "Prepare data" if route == "dino_experiment" else "Extract"
     )
-    app.radio(key="step_widget").set_value("Analyze").run()
+    app.radio(key="step_widget").set_value("Analyze" if route == "dino_experiment" else "Extract").run()
     label = "Local DINO weights" if route == "dino_experiment" else "Pretrained DINO weights"
     assert widget(app, "text_input", label).value == "/explicit/model.pth"
     widget(app, "button", "Use saved DINO locations for this backbone").click().run()

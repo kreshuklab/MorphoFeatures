@@ -17,7 +17,6 @@ from morphofeatures.analysis.visualization import (
     projection_panels,
     selected_object_ids,
 )
-from morphofeatures.workspace_navigation import selector_key
 
 
 def evaluation_results(metrics, title, *, key):
@@ -110,6 +109,11 @@ def classification_results(metadata, path):
         else next(iter(entries))
     )
     evaluation = entries[name]
+    from morphofeatures.result_browser_ui import focus
+    from morphofeatures.result_catalog import vector_artifacts
+
+    vectors = vector_artifacts(metadata, path)
+    focus(path, metadata, vectors={name: vectors[name]} if name in vectors else vectors)
     settings = evaluation.get("settings", metadata.get("classification_settings", metadata.get("settings", {})))
     space = classifier_space(settings)
     dimensions = settings.get("classifier_dimensions") or settings.get("evaluation_pca") or 2
@@ -180,8 +184,12 @@ def mobie_export_start(config, metadata, path):
 
 def mobie_export_results(metadata, path):
     from morphofeatures.analysis.mobie_export import _inside
+    from morphofeatures.artifact_availability import probe
 
     project = _inside(path.parent, metadata["project"])
+    if not probe(project / "project.json").ready:
+        st.info("The MoBIE project manifest is unavailable or invalid. Restore the project or open its new location; the export report alone is not a viewable project.")
+        return
     st.success("MoBIE project exported")
     st.code(str(project), language=None)
     st.caption(
@@ -234,7 +242,10 @@ def mobie_export_results(metadata, path):
 
 def projection_results(frame, metadata, path):
     prefix = "projection:" + str(path)
-    methods = (["umap"] if "umap_1" in frame else []) + (["pca"] if "pca_1" in frame else [])
+    methods = [method for method in ("umap", "pca") if {method + "_1", method + "_2"} <= set(frame.columns)]
+    if not methods or frame.empty:
+        st.info("No usable saved projection coordinates are available.")
+        return
     method = st.selectbox("Projection", methods, key=prefix + ":method")
     opacity = st.slider(
         "Unlabeled point opacity",
@@ -344,8 +355,17 @@ def projection_results(frame, metadata, path):
 
 def joint_projection_results(config, metadata, path):
     """Show pooled plots, then route selections to the correct spatial dataset."""
+    from morphofeatures.artifact_availability import availability_details, probe, selected_artifact
+    from morphofeatures.artifact_locations import artifact_path
+    from morphofeatures.result_browser_ui import safe_choice
+
+    coordinate_path = artifact_path(path.parent / metadata.get("coordinates", "coordinates.tsv"))
+    if not selected_artifact(coordinate_path).ready:
+        availability_details({"Joint coordinates": coordinate_path}, key="joint:" + str(path))
+        st.info("The shared map is unavailable. Use Next steps with the available dataset vectors, or restore the saved coordinates.")
+        return
     frame = pd.read_csv(
-        path.parent / metadata["coordinates"],
+        coordinate_path,
         sep="\t",
         dtype={"label_id": np.int64, "source_label_id": np.int64},
         converters={"dataset": str},
@@ -366,7 +386,7 @@ def joint_projection_results(config, metadata, path):
         "joint-coordinates.tsv",
     )
     archive = path.parent / "export.zip"
-    if archive.is_file():
+    if selected_artifact(archive).ready:
         if archive.stat().st_size <= 200 * 1024**2:
             with archive.open("rb") as stream:
                 st.download_button(
@@ -380,26 +400,31 @@ def joint_projection_results(config, metadata, path):
     st.caption(
         "Choose the dataset whose raw image and segmentation you want to inspect. Object IDs below are the original IDs for that dataset; coordinates and clusters remain those of the shared fit. Nearest-neighbor inspection here searches within the selected dataset."
     )
-    name = st.selectbox(
+    datasets = [name for name, entry in metadata.get("datasets", {}).items() if entry.get("report") and probe(path.parent / entry["report"]).ready]
+    if not datasets:
+        st.caption("No per-dataset reports are available for inspection. The shared coordinates above remain viewable.")
+        return
+    name = safe_choice(
         "Dataset to inspect / export",
-        [dataset["name"] for dataset in metadata["settings"]["datasets"]],
-        key=selector_key("joint-dataset:" + str(path)),
+        datasets,
+        key="joint-dataset:" + str(path),
     )
     entry = metadata["datasets"][name]
     child = path.parent / entry["report"]
     native_metadata = json.loads(child.read_text())
     native_frame = pd.read_csv(
         child.parent / "coordinates.tsv", sep="\t", dtype={"label_id": np.int64}
-    )
+    ) if selected_artifact(child.parent / "coordinates.tsv").ready else pd.DataFrame({"label_id": []})
     st.caption(
         f"{entry['projected_objects']} of {entry['objects']} objects projected. Per-dataset report: {child}"
     )
-    st.download_button(
-        "Download this dataset's shared coordinates",
-        native_frame.to_csv(sep="\t", index=False),
-        "dataset-coordinates.tsv",
-        key="joint-native:" + str(path),
-    )
+    if not native_frame.empty:
+        st.download_button(
+            "Download this dataset's shared coordinates",
+            native_frame.to_csv(sep="\t", index=False),
+            "dataset-coordinates.tsv",
+            key="joint-native:" + str(path),
+        )
     mapping = frame[frame.dataset == name].set_index("label_id").source_label_id.to_dict()
     for source_key, target_key in (
         ("comparison:" + str(path) + ":Embedding", "comparison:" + str(child) + ":Embedding"),
@@ -422,16 +447,25 @@ def joint_projection_results(config, metadata, path):
 
 
 def inspect_results(config, embeddings, metadata, frame, path):
+    from morphofeatures.artifact_availability import availability_details, available_vectors
     from morphofeatures.configuration_editor import load_document
     from morphofeatures.data.io import load_embeddings
     from morphofeatures.representation_analysis import nearest_neighbors
+    from morphofeatures.result_browser_ui import focus, safe_choice
     from morphofeatures.workflow_ui import continue_from_artifact
 
+    availability_details(embeddings, key="inspect:" + str(path))
+    embeddings = available_vectors(embeddings)
+    if not embeddings:
+        st.info("Object inspection needs a validated embedding with exact IDs.")
+        return
+
     prefix = "inspection:" + str(path)
-    name = st.selectbox(
-        "Embedding to use in a new workflow", list(embeddings), key=prefix + ":representation"
+    name = safe_choice(
+        "Representation to inspect", list(embeddings), key=prefix + ":representation"
     )
     embedding = embeddings[name]
+    focus(path, metadata, vectors={name: embedding})
     table = load_embeddings(embedding)
     allowed = set(table.label_ids)
     if st.button("Analyze these embeddings in a new workflow"):

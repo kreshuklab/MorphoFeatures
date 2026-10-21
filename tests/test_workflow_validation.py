@@ -84,7 +84,7 @@ def test_umap_pca_error_is_located_before_reading_analysis_inputs(tmp_path, acti
     document = {"stages": [{"action": action, "umap_pca_components": -2}]}
     issues = check_workflow(document, tmp_path)
     assert len(issues) == 1
-    assert issues[0].page == "Analyze"
+    assert issues[0].page == ("Learn" if action == "transfer" else "Analyze")
     assert issues[0].fields == (("stages", 0, "umap_pca_components"),)
     assert "positive whole number" in issues[0].message
 
@@ -193,7 +193,7 @@ def test_continue_checks_current_page_and_corrected_errors_disappear(tmp_path):
     _widget(app, "selectbox", "Starting point").set_value("demo").run()
     _widget(app, "button", "Create workflow").click().run()
     _widget(app, "number_input", "Training epochs").set_value(0).run()
-    _widget(app, "button", "Continue to Analyze").click().run()
+    _widget(app, "button", "Continue to Extract").click().run()
     assert app.radio(key="step_widget").value == "Train"
     assert not app.exception
     assert any("Train → Stage 1" in e.value and "Training epochs" in e.value for e in app.error)
@@ -201,8 +201,8 @@ def test_continue_checks_current_page_and_corrected_errors_disappear(tmp_path):
     assert any(e.value.startswith("Training epochs:") for e in app.error)
     _widget(app, "number_input", "Training epochs").set_value(2).run()
     assert not app.error
-    _widget(app, "button", "Continue to Analyze").click().run()
-    assert app.radio(key="step_widget").value == "Analyze"
+    _widget(app, "button", "Continue to Extract").click().run()
+    assert app.radio(key="step_widget").value == "Extract"
     assert not app.exception
     assert not (tmp_path / "experiments").exists()
 

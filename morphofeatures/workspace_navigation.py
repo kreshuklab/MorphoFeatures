@@ -37,15 +37,16 @@ def begin_screen(state):
 def screen(state):
     page = state.get("workspace_navigation", "Workflow")
     keys = {
-        "Workflow": ("workflow_step",),
+        "Workflow": ("workflow_step", "workflow_active_id"),
         "Runs": ("runs:selected", "runs:selected_ids", "runs:filter", "runs:states"),
-        "Results": ("results:registered", "value:results:path"),
+        "Results": ("results:registered", "results:experiment", "results:source", "value:results:path"),
         "Tools": ("tools:selection",),
         "Help": ("help:selection",),
     }.get(page, ())
     values = {key: deepcopy(state[key]) for key in keys if key in state}
     if page == "Workflow":
         values["workflow_step"] = state.get("workflow_step", "Start")
+        values.update({key: deepcopy(value) for key, value in state.items() if str(key).startswith("workflow-stage:")})
     if page == "Results":
         values.update(
             {
@@ -88,6 +89,12 @@ def go_back(state):
         state["widget:results:path"] = target["values"]["value:results:path"]
     if "workflow_step" in target["values"]:
         state["step_widget"] = target["values"]["workflow_step"]
+    if target["values"].get("workflow_active_id"):
+        from morphofeatures.workflow_catalog import restore_draft
+
+        restore_draft(state, state.get("workspace_root", ""), target["values"]["workflow_active_id"])
+        draft = state.get("workflow:" + str(state.get("workspace_root", "")), {})
+        state["editor_epoch"] = draft.get("editor_epoch", 0)
     state["workspace_navigation"] = target["page"]
     state["navigation:current"] = deepcopy(target)
     # Rebuild the run table's selection state so Back cannot reuse a stale row event.

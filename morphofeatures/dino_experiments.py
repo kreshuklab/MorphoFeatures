@@ -338,6 +338,8 @@ def run_experiment(settings, destination, *, writer=None, backbones=None):
         "joint_analyses": [],
         "transfers": [],
         "embeddings": [],
+        "original_embeddings": [],
+        "execution_state": "partial",
         "cohorts": [],
         "object_eligibility": eligibility,
         "object_selections": [
@@ -348,6 +350,10 @@ def run_experiment(settings, destination, *, writer=None, backbones=None):
         ],
         "interpretation": "Every representation uses the same matched cohort and evaluation folds within each dataset. Each representation has its own fitted PCA/UMAP. Fusion concatenates full feature vectors before projection.",
     }
+    def publish():
+        write_json_atomic(destination / "experiment.json", report)
+
+    publish()
     from morphofeatures.dino_memory import announce_plan, plan_memory
 
     report["memory_plans"] = []
@@ -421,6 +427,12 @@ def run_experiment(settings, destination, *, writer=None, backbones=None):
                 else:
                     outputs.update(coarse_outputs[index])
                 representations = {name: outputs[key] for name, key in names.items()}
+                report["original_embeddings"].extend(
+                    {"dataset": dataset["name"], "backbone": family, "scale_um": scale,
+                     "representation": name, "path": str(path), "original_path": str(path)}
+                    for name, path in representations.items()
+                )
+                publish()
                 for j, pairing in enumerate(pairings):
                     representations[pairing["name"]] = fuse_embeddings(
                         {
@@ -432,6 +444,12 @@ def run_experiment(settings, destination, *, writer=None, backbones=None):
                         },
                         root / f"fusion-{j}",
                     )
+                    report["original_embeddings"].append(
+                        {"dataset": dataset["name"], "backbone": family, "scale_um": scale,
+                         "representation": pairing["name"], "path": str(representations[pairing["name"]]),
+                         "original_path": str(representations[pairing["name"]])}
+                    )
+                    publish()
                 for baseline_index, baseline in enumerate(dataset.get("baselines", [])):
                     if baseline["name"] in representations:
                         raise ValueError(
@@ -536,6 +554,7 @@ def run_experiment(settings, destination, *, writer=None, backbones=None):
                     "original_path": str(path),
                 }
             )
+            publish()
         cohort_root = destination / f"dataset-{index}"
         pd.DataFrame({"label_id": ids}).to_csv(
             cohort_root / "matched_ids.tsv", sep="\t", index=False
@@ -622,6 +641,7 @@ def run_experiment(settings, destination, *, writer=None, backbones=None):
                     "path": str(Path(path).relative_to(destination)),
                 }
             )
+            publish()
             for name, entry in json.loads(Path(path).read_text())["representations"].items():
                 for row in entry.get("evaluation", []):
                     metrics.append(
@@ -668,6 +688,7 @@ def run_experiment(settings, destination, *, writer=None, backbones=None):
                             "path": str(Path(path).relative_to(destination)),
                         }
                     )
+                    publish()
                 transfer = settings.get("transfer", {})
                 if transfer.get("enabled"):
                     reference = next(
@@ -699,6 +720,7 @@ def run_experiment(settings, destination, *, writer=None, backbones=None):
                             "path": str(Path(path).relative_to(destination)),
                         }
                     )
+                    publish()
         write_json_atomic(destination / "experiment.json", report)
     metric_frame = pd.DataFrame(metrics)
     metric_frame.to_csv(destination / "metrics.tsv", sep="\t", index=False)
@@ -723,5 +745,7 @@ def run_experiment(settings, destination, *, writer=None, backbones=None):
             )
             summary.columns = ["_".join(str(v) for v in c if v) for c in summary.columns]
             summary.to_csv(destination / "metrics_summary.tsv", sep="\t", index=False)
+    report["execution_state"] = "completed"
+    publish()
     package_results(destination)
     return destination / "experiment.json"

@@ -1,14 +1,82 @@
-# Bring your own instance segmentation
+# Choose a workflow and continue an experiment
 
 The maintained workspace now connects configuration editing, MAE training,
 embedding extraction, analysis, representation comparisons, preprocessing,
 and mesh inspection. Scientific processing lives in shared Python modules;
 the UI submits the same pipeline that the CLI and SLURM execute.
 
+## Start with your question, then your inputs
+
+In **Workflow → Start**, choose a goal first. It narrows the scientific decisions
+before you choose an image source or model. Then choose what you already have:
+
+| Goal | Typical input | Next decision |
+| --- | --- | --- |
+| Create representations | Images and segmentation, prepared crops, or a checkpoint | Prepare only, frozen DINO, train MAE, reuse MAE, or a physical fine/coarse experiment. |
+| Create representations | Saved vectors | Combine feature blocks of the same objects, or construct physical neighborhood context. |
+| Explore and evaluate | Saved vectors | Analyze a representation, compare methods on matched objects, fit a shared map across independent datasets, or test bilateral retrieval. |
+| Learn from labels | Saved vectors and annotations | Learn compact cell-type representations, or transfer labels from a reference to targets. |
+| Any goal | Existing results | Open **Results**, select the relevant dataset/representation, then use **Next steps**. |
+
+The plan preview shows its prerequisites and outputs before you create a draft.
+Existing configurations and all original starting-point presets remain available
+under **Direct presets, demonstration and specialist workflows**. Published shape
+and texture models retain their dedicated tools. Sources such as PlatyBrowser and
+OME-Zarr are choices within image preparation, rather than competing scientific
+goals. Frozen DINO extraction and physical fine/coarse comparisons remain distinct:
+the latter need calibrated source volumes and match methods on an explicit cohort.
+
+Only relevant stage pages appear: **Prepare data**, **Train**, **Extract**,
+**Build features**, **Learn**, **Analyze**, **Export**, then **Review & run**.
+Several operations on one page use a stage selector. Advanced settings stay beside
+the decision they affect; full pipeline YAML remains editable. You may enter at
+extraction, analysis or learning without preparing or training again. Linked stages
+reuse earlier outputs; **Check this page** explains missing inputs before review.
+
+Drafts remain available in the current session when you start another workflow or
+create a follow-up. **Back** restores the selected draft and result context.
+Use **Save draft** to retain a draft across browser sessions. Opening a result,
+changing stages, creating a draft and reviewing a plan never launch a worker.
+Submission remains an explicit action after **Review run**, for local or SLURM
+execution. A dry-run bundle uses the same resolved configuration.
+
+## Browse usable results, including partial experiments
+
+Results groups declared outputs by experiment and uses saved display names for
+datasets and representations. Search the catalog, open a report or vector file
+directly, or browse published references. Historical published coordinates and
+clusters are displayed as saved; opening them never fits a new map.
+
+Only usable views and downloads are offered. Vectors must have nonempty finite
+features and exact, unique object IDs; saved coordinate tables are maps, not
+substitutes for the original features. Small selected inputs are checked directly.
+Large inputs initially appear as unchecked: use **Artifact availability → Check**
+to validate them in the background. Listing experiments reads metadata, without
+loading feature arrays or recursively scanning output directories.
+
+Completed stages remain available when later stages fail. Physical DINO experiments
+publish partial reports as vectors and analyses become available; unmatched
+original populations and matched comparison populations remain labelled separately.
+Old runs can expose only the outputs recorded in their registry/status/report files;
+open a known unregistered result directly if necessary.
+
+Missing or invalid artifacts appear under availability details, without broken
+viewing buttons. For moved files, open the new report location or use **Locate a
+moved artifact**. Confirm that it is the same saved artifact. The workspace stores
+an explicit relocation record separately from the original report; it does not
+infer identity or rewrite scientific provenance. Extraction/analysis compatibility
+is still checked before execution. **Files & provenance** retains settings, lineage
+and technical paths.
+
+In **Runs → Metrics → Structured event timeline**, the table shows stages, progress,
+losses and errors. Resource usage, memory planning and modulation fields are omitted
+from this table. **Resource and runtime diagnostics** retains adjustment events,
+and the complete original JSONL remains available on disk.
+
 ## Distill embeddings using known cell types
 
 Choose **Workflow → Distill embeddings with cell types (adapter / PCA)**, or open
-saved results and choose **Follow-up analysis → Distill embeddings**. Start with
+saved results and choose **Next steps → Distill embeddings**. Start with
 one specimen's saved MAE, DINO or MorphoFeatures vectors and a TSV/CSV containing
 `label_id` and a cell-type column. The annotation IDs must be in the same namespace
 as the embeddings: cell IDs and nucleus IDs are not interchangeable. Unlabeled
@@ -112,16 +180,16 @@ Preserve the input feature order and recipe. Independently fitted PCA/adapter
 models do not define a shared space: common-space checks distinguish their fitted
 parameter fingerprints.
 
-## Follow-up analysis and Results navigation
+## Next steps from a result
 
-Results now separates **Explore results**, **Follow-up analysis** and **Files &
+Results separates **Explore results**, **Next steps** and **Files &
 provenance**. Ordinary analyses further separate Projection, Classification,
 Bilateral probe, Objects & meshes and Exports. Choose which representations to
 display rather than rendering every map at once; point selections are retained
 for object inspection. Existing classifiers, meshes, downloads, MoBIE export,
 renaming and analysis-variant settings remain available in these sections.
 
-**Follow-up analysis** accepts multiple saved representations and multiple tasks:
+**Next steps** accepts multiple saved representations and multiple tasks:
 analysis/classification, distillation, bilateral retrieval, spatial context,
 feature fusion, shared maps and label transfer. **Create follow-up workflow draft**
 copies the selected artifact paths and parent-report provenance into an editable
@@ -130,11 +198,36 @@ Review the specimen identities, annotations, additional graph/candidate inputs
 and resource settings before submission. Fusion compares blocks of the same
 objects; joint maps and transfer use independent datasets with compatible recipes.
 
-Existing in-place clustering/UMAP variants are still under Follow-up analysis
-(and the follow-up expander on nested experiment maps). They retain their existing
-background computation and provenance behavior. Runs has one main result-opening
-button for the selected completed report. Other files and workflow continuation
-actions are grouped in **Other saved outputs and workflow inputs**.
+The selected map or inspected representation supplies the default inputs. For
+compound results, **Follow-up scope → Whole result** exposes the other saved
+representations. Distillation defaults to held-out vectors, excluding training
+objects; its full vectors remain explicitly available. Applicable projection and
+classifier settings are copied along with parent provenance. Review any additional
+annotations, partner candidates, spatial graph or compatible target data requested
+by the selected task.
+
+**Change map or clustering → Create map / clustering draft** is distinct from a
+fresh analysis: it retains the saved plotted cohort, classifier scores and
+predictions, and recomputes only the requested maps/clusters. The resulting
+`analysis_variant` stages use the existing scientific engine in a new run directory.
+They can run locally or on SLURM after review. The advanced app-host computation
+interface remains available through an explicit checkbox and Compute button.
+Runs offers one main result-opening button for the selected report, including
+usable outputs from partial runs. Other files and continuations are grouped in
+**Other saved outputs and workflow inputs**.
+
+For example, a reviewed map variant uses the following additive stage contract
+(the path is an example; supply a real saved report with its vectors and coordinates):
+
+```yaml
+stages:
+  - action: analysis_variant
+    analysis: /example/experiment/analysis.json
+    variant:
+      name: K12 PCA map
+      clusters: 12
+      umap: false
+```
 
 Install the optional runtime in your chosen environment, then launch:
 
@@ -282,7 +375,8 @@ accounts, quotas and maximum resources at submission.
 In **Workflow**, choose your starting point: raw aligned volumes, **Just Run
 Preprocessing**, prepared crops or grouped N5 patches, **DINO features from
 prepared objects**, an existing checkpoint, saved embeddings, or an explicit
-synthetic demonstration. Preparation, training, extraction and analysis share
+synthetic demonstration through the direct presets. The guided goal/input choices
+build these same scientific stages. Preparation, training, extraction and analysis share
 one draft. The stage navigator shows what will run; moving between its steps
 never starts processing. Existing artifacts let you enter at later stages.
 Only steps included in the draft appear in the navigator. The preparation page
@@ -534,7 +628,7 @@ The SQLite registry and existing SLURM renderer/scheduler are reused.
 
 ## Extract, analyze, reopen, export
 
-In **Workflow → Analyze → Extract embeddings**, load the model configuration,
+In **Workflow → Extract**, load the model configuration,
 identify the target crops or N5 objects, and set the checkpoint. A linked training
 stage supplies its checkpoint and data automatically.
 For MAE, the architecture must match the checkpoint. Extraction preserves the
@@ -1026,7 +1120,7 @@ submitted through **Review & run**.
    Applying the choices creates an analysis stage for each embedding method and
    optionally a joint comparison. With no models selected, only preprocessing runs.
 5. Configure training under **Train**, and checkpoints/DINO views under
-   **Analyze → Extract embeddings**. Existing MAE checkpoints must match the crop
+   **Extract**. Existing MAE checkpoints must match the crop
    architecture, crop shape and token size. Grouped N5 patch checkpoints require
    their original input layout; the Workflow does not convert them into crop models.
    DINOv2/v3 use the existing local pretrained-weight and backbone-repository fields.

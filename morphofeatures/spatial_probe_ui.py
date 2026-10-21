@@ -511,26 +511,31 @@ def published_fields(draft, index):
 
 
 def _download(path, label):
-    if path.is_file() and path.stat().st_size <= 200 * 1024**2:
-        st.download_button(label, path.read_bytes(), path.name, key="spatial-download:" + str(path))
-    elif path.is_file():
-        st.caption(f"Large artifact: download from the worker at {path}")
+    from morphofeatures.followup_ui import download_file
+
+    download_file(path, label)
 
 
 def probe_results(config, metadata, path):
     from morphofeatures.analysis_ui import inspect_results
+    from morphofeatures.artifact_availability import availability_details, probe, selected_artifact
+    from morphofeatures.artifact_locations import artifact_path
+    from morphofeatures.result_browser_ui import safe_choice
 
     path = Path(path)
     root = path.parent
-    st.info(metadata["interpretation"])
+    st.info(metadata.get("interpretation", "Saved spatial analysis."))
     for warning in metadata.get("warnings", []):
         st.warning(warning)
     if metadata["schema"] == "morphofeatures.context.v1":
         st.write(
             f"{metadata['matched_objects']:,} context vectors · {metadata['input_dimensions']} input dimensions → {metadata['full_dimensions']} concatenated → {metadata['dimensions']} saved dimensions"
         )
-        coverage = pd.read_csv(root / "coverage.tsv", sep="\t", keep_default_na=False)
-        st.dataframe(coverage, hide_index=True)
+        coverage_path = artifact_path(root / "coverage.tsv")
+        if probe(coverage_path).ready:
+            coverage = pd.read_csv(coverage_path, sep="\t", keep_default_na=False)
+            st.dataframe(coverage, hide_index=True)
+        availability_details({"Neighborhood coverage": coverage_path}, key="context-coverage:" + str(path))
         for name in (
             "embeddings.npz",
             "full_context.npz",
@@ -580,41 +585,53 @@ def probe_results(config, metadata, path):
             draft["name"] = "Export bilateral pairs in 3D"
             use_draft(config, draft, "Analyze")
             navigate("Workflow")
-        st.dataframe(pd.read_csv(root / "summary.tsv", sep="\t"), hide_index=True)
-        st.image(str(root / "bilateral.png"))
+        summary = artifact_path(root / "summary.tsv")
+        picture = artifact_path(root / "bilateral.png")
+        if probe(summary).ready:
+            st.dataframe(pd.read_csv(summary, sep="\t"), hide_index=True)
+        if probe(picture).ready:
+            st.image(str(picture))
         for name in ("summary.tsv", "bilateral.svg", "bilateral.png"):
             _download(root / name, "Download " + name)
-        name = st.selectbox(
-            "Retrieval representation", list(metadata["representations"]), key=str(path) + ":rep"
+        representations = {name: [variant for variant in entry.get("variants", [])
+                                  if probe(root / entry["directory"] / variant.get("ranks", "")).ready]
+                           for name, entry in metadata.get("representations", {}).items()}
+        representations = {name: variants for name, variants in representations.items() if variants}
+        if not representations:
+            st.info("No saved retrieval ranks are available. Next steps can reuse the remaining vectors.")
+            return
+        name = safe_choice(
+            "Retrieval representation", list(representations), key=str(path) + ":rep"
         )
         representation = metadata["representations"][name]
-        variant_index = st.selectbox(
+        variant_index = safe_choice(
             "Retrieval settings variant",
-            range(len(representation["variants"])),
-            format_func=lambda i: representation["variants"][i]["settings"]["name"],
+            range(len(representations[name])),
+            format_func=lambda i: representations[name][i]["settings"]["name"],
             key=str(path) + ":variant",
         )
-        variant = representation["variants"][variant_index]
-        ranks_path = root / representation["directory"] / variant["ranks"]
+        variant = representations[name][variant_index]
+        ranks_path = artifact_path(root / representation["directory"] / variant["ranks"])
         from morphofeatures.analysis.bilateral_comparison import read_ranks
 
         ranks = read_ranks(ranks_path)
         st.dataframe(ranks, hide_index=True)
         _download(ranks_path, "Download per-cell retrieval ranks")
         valid = ranks.dropna(subset=["best_partner_id"])
-        if len(valid):
+        bridge_path = artifact_path(root / representation["directory"] / "id_mapping.tsv")
+        if len(valid) and probe(bridge_path).ready:
             selected = st.selectbox(
                 "Cell / candidate pair to inspect", valid.label_id.tolist(), key=str(path) + ":pair"
             )
             row = valid.set_index("label_id").loc[selected]
             bridge = pd.read_csv(
-                root / representation["directory"] / "id_mapping.tsv", sep="\t", dtype="int64"
+                bridge_path, sep="\t", dtype="int64"
             ).set_index("label_id")
             native_ids = [
                 int(bridge.loc[i, "native_id"]) for i in (selected, int(row.best_partner_id))
             ]
-            source = Path(representation["source"]["path"])
-            if source.is_file():
+            source = artifact_path(representation["source"]["path"])
+            if selected_artifact(source).ready:
                 if st.button(
                     "Inspect this cell and its best candidate", key=str(path) + ":inspect"
                 ):

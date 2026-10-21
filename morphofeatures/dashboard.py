@@ -1070,7 +1070,10 @@ def _experiments(config) -> None:
         try:
             events = read_metric_events(Path(selected.metrics_path))
             if events:
-                latest_event = events[-1]
+                from morphofeatures.metrics import progress_events as scientific_progress
+
+                scientific = scientific_progress(events)
+                latest_event = scientific[-1] if scientific else {"event": "Waiting for scientific progress", "timestamp": events[-1].get("timestamp")}
                 st.caption(
                     "Latest structured event: {} at {}".format(
                         latest_event.get("event", "unknown"),
@@ -1096,7 +1099,14 @@ def _experiments(config) -> None:
                         )
                     )
                 with st.expander("Structured event timeline (latest 100)"):
-                    _show_dataframe(pd.DataFrame(events[-100:]))
+                    from morphofeatures.metrics import progress_events as scientific_progress
+
+                    rows = scientific_progress(events)
+                    if rows:
+                        _show_dataframe(pd.DataFrame(rows).dropna(axis=1, how="all"))
+                    else:
+                        st.info("No scientific progress events yet.")
+                    st.caption("Stages, progress and scientific metrics. Resource planning and adjustments are in Resource and runtime diagnostics below.")
             series = metric_series(events)
             if series:
                 frame = pd.DataFrame(series)
@@ -1118,11 +1128,22 @@ def _experiments(config) -> None:
                         f"Latest validation improvement over the visible-mean baseline: "
                         f"{latest:.1%}. Negative values mean the model is worse than the baseline."
                     )
-                _show_dataframe(frame)
+                from morphofeatures.metrics import progress_events as scientific_progress
+
+                _show_dataframe(pd.DataFrame(scientific_progress(series)))
             else:
                 st.info("No structured epoch metrics are available yet.")
         except Exception as error:
             st.error(str(error))
+    with st.expander("Resource and runtime diagnostics"):
+        from morphofeatures.metrics import resource_event
+
+        diagnostics = [event for event in events if resource_event(event)] if "events" in locals() else []
+        if diagnostics:
+            st.json(diagnostics[-20:], expanded=False)
+        else:
+            st.caption("No resource adjustments recorded. Full structured records remain in the metrics file.")
+        st.caption(str(selected.metrics_path))
     with st.expander("Logs"):
         st.caption("Standard output")
         with st.container():
@@ -1140,12 +1161,12 @@ def _experiments(config) -> None:
             selected.stdout_path,
             selected.stderr_path,
         )}))
-        if selected.checkpoint_path and Path(selected.checkpoint_path).is_file():
+        if selected.checkpoint_path and Path(selected.checkpoint_path).is_file() and st.checkbox("Inspect checkpoint details", key="inspect-checkpoint:" + selected.id):
             try:
                 st.json(inspect_checkpoint(Path(selected.checkpoint_path)))
             except Exception as error:
                 st.warning(str(error))
-        if selected.embedding_path and Path(selected.embedding_path).is_file():
+        if selected.embedding_path and Path(selected.embedding_path).is_file() and st.checkbox("Inspect embedding details", key="inspect-embedding:" + selected.id):
             try:
                 st.json(inspect_embedding(Path(selected.embedding_path)).to_dict())
                 embedding = load_embeddings(Path(selected.embedding_path), mmap=True)

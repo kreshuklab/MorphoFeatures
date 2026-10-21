@@ -16,7 +16,6 @@ from morphofeatures.analysis.variants import (
     start_variants,
     variant_history,
 )
-from morphofeatures.workspace_navigation import selector_key
 
 
 def scaling_fields(draft, path, *, experiment=False):
@@ -206,10 +205,16 @@ def _progress(path):
         )
 
 
-def result_controls(path, metadata, *, exploration=True):
+def result_controls(path, metadata, *, exploration=True, heading=True):
     """Select a revision before plotting/inspection so every downstream view agrees."""
     original = Path(path).resolve()
-    rows = variant_history(original)
+    try:
+        rows = variant_history(original)
+        if not isinstance(rows, list) or any(not isinstance(row, dict) or "state" not in row for row in rows):
+            raise ValueError("Invalid saved-combination index")
+    except (OSError, ValueError, TypeError) as error:
+        st.warning("Saved combinations could not be listed; the original result remains available. " + str(error))
+        rows = []
     failures = sum(row["state"] == "failed" for row in rows)
     if failures:
         st.warning(
@@ -219,20 +224,25 @@ def result_controls(path, metadata, *, exploration=True):
     choices = {str(original): metadata.get("display_name", "Original analysis")}
     for row in rows:
         if row["state"] == "completed":
-            child = Path(row["result"])
-            if child.is_file():
-                value = json.loads(child.read_text())
+            from morphofeatures.artifact_availability import probe
+            child = Path(row.get("result", ""))
+            status = probe(child)
+            if status.ready and status.metadata.get("schema") in REPORT_SCHEMAS:
+                value = status.metadata
                 choices[str(child)] = value.get("display_name", row["name"])
-    if len(choices) > 1:
-        selected = st.selectbox(
+    if len(choices) > 1 and heading:
+        from morphofeatures.result_browser_ui import safe_choice
+        selected = safe_choice(
             "Saved analysis combination",
             list(choices),
             format_func=choices.get,
-            key=selector_key("analysis-combination:" + str(original)),
+            key="analysis-combination:" + str(original),
         )
         path = Path(selected)
-        metadata = json.loads(path.read_text())
-    result_name_controls(path, metadata)
+        from morphofeatures.artifact_availability import read_report
+        metadata = read_report(path)
+    if heading:
+        result_name_controls(path, metadata)
     if metadata.get("schema") not in REPORT_SCHEMAS or not exploration:
         return path, metadata
     with st.expander("Explore clustering and UMAP on these embeddings"):
@@ -284,3 +294,37 @@ def result_controls(path, metadata, *, exploration=True):
         key="current-result-metadata:" + str(path),
     )
     return path, metadata
+
+
+def variant_draft_controls(config, path, metadata):
+    """Prepare a separate draft; only Review & run can start worker execution."""
+    from morphofeatures.artifact_availability import available_vectors, selected_artifact
+    from morphofeatures.result_catalog import vector_artifacts
+    from morphofeatures.workflow_ui import navigate, use_draft
+    from morphofeatures.workspace_state import new_draft
+
+    vectors = vector_artifacts(metadata, path)
+    coordinates = selected_artifact(path.parent / metadata.get("coordinates", "coordinates.tsv"))
+    if not vectors or len(available_vectors(vectors)) != len(vectors) or not coordinates.ready or coordinates.kind != "coordinates":
+        st.caption("Changing a saved map needs its original vectors and coordinates. Check missing or unchecked artifacts first.")
+        return
+    if st.checkbox("Advanced: existing app-host variant computation", key="host-variants:" + str(path)):
+        st.caption("This compatibility interface computes only after its explicit Compute button. Uncheck it to create a draft for reviewed local or SLURM execution.")
+        result_controls(path, metadata, exploration=True, heading=False)
+        return
+    with st.expander("Change map or clustering · retain saved classifier scores"):
+        key = "reviewed-variant:" + str(path)
+        if key not in st.session_state:
+            options = {k: v for k, v in metadata.get("settings", {}).items() if k in VARIANT_KEYS}
+            st.session_state[key] = new_draft(document={"stages": [{"action": "analyze", **options,
+                "analysis_variants": [{"name": "New map", **options}]}]})
+        editor = st.session_state[key]
+        variant_fields(editor, ["document", "stages", 0])
+        st.caption("Reuses the exact plotted cohort and fitted vectors. Classifier predictions and scores retain their original settings. New maps are exploratory, including when the parent is a published layout.")
+        variants = editor["document"]["stages"][0]["analysis_variants"]
+        if st.button("Create map / clustering draft", key=key + ":create", disabled=not variants):
+            stages = [{"action": "analysis_variant", "analysis": str(path), "variant": deepcopy(variant)} for variant in variants]
+            draft = new_draft(document={"stages": stages, "followup_of": {"analysis": str(path), "embeddings": vectors}})
+            draft["name"] = "Map variants · " + metadata.get("display_name", path.parent.name)
+            use_draft(config, draft, "Analyze")
+            navigate("Workflow")
