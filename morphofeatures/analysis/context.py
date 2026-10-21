@@ -1,4 +1,9 @@
-"""Neighbor aggregation for MorphoContextFeatures."""
+"""Legacy mean/max neighborhood aggregation (aggregate vector only).
+
+For the paper's focal-vector plus neighborhood-mean concatenation and bounded
+physical graph construction, use ``analysis.spatial_context.build_context``.
+Bilateral candidate partners are evaluation inputs, not a spatial graph.
+"""
 
 from __future__ import annotations
 

@@ -14,21 +14,68 @@ from morphofeatures.configuration_editor import load_document, parse_document
 from morphofeatures.workspace_jobs import resolve_job
 
 STARTING_POINTS = {
+    "distill": "Distill embeddings with cell types (adapter / PCA)",
+    "published": "Explore published MorphoFeatures / MorphoContextFeatures",
+    "bilateral": "Compare bilateral-partner retrieval",
+    "context": "Build spatial context from embeddings",
+    "dino_experiment": "Compare DINO fine/coarse representations",
+    "fusion": "Combine saved feature blocks",
+    "transfer": "Transfer labels from saved embeddings",
     "raw": "Raw image and instance segmentation",
+    "platybrowser": "Stream PlatyBrowser raw and segmentation",
+    "ome_zarr": "Stream OME-Zarr raw and segmentation",
     "preprocess": "Just Run Preprocessing",
     "crops": "Prepared crops or grouped N5 patches",
     "dino": "DINO features from prepared objects",
     "checkpoint": "An existing model checkpoint",
     "embeddings": "Saved embeddings",
+    "joint_embeddings": "Shared space across independent datasets",
     "demo": "Synthetic demonstration (eight crops)",
 }
+
+
+def with_fusion_comparison(document, index):
+    """Keep the configured fusion and add its raw/balanced counterpart plus analysis."""
+    result = deepcopy(document)
+    stages = result["stages"]
+    original = stages[index]
+    if original.get("action") != "fuse":
+        raise ValueError("Select a Combine embeddings stage first.")
+    if not original.get("name"):
+        original["name"] = "Combined"
+    alternative = deepcopy(original)
+    alternative["combination"] = "raw" if original.get("combination", "balanced") == "balanced" else "balanced"
+    base = original["name"] + " · " + alternative["combination"]
+    names = {stage.get("name") for stage in stages}
+    name, number = base, 2
+    while name in names:
+        name, number = f"{base} {number}", number + 1
+    alternative["name"] = name
+    following = stages[index + 1] if index + 1 < len(stages) else {}
+    reuse = following.get("action") == "analyze" and following.get("from_embedding") == original["name"]
+    analysis = deepcopy(following) if reuse else {"umap": True, "clusters": 8, "normalization": "none"}
+    analysis.pop("from_embedding", None)
+    analysis.pop("embedding", None)
+    analysis.update(action="compare", from_embeddings=[original["name"], name])
+    analysis.setdefault("analysis_normalizations", ["none", "l2"])
+    stages[index + 1:index + (2 if reuse else 1)] = [alternative, analysis]
+    return result
 STAGE_LABELS = {
+    "distill": "Distill embeddings",
+    "export_bilateral": "Export bilateral pairs in 3D",
+    "bilateral": "Bilateral-partner retrieval",
+    "context": "Build spatial context features",
+    "dino_experiment": "DINO fine/coarse experiments",
+    "fuse": "Combine embeddings",
+    "transfer": "Transfer labels",
     "preprocess": "Prepare data",
     "train": "Train",
     "extract": "Extract embeddings",
     "analyze": "Analyze",
     "compare": "Compare representations",
+    "joint_analyze": "Shared space across datasets",
     "export_labels": "Export labels to segmentation",
+    "export_mobie": "Export to MoBIE",
 }
 
 
@@ -47,6 +94,7 @@ def training_defaults(*, demo=False):
 def preprocessing_defaults():
     return {
         "action": "preprocess",
+        "layout": "single_crop",
         "raw": "",
         "segmentation": "",
         "raw_key": "exported_data",
@@ -86,11 +134,126 @@ def analysis_defaults(*, linked=True):
     }
 
 
-def new_draft(start="crops", *, document=None, source=None):
+def add_dataset_extraction(document, stage_index, dataset_index):
+    """Insert an extraction, copying model settings but requiring a new data source."""
+    document = deepcopy(document)
+    earlier = document["stages"][:stage_index]
+    template = next((s for s in earlier if s["action"] == "extract"), None)
+    stage = deepcopy(template) if template else new_draft("checkpoint")["document"]["stages"][0]
+    if "config" not in stage and stage.get("from_training"):
+        stage["config"] = deepcopy(
+            next(s["config"] for s in reversed(earlier) if s["action"] == "train")
+        )
+    config = stage.setdefault("config", training_defaults())
+    data = config.setdefault("data", {})
+    for key in ("crops", "label_ids", "loss_masks", "patches_container", "positions_container"):
+        if key in data:
+            data[key] = None
+    for key in (
+        "preprocessing",
+        "object_table",
+        "qc_raw_container",
+        "foreground_mask_container",
+        "masks_container",
+        "manifest",
+        "root",
+        "raw",
+        "id_mapping",
+    ):
+        data.pop(key, None)
+    config.pop("inspection", None)
+    stage.pop("from_preprocessing", None)
+    stage["name"] = "dataset-" + uuid.uuid4().hex[:8]
+    dataset = document["stages"][stage_index]["datasets"][dataset_index]
+    dataset.pop("embedding", None)
+    dataset["from_embedding"] = stage["name"]
+    document["stages"].insert(stage_index, stage)
+    return document
+
+
+def stages_after_preparation(preparation, *, mae="none", dino=False, compare=False, model_defaults=None):
+    """Build the same crop handoff for local and streamed sources."""
+    if mae not in {"none", "train", "checkpoint"}:
+        raise ValueError("Choose none, train, or checkpoint for MAE")
+    if preparation.get("layout") == "distributed_patches" and mae != "none":
+        raise ValueError(
+            "Distributed patches currently feed DINO; select No MAE or single_crop preparation"
+        )
+    stages = [deepcopy(preparation)]
+    names = []
+    if mae != "none":
+        config = training_defaults()
+        config["mae"]["input_shape"] = preparation.get("crop_shape", [32, 32, 32])
+        if preparation.get("source") in {"platybrowser", "ome_zarr"}:
+            config["mae"]["patch_size"] = [
+                8 if side % 8 == 0 else 4 if side % 4 == 0 else 1
+                for side in config["mae"]["input_shape"]
+            ]
+        if mae == "train":
+            stages.append({"action": "train", "config": config, "from_preprocessing": True})
+        stages.append(
+            {
+                "action": "extract",
+                "name": "MAE",
+                "model": "mae",
+                **(
+                    {"from_training": True}
+                    if mae == "train"
+                    else {
+                        "from_preprocessing": True,
+                        "config": config,
+                        "checkpoint": "",
+                    }
+                ),
+            }
+        )
+        stages.append(analysis_defaults())
+        names.append("MAE")
+    if dino:
+        stage = new_draft("dino", model_defaults=model_defaults)["document"]["stages"][0]
+        stage.update(name="DINO", from_preprocessing=True)
+        if preparation.get("layout") == "distributed_patches":
+            stage.setdefault("views", {}).update(
+                normalization="unit", resize="letterbox", fractions=[0.5]
+            )
+        stages.extend([stage, analysis_defaults()])
+        names.append("DINO")
+    if compare and len(names) > 1:
+        analysis = analysis_defaults(linked=False)
+        analysis.pop("embedding", None)
+        stages.append({**analysis, "action": "compare", "from_embeddings": names})
+    return stages
+
+
+def new_draft(start="crops", *, document=None, source=None, model_defaults=None):
+    from morphofeatures.dino_defaults import backbone_defaults
+
     if document is None:
         stages = []
-        if start in {"raw", "preprocess"}:
+        if start in {"raw", "preprocess", "platybrowser", "ome_zarr"}:
             stages.append(preprocessing_defaults())
+            if start == "platybrowser":
+                from morphofeatures.analysis.platybrowser import DEFAULTS
+
+                stages[0].update(
+                    source="platybrowser",
+                    platybrowser={**DEFAULTS, "object_ids": "segmentation"},
+                    roi=None,
+                    crop_shape=[64, 64, 64],
+                    output_format="h5",
+                    oversized="clip",
+                    read_budget_side=256,
+                )
+        if start == "ome_zarr":
+            stages[0].update(
+                source="ome_zarr",
+                ome_zarr={},
+                roi=None,
+                output_format="h5",
+                normalization="percentile",
+                read_budget_side=256,
+                max_scan_voxels=128**3,
+            )
         if start in {"raw", "crops", "demo"}:
             stages.append(
                 {
@@ -113,10 +276,7 @@ def new_draft(start="crops", *, document=None, source=None):
             stages.append(
                 {
                     "action": "extract",
-                    "model": "dinov2",
-                    "variant": "dinov2_vits14",
-                    "checkpoint": "",
-                    "model_repository": "",
+                    **backbone_defaults(model_defaults),
                     "config": {
                         "device": "auto",
                         "seed": 42,
@@ -124,7 +284,47 @@ def new_draft(start="crops", *, document=None, source=None):
                     },
                 }
             )
-        if start != "preprocess":
+        if start == "joint_embeddings":
+            stages.append(
+                {
+                    **analysis_defaults(linked=False),
+                    "action": "joint_analyze",
+                    "datasets": [
+                        {"name": "Dataset A", "embedding": ""},
+                        {"name": "Dataset B", "embedding": ""},
+                    ],
+                    "assume_same_model": False,
+                    "max_objects_per_dataset": 0,
+                }
+            )
+            stages[-1].pop("embedding")
+        if start == "dino_experiment":
+            from morphofeatures.dino_experiments import experiment_defaults
+
+            stages.append(experiment_defaults())
+            stages[-1]["backbones"] = [backbone_defaults(model_defaults)]
+        if start == "fusion":
+            stages.extend([{"action": "fuse", "name": "Combined", "embeddings": {}, "weights": [.5, .5]}, {"action": "analyze", "from_embedding": "Combined", "normalization": "none", "umap": True, "clusters": 8}])
+        if start == "transfer":
+            stages.append({"action": "transfer", "reference": {"name": "Reference", "embedding": "", "annotations": ""}, "targets": [{"name": "Target", "embedding": "", "annotations": None}]})
+        if start == "distill":
+            from morphofeatures.analysis.distillation import defaults
+
+            stages.append(defaults())
+        if start == "published":
+            from morphofeatures.analysis.published import references
+
+            name = "MorphoContextFeatures (200 dimensions)"
+            stages.append({**analysis_defaults(linked=False), "embedding": references()[name]["embedding"], "published_reference": name, "use_published_layout": True, "umap": True})
+        if start == "bilateral":
+            from morphofeatures.analysis.bilateral import defaults
+            from morphofeatures.analysis.published import references
+
+            stages.append({"action": "bilateral", **defaults(), "embeddings": {name: value["embedding"] for name, value in references().items()}, "same_specimen": True})
+        if start == "context":
+            stages.extend([{"action": "context", "name": "Spatial context", "embedding": "", "graph_mode": "adjacency_table", "adjacency_table": "", "include_self": True, "combination": "raw", "reduction": "none"}, {**analysis_defaults(linked=False), "from_embedding": "Spatial context"}])
+            stages[-1].pop("embedding")
+        if start not in {"preprocess", "platybrowser", "ome_zarr", "joint_embeddings", "dino_experiment", "fusion", "transfer", "published", "bilateral", "context", "distill"}:
             stages.append(analysis_defaults(linked=start != "embeddings"))
         document = {
             "stages": stages,
@@ -196,9 +396,17 @@ def workflow_document(draft):
     document = deepcopy(draft["document"])
     prepared = None
     for stage in document["stages"]:
+        if stage.get("action") == "fuse":
+            from morphofeatures.analysis.fusion import freeze_component_order
+
+            freeze_component_order(stage)
         if stage.get("action") == "preprocess":
             prepared = stage
-        elif stage.get("from_preprocessing") and prepared:
+        elif (
+            stage.get("from_preprocessing")
+            and prepared
+            and prepared.get("layout") != "distributed_patches"
+        ):
             stage.setdefault("config", {}).setdefault("mae", {})["input_shape"] = prepared.get(
                 "crop_shape", [32, 32, 32]
             )
@@ -222,6 +430,11 @@ def save_draft(root, draft):
                 "This draft was saved in another session. Download your changes, then reopen the saved draft before saving again."
             )
         saved = deepcopy(draft)
+        for stage in saved.get("document", {}).get("stages", []):
+            if stage.get("action") == "fuse":
+                from morphofeatures.analysis.fusion import freeze_component_order
+
+                freeze_component_order(stage)
         saved["saved_revision"] = saved["revision"]
         saved["storage_revision"] += 1
         write_json_atomic(path, saved)

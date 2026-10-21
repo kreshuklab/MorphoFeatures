@@ -1,0 +1,180 @@
+# Workflow → Start → Load settings from a file.
+# Replace the local paths and measured spatial metadata before running.
+# Walkthrough: docs/workspace_workflows.md#dino-finecoarse-experiments
+stages:
+  - action: dino_experiment
+    datasets:
+      - name: Platynereis
+        source:
+          source: local
+          raw: /path/to/raw.h5
+          raw_key: raw
+          segmentation: /path/to/nuclei.h5
+          segmentation_key: labels
+          raw_axes: zyx
+          segmentation_axes: zyx
+          unit: um
+          # EXAMPLE values: replace with the metadata for these particular arrays.
+          raw_spacing_zyx: [0.025, 0.020, 0.020]
+          segmentation_spacing_zyx: [0.100, 0.080, 0.080]
+          raw_origin_zyx: [0, 0, 0]
+          segmentation_origin_zyx: [0, 0, 0]
+          # Bounds are in segmentation voxels, with exclusive stop coordinates.
+          # Optional TSV: label_id, bbox_min_z/y/x, bbox_max_z/y/x.
+          object_index: null
+          id_mapping: null # Optional TSV: label_id, segmentation_id.
+          object_ids: null # Optional native IDs, e.g. [123, 456].
+          # Reusable targeting before reads/inference. UI: Prepare data → Target objects.
+          # For local nucleus masks and a cell-indexed table, supply the explicit mapping.
+          object_selection:
+            mode: all # all | ids | table; all preserves existing selection behavior.
+            ids: [] # In ids mode, e.g. [123, 456]. Empty selections are errors.
+            ids_file: null # CSV/TSV path in table mode; e.g. ../analysis/data/class_labels.tsv (CELL IDs).
+            id_column: label_id
+            filter_column: null # For the bundled table: cell_type; null keeps all rows.
+            require_nonempty: true
+            filter_values: [] # e.g. [neuron, muscle]; [] retains every category.
+            id_space: output # output | segmentation; never infer identity from numeric overlap.
+            mapping_file: null # e.g. /path/to/cells_to_nuclei.tsv if selecting nucleus IDs from cell IDs.
+            mapping_from: label_id
+            mapping_to: nucleus_id
+            missing: error # skip is explicit and reports unavailable IDs; zero matches always errors.
+          roi: null # Or [[z0, y0, x0], [z1, y1, x1]]; required for remote indexing.
+          # Whole segmentation box + one-voxel halo, including background; NOT the fine tile.
+          # Raising this limit needs enough worker RAM; SLURM memory is configured separately.
+          max_object_voxels: 16777216 # 256³; oversized objects are never clipped to fit.
+          boundary_policy: skip # skip | error | allow_partial (marks fine/coarse coverage partial).
+          oversized_policy: skip # skip | error; report the required box size in either case.
+          on_object_error: skip # skip | error for stale bounds, contrast, sampling/read failures.
+          data_version: '1' # Increment after modifying volume contents in place.
+        annotations: null # TSV/CSV with label_id, cell_type and optional specimen.
+        label_column: auto
+        group_column: null
+        baselines: [] # [{name: Existing method, embedding: /path/to/embeddings.npz}]
+      # Add Parhyale once its instance segmentation and spatial metadata are ready:
+      # - name: Parhyale
+      #   source:
+      #     source: ome_zarr
+      #     ome_zarr:
+      #       raw: {url: https://your-server/raw.ome.zarr, level: 0, channel: 0, timepoint: 0}
+      #       segmentation: {url: https://your-server/nuclei.ome.zarr, level: 0, channel: 0, timepoint: 0}
+      #     roi: [[0, 0, 0], [256, 256, 256]] # Select an actual region; boundary objects are skipped.
+      #     data_version: '1'
+      #   annotations: null # Optional; never used to adapt or predict target labels.
+      #   label_column: auto
+      #   group_column: null
+    backbones:
+      - model: dinov2
+        variant: dinov2_vits14
+        checkpoint: /path/to/dinov2_vits14_pretrain.pth
+        model_repository: /path/to/official/dinov2
+      # Same cohorts, separate experiment outputs; weights remain frozen:
+      # - model: dinov3
+      #   variant: dinov3_vits16
+      #   checkpoint: /path/to/dinov3_vits16.pth
+      #   model_repository: /path/to/official/dinov3
+    max_objects: 100 # Applied AFTER targeting. 0 = all targeted IDs; shared by all variants.
+    seed: 42
+    device: auto
+    cache: ../outputs/embedding_cache
+    # Execution only: keeps the same object cohort, tiles, slice positions and cutoffs.
+    # Tune on a small fixed cohort; see docs/troubleshooting.md for dino-benchmark.
+    runtime:
+      memory_mode: auto # auto derives RAM sub-budgets from SLURM/local job RAM; manual uses values below.
+      job_memory_mb: 0 # 0 = SLURM allocation, or conservative 8192 MiB locally; set a local budget here.
+      auto_adjust_memory: true # Repair manual budget conflicts and retry GPU OOM with smaller batches; log changes.
+      resume: true # Save/reuse each fully encoded object after interruption.
+      prepare_workers: 2 # Try 2–4 CPU processes feeding one GPU; 0 = serial preparation.
+      worker_threads: 1 # Numerical-library CPU threads per preparation process.
+      prepare_memory_mb: 4096 # Manual target; includes complete-object scratch, worker overhead and caches.
+      prefetch_mb: 256 # Manual queue target; auto calculates it within the whole-job budget.
+      decoded_cache_mb: 128 # Manual cache target PER volume PER reader; 0 disables in manual mode.
+      scratch_directory: null # Optional worker-local path; recovery vectors stay in `cache` above.
+      prepared_cache_mb: 0 # Optional byte-bounded image reuse across checkpoints; 0 disables.
+      spatial_order: false # Read nearby object boxes together; output IDs keep cohort order.
+      precision: float32 # Opt-in CUDA bfloat16/float16; benchmark feature drift first.
+      pin_memory: true # Pin CUDA input batches on the host.
+      async_transfer: true # Allow nonblocking transfers of pinned batches to CUDA.
+      batch_across_objects: true # Fill batches with images from multiple objects/modes, retaining ownership.
+      group_normalization_reads: true # Same sampled intensities, grouped by storage chunk.
+      reuse_object_mask: true # Use the already-loaded label mask for foreground sampling.
+    tile_sizes_um: [1.0] # Experimental starting value, not a biologically optimized scale.
+    views:
+      mode: both
+      size: 224 # Must be divisible by 14 for DINOv2, 16 for DINOv3; 224 works for both.
+      axes: [0, 1, 2] # 0=Z (XY image), 1=Y (XZ), 2=X (YZ).
+      coarse_fractions: [0.1, 0.3, 0.5, 0.7, 0.9]
+      fine_fractions: [0.5]
+      max_tiles: 64
+      max_candidate_tiles: 250000
+      min_foreground_fraction: 0.01 # 3D tile occupied by this nucleus: 0.25=25%, 0.50=50%.
+      min_slice_foreground_fraction: 0.0 # Each 2D fine DINO image: 0 keeps all nonempty slices.
+      tile_anchor: bbox_min # Existing grid; or bbox_center / centroid to center a tile there.
+      exhaustive: false # true ignores max_tiles; foreground and resource safeguards still apply.
+      normalization: foreground_percentile
+      percentiles: [1, 99]
+      resize: letterbox
+      mask: true # Set false only for an explicit surrounding-context experiment.
+      aggregation: mean # mean or max across valid views.
+      batch_size: 16
+    fusion_weights: [0.5, 0.5]
+    # Combine the same extracted blocks two ways; no additional DINO inference.
+    combination_methods: [balanced, raw]
+    # Additional choices: cls_cls, cls_foreground, foreground_foreground,
+    # fine_both, coarse_both. The primary fine-foreground + coarse-CLS pair remains.
+    additional_combinations: [all_four]
+    # Separately test analysis preprocessing, including newly evaluated classifiers.
+    # none preserves saved values; l2 normalizes the complete vector after fusion;
+    # standardize scales each feature (training folds only for classification).
+    analysis_normalizations: [none, l2]
+    extra_pairings: []
+    # extra_pairings:
+    #   - {name: Both foreground, fine: foreground_mean, coarse: foreground_mean, weights: [0.5, 0.5]}
+    export_tsv: false # Optional, larger text feature tables written by the worker.
+    classify: true # Runs only when annotations are supplied; needs at least two usable classes.
+    classifier_models: [logistic, knn] # [logistic] runs a linear classifier alone; mlp is also available.
+    classifier_space: embeddings # Or pca / umap, fitted within each training fold.
+    classifier_dimensions: 2 # Used only for PCA/UMAP; independent of plotted coordinates.
+    classifier_standardize: false # Optional scaling of the selected dimensions AFTER projection.
+    folds: 5
+    umap: true
+    umap_pca_components: null # Try 50 for PCA → UMAP; null/0 is off. Plotting only, including transfer maps.
+    cluster_pca_components: null # Optional PCA before K-means/Leiden; independent of UMAP.
+    analysis_variants: [] # Additional named combinations for every representation/transfer map, without re-encoding.
+    clusters: 8
+    neighbors: 15
+    min_dist: 0.1
+    transfer:
+      enabled: false # Enable after adding a target and reference annotations.
+      reference: Platynereis
+      classifier: logistic # logistic, mlp or knn (shared Classification Tool estimators).
+      hidden_dimensions: [64] # MLP only; one hidden layer by default.
+      max_iter: 2000 # Logistic/MLP iteration limit.
+      classifier_normalization: none # Optional standardize; fitted on reference training folds.
+      classifier_space: embeddings # Or pca / umap; target objects use the fitted reference transform.
+      classifier_dimensions: 2 # Increase for a higher-dimensional classifier space.
+      classifier_standardize: false # Set true to scale PCA/UMAP coordinates after projection.
+      classifier_umap_neighbors: 15
+      classifier_umap_min_dist: 0.1
+      classifier_umap_epochs: 200
+      # Same objects/folds for all five conditions; target labels are evaluation-only.
+      conditions: [uncorrected, coral, coral_source_to_target, adapter, deep_coral]
+      adapter: # Shared by both neural conditions; DINO checkpoints stay frozen.
+        hidden_dim: 128
+        latent_dim: 64 # Exported adapted feature-vector width, not UMAP dimensions.
+        epochs: 100 # Fixed length for every fold and final model; no target-label stopping.
+        batch_size: 128 # Object vectors per batch, not images.
+        learning_rate: 0.001
+        weight_decay: 0.0001
+        coral_weight: 1.0 # Deep CORAL only; adapter control always uses zero.
+        standardize: true # Reference-training statistics after full-vector L2 normalization.
+        device: cpu # cpu, cuda or auto; CUDA needs a GPU allocation.
+      min_confidence: 0.6
+      distance_quantile: 0.99
+      label_mapping: {} # Explicit target-name → reference-name correspondences only.
+slurm:
+  partition: gpu # Replace with your cluster's partition; choose local execution in the UI if desired.
+  cpus: 4
+  gpus: 1
+  memory: 32G
+  time: '04:00:00'

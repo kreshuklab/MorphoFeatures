@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import inspect
 import os
@@ -23,7 +24,7 @@ from morphofeatures.artifacts import inspect_checkpoint, inspect_embedding, tail
 from morphofeatures.config import load_config, repository_root
 from morphofeatures.data.io import export_embeddings, load_embeddings, merge_embeddings
 from morphofeatures.data.synthetic import save_synthetic_dataset
-from morphofeatures.experiments import cancel_job, plan_job, refresh_jobs, submit_plan
+from morphofeatures.experiments import plan_job, refresh_jobs, submit_plan
 from morphofeatures.mae_sweep import (
     load_prepared_sweep,
     plan_soft_grid,
@@ -37,6 +38,8 @@ from morphofeatures.slurm import (
     ClusterProfile,
     DryRunScheduler,
     SlurmScheduler,
+    cluster_profile_source,
+    cluster_profiles_from_mapping,
     load_cluster_profiles,
 )
 from morphofeatures.workflows import WORKFLOWS, WorkflowRequest, format_command
@@ -205,6 +208,9 @@ def _overview(config) -> None:
 
 
 def _classification(config) -> None:
+    from morphofeatures.analysis.classification import CLASSIFIER_NAMES
+    from morphofeatures.ui_settings import HELP
+
     default_embedding = Path(
         st.session_state.get(
             "analysis_embedding_path",
@@ -219,15 +225,64 @@ def _classification(config) -> None:
         labels_value = label_column.text_input("Class labels", _display_path(default_labels))
         model_column, minimum_column = st.columns(2)
         classifier_model = model_column.selectbox(
-            "Shallow model", ("logistic", "mlp"), help="Linear probe or one-hidden-layer MLP."
+            "Shallow model",
+            ("logistic", "mlp", "knn"),
+            format_func=CLASSIFIER_NAMES.get,
+            help="Logistic regression is a linear classifier. Select it to run a linear probe alone; MLP learns nonlinear relationships and KNN uses nearby labeled objects.",
         )
         minimum_class_count = minimum_column.number_input(
             "Minimum matched cells per type", min_value=2, value=2
         )
         fold_column, seed_column, iteration_column = st.columns(3)
-        folds = fold_column.number_input("Cross-validation folds", min_value=2, max_value=10, value=5)
+        folds = fold_column.number_input(
+            "Cross-validation folds", min_value=2, max_value=10, value=5
+        )
         seed = seed_column.number_input("Seed", min_value=0, value=int(config.seed))
-        max_iter = iteration_column.number_input("Maximum iterations", min_value=100, value=2000, step=100)
+        max_iter = iteration_column.number_input(
+            "Maximum iterations", min_value=100, value=2000, step=100
+        )
+        space = st.selectbox(
+            "Classification input", ["embeddings", "pca", "umap"], help=HELP["classifier_space"]
+        )
+        dimensions = st.number_input(
+            "Classifier dimensions (PCA/UMAP only)",
+            min_value=1,
+            value=2,
+            help=HELP["classifier_dimensions"],
+        )
+        scaling = st.selectbox(
+            "Feature scaling before classifier projection",
+            ["standardize", "l2", "none"],
+            help="Scale original feature dimensions before the chosen projection. standardize centers each feature and gives it unit standard deviation using training objects; l2 sets each object's vector length to one; none preserves the input values.",
+        )
+        standardize = st.checkbox(
+            "Standardize selected classifier dimensions",
+            value=False,
+            help=HELP["classifier_standardize"],
+        )
+        with st.expander("Classifier UMAP settings"):
+            neighbors = st.number_input(
+                "Classifier UMAP neighbors",
+                min_value=2,
+                value=15,
+                help=HELP["classifier_umap_neighbors"],
+            )
+            min_dist = st.number_input(
+                "Classifier UMAP minimum distance",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.1,
+                help=HELP["classifier_umap_min_dist"],
+            )
+            epochs = st.number_input(
+                "Classifier UMAP epochs",
+                min_value=3,
+                value=200,
+                help=HELP["classifier_umap_epochs"],
+            )
+        st.caption(
+            "PCA/UMAP and scaling are fitted only on each training fold, then applied to held-out objects. These are separate from the exploratory plots of all objects."
+        )
         submitted = st.form_submit_button("Run classification")
     if submitted:
         try:
@@ -241,6 +296,15 @@ def _classification(config) -> None:
                     seed=int(seed),
                     max_iter=int(max_iter),
                     minimum_class_count=int(minimum_class_count),
+                    classifier_settings={
+                        "normalization": scaling,
+                        "classifier_space": space,
+                        "classifier_dimensions": int(dimensions),
+                        "classifier_standardize": standardize,
+                        "classifier_umap_neighbors": int(neighbors),
+                        "classifier_umap_min_dist": min_dist,
+                        "classifier_umap_epochs": int(epochs),
+                    },
                 )
             st.session_state["classification_result"] = result
         except Exception as error:
@@ -262,9 +326,7 @@ def _classification(config) -> None:
         )
         _show_dataframe(confusion)
         _show_dataframe(
-            pd.DataFrame(
-                {"cell_type": result.class_names, "recall": result.per_class_recall}
-            )
+            pd.DataFrame({"cell_type": result.class_names, "recall": result.per_class_recall})
         )
         st.caption(
             "Features are standardized inside each fold and labels are joined by label_id. "
@@ -273,6 +335,8 @@ def _classification(config) -> None:
 
 
 def _projection(config) -> None:
+    from morphofeatures.ui_settings import HELP
+
     default_embedding = Path(
         st.session_state.get(
             "analysis_embedding_path",
@@ -301,6 +365,16 @@ def _projection(config) -> None:
         epochs = epoch_column.number_input("UMAP epochs", min_value=10, value=50, step=10)
         seed = seed_column.number_input("Projection seed", min_value=0, value=int(config.seed))
         min_dist = st.number_input("UMAP minimum distance", min_value=0.0, max_value=1.0, value=0.0)
+        pca_components = st.number_input(
+            "PCA components before UMAP (0 = off)",
+            min_value=0,
+            value=0,
+            help=HELP["umap_pca_components"],
+        )
+        cluster_pca_components = st.number_input(
+            "PCA components before clustering (0 = off)", min_value=0, value=0,
+            help=HELP["cluster_pca_components"],
+        )
         resolution = st.number_input("Leiden resolution", min_value=0.000001, value=0.004, format="%.6f")
         submitted = st.form_submit_button("Run projection")
     if submitted:
@@ -316,10 +390,12 @@ def _projection(config) -> None:
                     "neighbors": int(neighbors), "min_dist": float(min_dist),
                     "resolution": float(resolution), "umap_epochs": int(epochs),
                     "seed": int(seed), "umap": True,
+                    "umap_pca_components": int(pca_components),
+                    "cluster_pca_components": int(cluster_pca_components),
                 }
                 if annotation_value.strip():
                     settings["annotations"] = str(_resolve(annotation_value))
-                result_frame, _ = project_embeddings(table.label_ids, table.features, settings)
+                result_frame, diagnostics = project_embeddings(table.label_ids, table.features, settings)
                 all_labels = join_labels(table.label_ids, settings)
                 result_frame = result_frame.merge(all_labels, on="label_id", validate="one_to_one")
                 result_frame.attrs["class_colors"] = label_palette(all_labels)
@@ -333,14 +409,25 @@ def _projection(config) -> None:
                 result_frame.to_csv(
                     destination.with_name(destination.stem + "_labels.tsv"), sep="\t", index=False
                 )
+                from morphofeatures.artifacts import write_json_atomic
+
+                write_json_atomic(
+                    destination.with_name(destination.stem + "_projection.json"),
+                    {"source": str(_resolve(embedding_value)), "diagnostics": diagnostics},
+                )
             st.session_state["projection_result"] = result_frame
+            st.session_state["projection_diagnostics"] = diagnostics
             st.success("Saved {}".format(_display_path(destination)))
         except Exception as error:
             st.error(str(error))
     result = st.session_state.get("projection_result")
     if result is not None:
+        from morphofeatures.analysis.projection import umap_input_description
         from morphofeatures.analysis.visualization import interactive_projection
 
+        umap_input = st.session_state.get("projection_diagnostics", {}).get("umap_input")
+        if umap_input:
+            st.caption(umap_input_description(umap_input))
         opacity = st.slider("Unlabeled point opacity", 0.0, 1.0, 0.15, key="tools:opacity")
         st.plotly_chart(
             interactive_projection(result, "umap", unlabeled_opacity=opacity),
@@ -397,14 +484,15 @@ def _context_features(config) -> None:
     import pickle
 
     with st.form("context"):
-        st.subheader("Aggregate neighbor context")
+        st.subheader("Aggregate neighbor context (legacy mean/max tool)")
+        st.caption("This tool saves the neighborhood aggregate alone. Workflow → Build spatial context retains the focal vector plus its neighborhood mean, following the paper's construction. Bilateral candidate partners are evaluation data, not physical neighbors.")
         input_column, neighbor_column = st.columns(2)
         embedding_value = input_column.text_input(
             "Context embedding",
             _display_path(config.paths.analysis_data / "morphofeatures_all_cells.npy"),
         )
         neighbor_value = neighbor_column.text_input(
-            "Neighbor mapping", _display_path(config.paths.analysis_data / "bilateral_neighbors.pkl")
+            "Neighbor mapping", "", help="Existing spatial neighbor dictionary (legacy pickle format). Supply your own physical graph; do not use analysis/data/bilateral_neighbors.pkl. The guided Workflow supports TSV/CSV graphs and bounded segmentation scans."
         )
         output_column, feature_column, reducer_column = st.columns(3)
         output_value = output_column.text_input(
@@ -446,11 +534,12 @@ def _build_features(config) -> None:
 
 
 def _profiles(config) -> Dict[str, ClusterProfile]:
-    configured = (config.raw or {}).get("slurm", {}).get(
-        "profiles", "configs/slurm_profiles.example.yaml"
-    )
-    profile_value = os.environ.get("MORPHOFEATURES_SLURM_PROFILES", configured)
-    profile_path = _resolve(profile_value)
+    slurm = (config.raw or {}).get("slurm", {})
+    if cluster_profile_source(slurm) == "workspace":
+        return cluster_profiles_from_mapping({"profiles": slurm.get("resource_presets")})
+    configured = slurm.get("profiles") or "configs/slurm_profiles.example.yaml"
+    profile_value = configured if "workspace_config_override" in st.session_state else os.environ.get("MORPHOFEATURES_SLURM_PROFILES", configured)
+    profile_path = config.paths.repo_root / Path(profile_value).expanduser()
     try:
         return load_cluster_profiles(profile_path)
     except Exception:
@@ -496,7 +585,7 @@ def _legacy_train_encode(config) -> None:
     )
     device_column, checkpoint_column, output_column = st.columns(3)
     device = device_column.selectbox(
-        "Device", ("auto", "cpu", "cuda"), key="workflow_device_{}".format(workflow)
+        "Device", ("auto", "cpu", "cuda"), index=("auto", "cpu", "cuda").index(config.device), key="workflow_device_{}".format(workflow)
     )
     checkpoint_defaults = {
         "shape_encode": _display_path(config.paths.output_root / "shape_cell" / "checkpoints" / "best.pt"),
@@ -815,68 +904,146 @@ def _legacy_train_encode(config) -> None:
 
 def _experiments(config) -> None:
     _header("Runs", "Track submissions, inspect outputs, and continue from a completed stage.")
+    from morphofeatures.run_presentation import select_table_run, workflow_label
+    from morphofeatures.job_status import reconcile_job_states, scheduler_display
     from morphofeatures.workflow_ui import run_actions
 
     notice = st.session_state.pop("run_notice", None)
     if notice:
         st.success(notice)
+    for error in st.session_state.pop("run_deletion_errors", []):
+        st.error(error)
     registry = JobRegistry.under_output_root(config.paths.output_root)
+    repaired = reconcile_job_states(registry)
+    if repaired:
+        st.caption(f"Updated {repaired} job record(s) from saved worker outcomes. Old scheduler observations are retained in provenance.")
     filter_column, state_column, refresh_column = st.columns((2, 2, 1))
-    run_filter = filter_column.text_input("Filter run ID", "")
+    run_filter = filter_column.text_input("Filter run ID, name or workflow", "", key="runs:filter")
     states = state_column.multiselect(
         "Application state",
-        ("dry_run", "queued", "running", "completed", "failed", "cancelled", "unknown"),
+        ("dry_run", "queued", "running", "cancelling", "completed", "failed", "cancelled", "unknown", "deleting", "deletion_failed"),
+        key="runs:states",
     )
     if refresh_column.button("Refresh SLURM"):
         if SlurmScheduler.accounting_available():
             try:
                 updated, warnings = refresh_jobs(registry, SlurmScheduler())
-                st.success("Refreshed {} active job(s).".format(updated))
+                st.success("Refreshed {} SLURM job record(s), including finished jobs awaiting a final scheduler status.".format(updated))
                 for warning in warnings:
                     st.warning(warning)
             except Exception as error:
                 st.error(str(error))
         else:
             st.warning("squeue/sacct are unavailable; persisted records and artifacts remain viewable.")
-    records = registry.list(run_id=run_filter or None, states=states, limit=500)
+    records = registry.list(states=states, limit=500)
+    if run_filter:
+        records = [r for r in records if run_filter.casefold() in (r.run_id + " " + r.display_name + " " + workflow_label(r)).casefold()]
     if not records:
+        st.session_state["runs:selected_ids"] = []
         st.info("No matching runs. Open Workflow to configure and review a run.")
         return
-    _show_dataframe(
-        pd.DataFrame(
+    frame = pd.DataFrame(
             [
                 {
                     "run": record.run_id,
-                    "workflow": record.workflow,
+                    "name": record.display_name,
+                    "workflow": workflow_label(record),
                     "stage": record.stage,
                     "state": record.application_state,
                     "SLURM": record.slurm_job_id or "—",
-                    "raw state": record.raw_scheduler_state or "—",
+                    "raw state": scheduler_display(record),
                     "created": record.created_at,
                     "updated/completed": record.completed_at or record.started_at or record.submitted_at or "—",
                     "dependency": record.dependency_job_id or "—",
                 }
                 for record in records
             ]
-        ),
-        height=260,
     )
-    labels = ["{} · {} · {}".format(record.run_id, record.workflow, record.id[:10]) for record in records]
     focus = st.session_state.pop("selected_run_id", None)
     if focus:
-        st.session_state["run_selection"] = next((label for label, record in zip(labels, records) if record.id == focus), labels[0])
-    if st.session_state.get("run_selection") not in labels:
-        st.session_state["run_selection"] = labels[0]
-    selected = records[labels.index(st.selectbox("Inspect run", labels, key="run_selection"))]
+        st.session_state["runs:selected"] = focus
+        st.session_state["runs:selected_ids"] = [focus]
+        st.session_state["runs:table_epoch"] = st.session_state.get("runs:table_epoch", 0) + 1
+    ids = [record.id for record in records]
+    selected_id = st.session_state.get("runs:selected")
+    selected_ids = [job_id for job_id in st.session_state.get("runs:selected_ids", [selected_id]) if job_id in ids]
+    st.session_state["runs:selected_ids"] = selected_ids
+    st.caption("Select rows using the checkboxes at the left of the table. Select several to delete their run folders together; the most recently added row opens below for inspection. Filtering removes hidden rows from the deletion selection.")
+    if "on_select" in inspect.signature(st.dataframe).parameters:
+        digest = hashlib.sha256((str(config.paths.output_root) + repr(ids)).encode()).hexdigest()[:16]
+        key = f"runs:table:{digest}:{st.session_state.get('runs:table_epoch', 0)}"
+        options = {}
+        if "selection_default" in inspect.signature(st.dataframe).parameters:
+            options["selection_default"] = {"selection": {"rows": [ids.index(job_id) for job_id in selected_ids]}}
+        st.dataframe(
+            frame, height=300, use_container_width=True, hide_index=True,
+            key=key, selection_mode="multi-row",
+            on_select=lambda: select_table_run(st.session_state, key, ids),
+            **options,
+        )
+    else:
+        # Legacy Streamlit still provides row actions, never a disconnected dropdown.
+        checked = []
+        for record in records:
+            if st.checkbox(f"Select {record.display_name} ({record.id[:10]})", value=record.id in selected_ids, key="run-row-selected:" + record.id):
+                checked.append(record.id)
+            if st.button(f"{record.display_name} · {workflow_label(record)} · {record.application_state}", key="run-row:" + record.id):
+                st.session_state["runs:selected"] = record.id
+        st.session_state["runs:selected_ids"] = checked
+    selected_rows = [record for record in records if record.id in st.session_state["runs:selected_ids"]]
+    selected = next((record for record in records if record.id == st.session_state.get("runs:selected")), None)
+    from morphofeatures.run_deletion_ui import deletion_controls
+
+    if selected_rows:
+        deletion_controls(config, registry, selected_rows)
+    if selected is None:
+        st.info("Select a run in the table to see its progress, logs and outputs.")
+        return
+    st.subheader(selected.display_name)
+    st.caption(f"{workflow_label(selected)} · Run ID: {selected.run_id} · Job: {selected.id[:10]}")
+    from morphofeatures.job_control_ui import stop_controls
+
+    stop_controls(registry, selected)
+    if selected.provenance.get("status_resolution"):
+        resolution = selected.provenance["status_resolution"]
+        st.caption(f"Recorded outcome: {selected.application_state}. The earlier {resolution['previous_scheduler_state']} scheduler observation was superseded by the worker's final outcome at {resolution['finished_at']}.")
+    if selected.application_state in {"failed", "completed"} and selected.raw_scheduler_state:
+        from morphofeatures.slurm import normalize_slurm_state
+
+        if normalize_slurm_state(selected.raw_scheduler_state) in {"running", "queued"}:
+            st.warning("The worker has finished, but a later SLURM check still shows an active allocation. Use Refresh SLURM to check whether cleanup or a requeued job has finished before deleting.")
+    if not selected_rows:
+        deletion_controls(config, registry, [selected])
+    with st.expander("Rename completed run"):
+        display_name = st.text_input(
+            "Run display name", selected.display_name, key="rename-run:" + selected.id,
+            help="Changes the name in Runs, Results and provenance. The permanent run ID, scheduler ID and file paths stay stable so dependencies and saved links still work.",
+        )
+        if st.button("Save run name", disabled=selected.application_state not in {"completed", "failed", "cancelled", "dry_run"}):
+            try:
+                registry.rename_run(selected.run_id, display_name)
+                st.session_state["selected_run_id"] = selected.id
+                st.rerun()
+            except (ValueError, OSError) as error:
+                st.error(str(error))
+        if selected.provenance.get("name_history"):
+            st.dataframe(pd.DataFrame(selected.provenance["name_history"]))
     if selected.workflow == "workspace_run":
         import json
+
+        from morphofeatures.provenance_ui import provenance_view
+
+        provenance_view(key="run:provenance:" + selected.id, artifact=Path(selected.working_directory))
 
         status_path = Path(selected.working_directory) / "status.json"
         st.button("Refresh progress and logs")
         if status_path.exists():
             try:
                 status = json.loads(status_path.read_text())
-                st.write("Pipeline: " + status["state"])
+                if selected.application_state in {"failed", "cancelled"} and status["state"] == "running":
+                    st.warning(f"This job is {selected.application_state} ({selected.raw_scheduler_state or 'see logs'}). The worker's last progress file still says running because it stopped before writing a final status.")
+                else:
+                    st.write("Pipeline: " + status["state"])
                 _show_dataframe(pd.DataFrame(status.get("stages", [])))
                 if status.get("error"):
                     st.error(status["error"])
@@ -899,14 +1066,6 @@ def _experiments(config) -> None:
         )
         if selected.error_message:
             st.warning(selected.error_message)
-        if selected.slurm_job_id and selected.application_state in {"queued", "running", "unknown"}:
-            confirmed = st.checkbox("Confirm cancellation of this SLURM job", value=False)
-            if st.button("Cancel selected job", disabled=not confirmed):
-                try:
-                    cancel_job(selected, registry, SlurmScheduler())
-                    st.success("Cancellation requested and retained in the registry.")
-                except Exception as error:
-                    st.error(str(error))
     with st.expander("Metrics", expanded=selected.application_state == "running"):
         try:
             events = read_metric_events(Path(selected.metrics_path))
@@ -1069,7 +1228,7 @@ def _data_config(config, config_path: Path) -> None:
 
 def _documentation() -> None:
     _header("Documentation", "Repository guides rendered alongside the workflow.")
-    selection = st.selectbox("Guide", tuple(DOCS))
+    selection = st.selectbox("Guide", tuple(DOCS), key="help:selection")
     path = DOCS[selection]
     if path.exists():
         st.markdown(path.read_text(encoding="utf-8"))
@@ -1086,43 +1245,26 @@ def _load_active_config(value: str):
 
 
 def _workspace_settings(config, config_path):
-    from morphofeatures.workflow_ui import rerun
-    from morphofeatures.workspace_ui import retained_input
+    from morphofeatures.workspace_preferences import settings_page
 
-    _header("Workspace settings", "Choose where drafts, runs and results are stored.")
-    source = retained_input("Workspace defaults YAML", str(config_path), "settings:config")
-    root = retained_input("Workspace output directory", str(config.paths.output_root), "settings:root")
-    st.caption("Workspace defaults set shared paths and bundled-data locations. Load training and pipeline settings inside Workflow.")
-    if st.button("Apply workspace settings"):
-        try:
-            path = _resolve(source)
-            if not path.is_file():
-                raise ValueError("Workspace defaults file does not exist: " + str(path))
-            load_config(path)
-            st.session_state["active_workspace_config"] = str(path)
-            st.session_state["workspace_root"] = str(_resolve(root))
-            st.session_state.pop("workspace_plan", None)
-            rerun()
-        except Exception as error:
-            st.error(str(error))
-    st.caption("Active workspace: " + str(config.paths.output_root))
-    st.caption("In-session drafts remain associated with their workspace. Save drafts in Workflow to reopen them after a restart.")
+    settings_page(config, config_path)
 
 
 def _tools(config, config_path):
     _header("Tools", "Specialist workflows, data inspection, and published feature processing.")
     tool = st.selectbox("Tool", ("Choose a tool", "Published shape / texture workflows and MAE sweeps",
-        "DINO features", "Feature assembly", "Classification and projection tools", "Mesh inspection", "Data inspection and synthetic fixtures", "Runtime and bundled-data checks"))
+        "DINO features", "Feature assembly", "Classification and projection tools", "Mesh inspection", "Data inspection and synthetic fixtures", "Runtime and bundled-data checks"), key="tools:selection")
     if tool == "Published shape / texture workflows and MAE sweeps":
         _legacy_train_encode(config)
     elif tool == "DINO features":
         st.write("Extract pretrained DINOv2 or DINOv3 features from prepared object intensity crops and masks, then visualize embeddings and test classification against your annotations.")
         st.caption("Supply an official local model checkout and matching pretrained weights. The workflow uses the same review, local/Slurm execution, and Results pages as MAE.")
         if st.button("Create DINO features workflow", type="primary"):
+            from morphofeatures.dino_defaults import workspace_defaults
             from morphofeatures.workflow_ui import navigate, use_draft
             from morphofeatures.workspace_state import new_draft
 
-            use_draft(config, new_draft("dino"), "Analyze")
+            use_draft(config, new_draft("dino", model_defaults=workspace_defaults(config)), "Analyze")
             navigate("Workflow")
     elif tool == "Feature assembly":
         _build_features(config)
@@ -1140,21 +1282,36 @@ def _tools(config, config_path):
 
 
 def main() -> None:
+    from morphofeatures.config import config_from_mapping
     from morphofeatures.workflow_ui import workflow_page
+    from morphofeatures.workspace_navigation import begin_screen, go_back, remember_screen
     from morphofeatures.workspace_ui import result_browser
 
     config_value = st.session_state.get("active_workspace_config", str(ROOT / "configs/default.yaml"))
-    config, config_path, config_error = _load_active_config(config_value)
+    if "workspace_config_override" in st.session_state:
+        config = config_from_mapping(st.session_state["workspace_config_override"], base=ROOT, apply_environment=False)
+        config_path, config_error = _resolve(config_value), None
+    else:
+        config, config_path, config_error = _load_active_config(config_value)
     if "workspace_root" not in st.session_state:
         st.session_state["workspace_root"] = str(config.paths.output_root)
     config = replace(config, paths=replace(config.paths, output_root=Path(st.session_state["workspace_root"])))
+    configured_profiles = (config.raw or {}).get("slurm", {}).get("profiles") or "configs/slurm_profiles.example.yaml"
+    st.session_state["workspace_cluster_profiles"] = str(config.paths.repo_root / Path(configured_profiles).expanduser())
+    slurm_settings = (config.raw or {}).get("slurm", {})
+    st.session_state["workspace_resource_presets"] = (
+        slurm_settings.get("resource_presets")
+        if cluster_profile_source(slurm_settings) == "workspace" else None
+    )
     pending = st.session_state.pop("navigate_to", None)
     if pending in PAGES:
         st.session_state["workspace_navigation"] = pending
+    begin_screen(st.session_state)
     with st.sidebar:
         st.title("MorphoFeatures")
         st.caption("From segmented objects to representations")
         page = st.radio("Navigate", PAGES, key="workspace_navigation")
+        st.button("Back", key="navigation:back", disabled=not st.session_state.get("navigation:history"), on_click=lambda: go_back(st.session_state), help="Return to the previous page, run or result selection in this browser session. Draft edits and completed work are kept.")
         if hasattr(st, "divider"):
             st.divider()
         else:
@@ -1179,6 +1336,7 @@ def main() -> None:
         _workspace_settings(config, config_path)
     else:
         _documentation()
+    remember_screen(st.session_state)
 
 
 main()

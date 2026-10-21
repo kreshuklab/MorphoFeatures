@@ -1,0 +1,40 @@
+# Load in Workflow -> Start; replace the analysis path with a completed result.
+# Biologist's guide: docs/analysis_and_mobie.md
+# Creates a NEW LOCAL project whose images stream from published PlatyBrowser.
+# It does not upload to or modify the published project.
+stages:
+  - action: export_mobie
+    analysis: /path/to/comparison/comparison.json
+    # For an appended stage after Analyze/Compare, remove analysis and use:
+    # from_analysis: true
+    mode: platybrowser
+    dataset_name: platynereis_nuclei
+    description: "Platynereis nuclei: embeddings, clusters and cell-type annotations"
+    platybrowser:
+      project_url: https://github.com/mobie/platybrowser-project
+      revision: 2d231ac5dcd55d6d97436ad544f8fc5791fab3c7
+      dataset: "1.0.1"
+      raw_source: raw
+      segmentation_source: nuclei
+      # New PlatyBrowser preparation uses segmentation IDs.
+      # Older cell-indexed nuclear patches: choose cell to load cells_to_nuclei.tsv.
+      object_ids: segmentation
+      raw_level: 3
+      segmentation_level: 0
+      # Levels validate metadata; Fiji streams the FULL published pyramid.
+      cache_directory: ../outputs/remote_cache/platybrowser
+      cache_size_mb: 1024
+      timeout_seconds: 20
+    id_mapping: null              # Optional explicit mapping overrides automatic lookup
+    require_all_ids: true         # Stop if any embedded object is absent from the catalogue
+    include_artifacts: true       # Embeddings, figures, analysis settings/reports and splits
+    include_feature_table: false  # Optional wide feature-dimension table for MoBIE
+    attachments: []               # Explicit files, e.g. ["/path/to/checkpoint.pt"]
+    max_artifact_gb: 4.0
+    contrast_limits: [0, 255]      # Display only; adjust to the selected raw image
+    make_zip: true
+slurm:
+  cpus: 4
+  gpus: 0
+  memory: 8G
+  time: "01:00:00"

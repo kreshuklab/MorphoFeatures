@@ -14,6 +14,7 @@ import numpy as np
 import yaml
 
 from morphofeatures.data.crop_storage import open_crop_array
+from morphofeatures.workflow_validation import FieldError, at_fields
 
 VARIANTS = {
     "dinov2": {"dinov2_vits14", "dinov2_vitb14", "dinov2_vits14_reg", "dinov2_vitb14_reg"},
@@ -23,42 +24,77 @@ VARIANTS = {
 
 def validate_dino_settings(settings, *, require_data=True):
     """Check input contracts and view settings before allocating an extraction run."""
+    from morphofeatures.data.object_selection import resolve_selection
+    from morphofeatures.dino_runtime import runtime_options
+
+    resolve_selection(settings.get("object_selection"))
+    runtime_options(settings)
     family = settings["model"]
     views = settings.get("views", {})
     stride = 14 if family == "dinov2" else 16
     size = views.get("size", 224)
     if isinstance(size, bool) or int(size) != size or size < stride or size % stride:
-        raise ValueError(f"DINO image size must be a positive multiple of {stride}")
+        raise FieldError(f"DINO image size must be a positive multiple of {stride}", "views.size")
     if int(views.get("batch_size", 16)) < 1:
-        raise ValueError("DINO view batch size must be positive")
-    if views.get("feature", "cls") not in {"cls", "patch_mean"} or views.get(
+        raise FieldError("DINO view batch size must be positive", "views.batch_size")
+    if views.get("feature", "cls") not in {"cls", "patch_mean", "foreground_mean"} or views.get(
         "aggregation", "mean"
     ) not in {"mean", "max"}:
-        raise ValueError("DINO feature must be cls/patch_mean and aggregation mean/max")
+        raise FieldError(
+            "DINO feature must be cls/patch_mean/foreground_mean and aggregation mean/max",
+            "views.feature",
+            "views.aggregation",
+        )
     if views.get("resize", "stretch") not in {"stretch", "letterbox"}:
-        raise ValueError("DINO resize must be stretch or letterbox")
+        raise FieldError("DINO resize must be stretch or letterbox", "views.resize")
     if views.get("normalization", "foreground_percentile") not in {
         "foreground_percentile",
         "dtype",
         "unit",
     }:
-        raise ValueError("DINO normalization must be foreground_percentile, dtype, or unit")
+        raise FieldError(
+            "DINO normalization must be foreground_percentile, dtype, or unit",
+            "views.normalization",
+        )
     axes, fractions = views.get("axes", [0, 1, 2]), views.get("fractions", [0.25, 0.5, 0.75])
     if not axes or any(isinstance(axis, bool) or axis not in (0, 1, 2) for axis in axes):
-        raise ValueError("DINO view axes must select 0=Z, 1=Y, or 2=X")
+        raise FieldError("DINO view axes must select 0=Z, 1=Y, or 2=X", "views.axes")
     if not fractions or any(not 0 <= float(fraction) <= 1 for fraction in fractions):
-        raise ValueError("DINO slice fractions must lie between 0 and 1")
+        raise FieldError("DINO slice fractions must lie between 0 and 1", "views.fractions")
     percentiles = views.get("percentiles", [1, 99])
     if len(percentiles) != 2 or not 0 <= percentiles[0] < percentiles[1] <= 100:
-        raise ValueError("DINO intensity percentiles must be increasing values between 0 and 100")
+        raise FieldError(
+            "DINO intensity percentiles must be increasing values between 0 and 100",
+            "views.percentiles",
+        )
     if not require_data:
         return
     config = settings.get("config", {})
     data = config.get("data", {})
+    if data.get("source") == "grouped_crops":
+        from morphofeatures.data.distributed_patches import grouped_arrays
+
+        if views.get("mode", "stored") != "stored":
+            raise FieldError(
+                "Saved distributed patches use stored views; select stored mode", "views.mode"
+            )
+        if views.get("normalization", "unit") != "unit":
+            raise FieldError(
+                "Distributed patches already share per-object intensity normalization. Select unit to preserve their relative contrast.",
+                "views.normalization",
+            )
+        with ExitStack() as stack:
+            grouped_arrays(stack, data)
+        return
+    if views.get("mode", "stored") != "stored":
+        from morphofeatures.dino_physical import validate_physical_settings
+
+        validate_physical_settings(settings)
+        return
     if data.get("source") == "n5_masked_patches":
         for key in ("patches_container", "positions_container"):
             if not data.get(key) or not Path(data[key]).is_dir():
-                raise ValueError(f"DINO requires an existing data.{key}")
+                raise FieldError(f"DINO requires an existing data.{key}", "config.data." + key)
         return
     if (
         data.get("crops")
@@ -74,29 +110,41 @@ def validate_dino_settings(settings, *, require_data=True):
             "For whole-object N5 crops from Prepare data, load its generated mae_config.yaml instead."
         )
     if not data.get("crops") or not Path(data["crops"]).exists():
-        raise ValueError(
+        raise FieldError(
             "Select existing prepared intensity crops (.npy, HDF5, or N5). "
             "Load their generated mae_config.yaml under Load model / data settings to fill "
-            "in paths and dataset keys. For grouped N5 patches, load your grouped MAE YAML."
+            "in paths and dataset keys. For grouped N5 patches, load your grouped MAE YAML.",
+            "config.data.crops",
         )
     from morphofeatures.mae3d import _load_label_ids
 
-    with open_crop_array(data) as crops:
+    with at_fields("config.data.crops", "config.data.crops_key"), open_crop_array(data) as crops:
         if crops.ndim not in (4, 5) or not len(crops) or (crops.ndim == 5 and crops.shape[1] != 1):
-            raise ValueError("DINO crops must have shape (N,Z,Y,X) or (N,1,Z,Y,X)")
-        if data.get("label_ids") is None and not settings.get("sequential_ids", False):
-            raise ValueError(
-                "DINO requires original object IDs; explicitly enable sequential IDs only when row-number IDs are intended"
+            raise FieldError(
+                "DINO crops must have shape (N,Z,Y,X) or (N,1,Z,Y,X)", "config.data.crops"
             )
-        _load_label_ids(config, len(crops))
+        if data.get("label_ids") is None and not settings.get("sequential_ids", False):
+            raise FieldError(
+                "DINO requires original object IDs; explicitly enable sequential IDs only when row-number IDs are intended",
+                "config.data.label_ids",
+            )
+        with at_fields("config.data.label_ids", "config.data.label_ids_key"):
+            _load_label_ids(config, len(crops))
         if data.get("loss_masks"):
-            with open_crop_array(data, "loss_masks") as masks:
+            with (
+                at_fields("config.data.loss_masks", "config.data.loss_masks_key"),
+                open_crop_array(data, "loss_masks") as masks,
+            ):
                 expected = (len(crops),) + tuple(crops.shape[-3:])
                 if masks.shape not in (expected, (len(crops), 1) + expected[1:]):
-                    raise ValueError("DINO masks must match the crop count and spatial dimensions")
+                    raise FieldError(
+                        "DINO masks must match the crop count and spatial dimensions",
+                        "config.data.loss_masks",
+                    )
         if views.get("normalization") == "dtype" and not np.issubdtype(crops.dtype, np.integer):
-            raise ValueError(
-                "DINO dtype normalization needs integer crops; use unit or foreground_percentile for preprocessed float crops"
+            raise FieldError(
+                "DINO dtype normalization needs integer crops; use unit or foreground_percentile for preprocessed float crops",
+                "views.normalization",
             )
 
 
@@ -120,7 +168,7 @@ def load_backbone(settings):
     return model.eval()
 
 
-def microscopy_views(raw, mask, settings):
+def microscopy_views(raw, mask, settings, *, with_mask=False):
     """Yield RGB tensors: selected axial slices, normalized, resized and ImageNet scaled."""
     import torch
     import torch.nn.functional as functional
@@ -178,27 +226,89 @@ def microscopy_views(raw, mask, settings):
             plane = torch.from_numpy(np.ascontiguousarray(np.take(raw, index, axis=axis)))[
                 None, None
             ]
+            foreground = torch.from_numpy(np.ascontiguousarray(np.take(mask, index, axis=axis))).float()[None, None]
             if resize == "letterbox":
-                scale = size / max(plane.shape[-2:])
-                shape = tuple(max(1, round(s * scale)) for s in plane.shape[-2:])
+                spacing = np.asarray(settings.get("spacing_zyx", [1.0, 1.0, 1.0]), dtype=float)
+                if spacing.shape != (3,) or not np.isfinite(spacing).all() or np.any(spacing <= 0):
+                    raise ValueError("View spacing_zyx must contain three positive voxel sizes")
+                extent = np.asarray(plane.shape[-2:]) * spacing[[d for d in range(3) if d != axis]]
+                scale = size / max(extent)
+                shape = tuple(max(1, round(s * scale)) for s in extent)
                 plane = functional.interpolate(
                     plane, size=shape, mode="bilinear", align_corners=False, antialias=True
                 )
                 dy, dx = size - shape[0], size - shape[1]
                 plane = functional.pad(plane, (dx // 2, dx - dx // 2, dy // 2, dy - dy // 2))
+                foreground = functional.interpolate(foreground, size=shape, mode="area")
+                foreground = functional.pad(foreground, (dx // 2, dx - dx // 2, dy // 2, dy - dy // 2))
             elif resize == "stretch":
                 plane = functional.interpolate(
                     plane, size=(size, size), mode="bilinear", align_corners=False, antialias=True
                 )
+                foreground = functional.interpolate(foreground, size=(size, size), mode="area")
             else:
                 raise ValueError("resize must be stretch or letterbox")
-            yield (plane[0].expand(3, -1, -1) - mean) / std
+            tensor = (plane[0].expand(3, -1, -1) - mean) / std
+            yield (tensor, foreground[0, 0]) if with_mask else tensor
 
 
-def object_readers(config):
+def pool_tokens(result, masks, feature, stride):
+    """Pool spatial tokens only; official outputs already exclude CLS/register tokens."""
+    import torch.nn.functional as functional
+
+    if feature == "cls":
+        return result["x_norm_clstoken"]
+    tokens = result["x_norm_patchtokens"]
+    if feature == "patch_mean":
+        return tokens.mean(1)
+    if feature != "foreground_mean":
+        raise ValueError("DINO feature must be cls, patch_mean, or foreground_mean")
+    height, width = masks.shape[-2:]
+    weights = functional.avg_pool2d(masks[:, None].float(), stride, stride).flatten(1)
+    if tokens.shape[1] != (height // stride) * (width // stride):
+        raise ValueError("Backbone spatial token count does not match the input mask grid")
+    denominator = weights.sum(1, keepdim=True)
+    if (denominator <= 0).any():
+        raise ValueError("Cannot pool an empty foreground mask")
+    return (tokens * weights.to(tokens.dtype)[..., None]).sum(1) / denominator
+
+
+def object_readers(config, *, object_selection=None, selection_report=None):
     """Yield ID plus a lazy reader so individual object failures can be recorded."""
     data = config.get("data", {})
-    if data.get("source") == "n5_masked_patches":
+    def selected_rows(ids):
+        from morphofeatures.data.object_selection import select_objects, selection_active
+
+        if not selection_active(object_selection):
+            return enumerate(ids)
+        import pandas as pd
+
+        table, _ = select_objects(pd.DataFrame({"label_id": ids}), object_selection, report=selection_report)
+        keep = set(map(int, table.label_id))
+        return ((i, label_id) for i, label_id in enumerate(ids) if int(label_id) in keep)
+
+    if data.get("source") == "grouped_crops":
+        from morphofeatures.data.distributed_patches import grouped_arrays
+
+        with ExitStack() as stack:
+            crops, masks, ids, offsets = grouped_arrays(stack, data)
+            for i, label_id in selected_rows(ids):
+
+                def read(i=i):
+                    for row in range(int(offsets[i]), int(offsets[i + 1])):
+                        raw, mask = np.asarray(crops[row]), np.asarray(masks[row])
+                        if (
+                            not np.isfinite(raw).all()
+                            or not np.isfinite(mask).all()
+                            or np.any((mask != 0) & (mask != 1))
+                        ):
+                            raise ValueError(
+                                "Distributed patch pixels must be finite and masks binary"
+                            )
+                        yield raw, mask.astype(bool)
+
+                yield int(label_id), read
+    elif data.get("source") == "n5_masked_patches":
         from morphofeatures.real_mae import prepare_real_mae_data, resolve_real_mae_config
 
         with tempfile.TemporaryDirectory() as folder:
@@ -206,7 +316,7 @@ def object_readers(config):
             path.write_text(yaml.safe_dump(config))
             prepared = prepare_real_mae_data(resolve_real_mae_config(path))
         dataset = prepared.dataset(config.get("inference", {}).get("split", "all"), "encode")
-        for i, label_id in enumerate(dataset.label_ids):
+        for i, label_id in selected_rows(dataset.label_ids):
 
             def read(i=i):
                 group = dataset.read_group(i)
@@ -233,7 +343,7 @@ def object_readers(config):
                 if data.get("loss_masks")
                 else None
             )
-            for i, label_id in enumerate(ids):
+            for i, label_id in selected_rows(ids):
 
                 def read(i=i):
                     raw = np.asarray(crops[i])
@@ -259,7 +369,7 @@ def object_readers(config):
                 yield int(label_id), read
 
 
-def extract_dino(settings, progress=None, *, backbone=None):
+def extract_dino(settings, progress=None, *, backbone=None, selection_report=None):
     import torch
 
     from morphofeatures.training_runtime import resolve_device
@@ -267,7 +377,16 @@ def extract_dino(settings, progress=None, *, backbone=None):
     torch.manual_seed(int(settings.get("config", {}).get("seed", 42)))
     device = resolve_device(settings.get("config", {}).get("device", "auto"))
     model = (backbone if backbone is not None else load_backbone(settings)).to(device).eval()
-    views = settings.get("views", {})
+    views = dict(settings.get("views", {}))
+    grouped = settings["config"].get("data", {}).get("source") == "grouped_crops"
+    if grouped:
+        if views.get("normalization", "unit") != "unit":
+            raise ValueError("Distributed patches require views.normalization=unit")
+        views.setdefault("normalization", "unit")
+        views.setdefault("resize", "letterbox")
+        recipe = settings["config"]["data"].get("patch_recipe", {})
+        if recipe.get("sampling") == "native_voxels":
+            views["spacing_zyx"] = recipe["saved_voxel_size_um"]
     size = int(views.get("size", 224))
     stride = 14 if settings["model"] == "dinov2" else 16
     if size % stride:
@@ -275,35 +394,57 @@ def extract_dino(settings, progress=None, *, backbone=None):
     batch_size = int(views.get("batch_size", 16))
     feature = views.get("feature", "cls")
     aggregation = views.get("aggregation", "mean")
-    if batch_size < 1 or feature not in {"cls", "patch_mean"} or aggregation not in {"mean", "max"}:
+    if (
+        batch_size < 1
+        or feature not in {"cls", "patch_mean", "foreground_mean"}
+        or aggregation not in {"mean", "max"}
+    ):
         raise ValueError("Use positive batch_size, feature=cls/patch_mean, aggregation=mean/max")
     ids, embeddings, excluded = [], [], []
     with torch.inference_mode():
-        for label_id, read in object_readers(settings["config"]):
+        for label_id, read in object_readers(
+            settings["config"], object_selection=settings.get("object_selection"),
+            selection_report=selection_report,
+        ):
             try:
-                pending, vectors = [], []
+                pending, masks = [], []
+                accumulated, view_count = None, 0
 
-                def flush(pending=pending, vectors=vectors):
+                def flush(pending=pending, masks=masks):
+                    nonlocal accumulated, view_count
                     result = model.forward_features(torch.stack(pending).to(device))
-                    encoded = (
-                        result["x_norm_clstoken"]
-                        if feature == "cls"
-                        else result["x_norm_patchtokens"].mean(1)
+                    encoded = pool_tokens(result, torch.stack(masks).to(device), feature, stride)
+                    values = encoded.cpu().float().numpy()
+                    reduced = (
+                        values.sum(0, dtype=np.float64) if aggregation == "mean" else values.max(0)
                     )
-                    vectors.append(encoded.cpu().float().numpy())
+                    accumulated = (
+                        reduced
+                        if accumulated is None
+                        else accumulated + reduced
+                        if aggregation == "mean"
+                        else np.maximum(accumulated, reduced)
+                    )
+                    view_count += len(values)
                     pending.clear()
+                    masks.clear()
 
                 for raw, mask in read():
-                    for view in microscopy_views(raw, mask, views):
+                    for view, foreground in microscopy_views(raw, mask, views, with_mask=True):
+                        if (grouped or feature == "foreground_mean") and not foreground.any():
+                            continue
                         pending.append(view)
+                        masks.append(foreground)
                         if len(pending) == batch_size:
                             flush()
                 if pending:
                     flush()
-                if not vectors:
+                if not view_count:
                     raise ValueError("No usable views")
-                vectors = np.concatenate(vectors)
-                vector = vectors.mean(0) if aggregation == "mean" else vectors.max(0)
+                vector = np.asarray(
+                    accumulated / view_count if aggregation == "mean" else accumulated,
+                    dtype=np.float32,
+                )
                 if not np.isfinite(vector).all():
                     raise ValueError("Backbone produced nonfinite features")
                 ids.append(label_id)

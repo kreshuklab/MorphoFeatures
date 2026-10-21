@@ -1,0 +1,35 @@
+# Portable template: replace every /path/to value, or extend this file in a site config.
+inputs:
+  expression: /path/to/spatial_expr_df_binarized.tsv  # label_id = nucleus ID
+  mapping: /path/to/cells_to_nuclei.tsv
+  morphology:
+    MorphoFeatures: /path/to/morphofeatures_all_cells.npy  # column 0 = cell ID
+    DINO: /path/to/original_embeddings.npz  # label_ids = cell IDs
+  nucleus_table: /path/to/nuclei/default.tsv
+  cell_table: /path/to/cells/default.tsv
+  bilateral: /path/to/cells/symmetric_cells.tsv
+  manual_labels: /path/to/class_labels.tsv  # Display only; never a training input.
+  gene_metadata_h5ad: null  # Optional var/XLOC, var/vis_name; no expression matrix read.
+output_root: /path/to/new/results/shared_space
+analysis:
+  seed: 42
+  threads: 2
+  max_cells: 4000  # Uniform CPU pilot sample; null uses all eligible matched cells.
+  schemes: [random_pair_grouped, spatial]
+  test_fraction: 0.25  # Fraction of groups; cell counts can differ between schemes.
+  spatial_regions: 12
+  morphology_pcs: 40  # Train-centered/L2/PCA, then train-standardized PC scores.
+  factors: 10
+  cca_ridge: 0.1  # Multiplier of mean covariance diagonal in each view.
+  mofa_iterations: 300
+  mofa_head_ridge: 0.01  # Ridge alpha = training cells * this value.
+  neural_epochs: 60
+  neural_hidden: 64
+  methods: [rcca, pls, mofa2_ridge, paired_neural, rcca_shuffled]
+  logistic_c: 1.0
+  min_test_class: 10  # Per-gene AP/AUC support rule; never changes model training.
+  retrieval_cells: 800  # Same saved candidate sample across methods within each scheme.
+  retrieval_k: 10
+  plot_cells: 500
+  run_umap: true
+  umap_methods: [rcca, mofa2_ridge, paired_neural]

@@ -6,7 +6,7 @@ import re
 import shlex
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Mapping, Optional, Protocol, Sequence, Tuple
 
@@ -186,13 +186,59 @@ class ClusterProfile:
 def load_cluster_profiles(path: Path) -> Dict[str, ClusterProfile]:
     with Path(path).open("r", encoding="utf-8") as stream:
         raw = yaml.safe_load(stream) or {}
+    return cluster_profiles_from_mapping(raw)
+
+
+def cluster_profile_source(slurm) -> str:
+    """Explicit source wins; older path-only workspace YAMLs retain file behavior."""
+    source = slurm.get("preset_source", "workspace" if slurm.get("resource_presets") else "file")
+    if source not in ("workspace", "file"):
+        raise ValueError("slurm.preset_source must be workspace or file")
+    return source
+
+
+def cluster_profile_values(profile: ClusterProfile) -> dict:
+    """Return a portable resource mapping, without the enclosing preset name."""
+    values = asdict(profile)
+    values.pop("name")
+    values["setup"] = [list(command) for command in profile.setup]
+    values["mail_types"] = list(profile.mail_types)
+    values["local_runtime_directories"] = list(profile.local_runtime_directories)
+    return values
+
+
+def cluster_profiles_from_mapping(raw) -> Dict[str, ClusterProfile]:
+    """Validate file or workspace presets with the same scheduler contract."""
+    if not isinstance(raw, dict):
+        raise ValueError("Cluster profile YAML must contain a non-empty profiles mapping")
     values = raw.get("profiles", raw)
     if not isinstance(values, dict) or not values:
         raise ValueError("Cluster profile YAML must contain a non-empty profiles mapping")
-    return {
-        name: ClusterProfile.from_mapping(name, config or {})
-        for name, config in values.items()
-    }
+    profiles = {}
+    for name, config in values.items():
+        try:
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("preset names must be nonempty text")
+            config = {} if config is None else config
+            if not isinstance(config, dict):
+                raise ValueError("resources must be a mapping")
+            for key in ("cpus", "gpus", "nodes", "ntasks", "ntasks_per_node"):
+                if key in config:
+                    value = config[key]
+                    try:
+                        if isinstance(value, bool) or int(value) != float(value):
+                            raise ValueError()
+                    except (ValueError, TypeError, OverflowError) as error:
+                        raise ValueError(f"{key} must be a whole number; received {value!r}") from error
+            setup = config.get("setup", [])
+            if not isinstance(setup, (list, tuple)) or any(
+                not isinstance(command, (list, tuple)) for command in setup
+            ):
+                raise ValueError("setup must be a list of argument lists, e.g. [[module, load, CUDA/12.8]]")
+            profiles[name] = ClusterProfile.from_mapping(name, config)
+        except (ValueError, TypeError, OverflowError) as error:
+            raise ValueError(f"Preset {name!r}: {error}") from error
+    return profiles
 
 
 def _validate_setup(command: Sequence[str]) -> None:

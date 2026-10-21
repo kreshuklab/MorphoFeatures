@@ -1,4 +1,4 @@
-"""Resolve versioned PlatyBrowser sources and published object bounds for inspection."""
+"""Resolve versioned PlatyBrowser volumes and object bounds for inspection and crops."""
 
 import hashlib
 import json
@@ -22,6 +22,8 @@ DEFAULTS = {
     "dataset": "1.0.1",
     "raw_level": 3,
     "segmentation_level": 0,
+    "raw_source": "raw",
+    "segmentation_source": "nuclei",
     "object_ids": "cell",
     "cache_size_mb": 1024,
     "cache_version": "1",
@@ -30,6 +32,8 @@ DEFAULTS = {
 
 
 def _atomic_bytes(path, content):
+    if path.is_file() and path.read_bytes() == content:
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
         temporary = Path(stream.name)
@@ -123,12 +127,8 @@ def validate_index_reference(settings):
             raise ValueError("Published bounds require the resolved ZYX image axes and channel")
 
 
-def resolve_platybrowser(config, *, cache_directory=None):
-    """Fetch metadata and tables only; never fetch image blocks or scan a volume."""
-    config = deepcopy(config)
-    options = {**DEFAULTS, **config.get("inspection", {}).get("platybrowser", {})}
-    if cache_directory is not None:
-        options.setdefault("cache_directory", str(cache_directory))
+def _project_sources(options):
+    options = {**DEFAULTS, **options}
     cache = HttpCache(options)
     options["cache_directory"] = str(cache.root)
     project = urlsplit(remote_url(options["project_url"]))
@@ -157,44 +157,76 @@ def resolve_platybrowser(config, *, cache_directory=None):
     base = f"https://raw.githubusercontent.com/{repository}/{revision}/data/{dataset}/"
     dataset_url, contents = _linked_file(cache, base + "dataset.json")
     sources = json.loads(contents)["sources"]
+    options["revision"] = revision
+    return options, cache, base, dataset_url, sources
+
+
+def list_platybrowser_sources(options):
+    """List published HTTP N5 images and segmentations without reading pixels."""
+    options, _, _, _, sources = _project_sources(options)
+    choices = {"image": [], "segmentation": []}
+    for name, entry in sources.items():
+        for kind in choices:
+            source = entry.get(kind, {})
+            if "bdv.n5.s3" in source.get("imageData", {}):
+                choices[kind].append(name)
+    return {"options": options, **{kind: sorted(names) for kind, names in choices.items()}}
+
+
+def resolve_platybrowser(config, *, cache_directory=None):
+    """Fetch metadata and tables only; never fetch image blocks or scan a volume."""
+    config = deepcopy(config)
+    options = {**DEFAULTS, **config.get("inspection", {}).get("platybrowser", {})}
+    if cache_directory is not None:
+        options.setdefault("cache_directory", str(cache_directory))
+    options, cache, base, dataset_url, sources = _project_sources(options)
+    revision, dataset = options["revision"], options["dataset"]
     try:
-        nuclei_source = sources["nuclei"]["segmentation"]
-        raw_source = sources["raw"]["image"]
+        instance_source = sources[options["segmentation_source"]]["segmentation"]
+        raw_source = sources[options["raw_source"]]["image"]
         raw = _image_source(cache, base, raw_source, options["raw_level"], options)
         segmentation = _image_source(
-            cache, base, nuclei_source, options["segmentation_level"], options
+            cache, base, instance_source, options["segmentation_level"], options
         )
         table_url, table_content = _linked_file(
             cache,
             urljoin(
-                base, nuclei_source["tableData"]["tsv"]["relativePath"].rstrip("/") + "/default.tsv"
+                base,
+                instance_source["tableData"]["tsv"]["relativePath"].rstrip("/") + "/default.tsv",
             ),
         )
     except KeyError as error:
         raise ValueError(
-            "Project needs raw and nuclei bdv.n5.s3 sources and a nucleus TSV table"
+            "Choose published bdv.n5.s3 image/segmentation sources with an object TSV table"
         ) from error
     mapping_url = None
-    if options["object_ids"] == "cell":
+    if options["object_ids"] == "cell" and options["segmentation_source"] == "nuclei":
         folder = sources["cells"]["segmentation"]["tableData"]["tsv"]["relativePath"]
         mapping_url, mapping_content = _linked_file(
             cache, urljoin(base, folder.rstrip("/") + "/cells_to_nuclei.tsv")
         )
-    elif options["object_ids"] != "nucleus":
-        raise ValueError("Embedding object IDs must be cell or nucleus IDs")
+    elif options["object_ids"] not in {"nucleus", "segmentation"}:
+        raise ValueError(
+            "Use segmentation IDs for this source; cell-to-nucleus mapping requires nuclei"
+        )
     signature = hashlib.sha256(
         json.dumps(
             [revision, dataset, segmentation, options["cache_version"]], sort_keys=True
         ).encode()
     ).hexdigest()
     directory = cache.root / "catalogs" / signature
-    table_path = directory / "nuclei.tsv"
+    table_path = directory / "instances.tsv"
     _atomic_bytes(table_path, table_content)
     table = read_id_table(table_path)
     spacing, origin = (
         np.asarray(segmentation["spacing_zyx"]),
         np.asarray(segmentation["origin_zyx"]),
     )
+    required = [prefix + axis for prefix in ("bb_min_", "bb_max_") for axis in "zyx"]
+    if not set(required) <= set(table.columns):
+        raise ValueError(
+            "The selected segmentation needs a published table with bb_min/max_x/y/z physical object bounds"
+        )
     lower = table[["bb_min_" + a for a in "zyx"]].to_numpy(dtype=float)
     upper = table[["bb_max_" + a for a in "zyx"]].to_numpy(dtype=float)
     if not np.isfinite(lower).all() or not np.isfinite(upper).all() or np.any(upper < lower):
@@ -227,12 +259,18 @@ def resolve_platybrowser(config, *, cache_directory=None):
         "revision": revision,
         "dataset": dataset,
         "dataset_url": dataset_url,
-        "nucleus_table_url": table_url,
+        "object_table_url": table_url,
+        "raw_source": options["raw_source"],
+        "segmentation_source": options["segmentation_source"],
         "mapping_url": mapping_url,
-        "nucleus_table_sha256": hashlib.sha256(table_content).hexdigest(),
+        "object_table_sha256": hashlib.sha256(table_content).hexdigest(),
         "raw": raw,
         "segmentation": segmentation,
     }
+    if options["segmentation_source"] == "nuclei":
+        provenance.update(
+            nucleus_table_url=table_url, nucleus_table_sha256=provenance["object_table_sha256"]
+        )
     write_json_atomic(directory / "source.json", provenance)
     mesh = {
         **config.get("inspection", {}).get("mesh", {}),
@@ -268,3 +306,53 @@ def resolve_platybrowser(config, *, cache_directory=None):
         platybrowser={**options, "revision": revision}, mesh=mesh
     )
     return config
+
+
+def resolve_platybrowser_preprocessing(settings):
+    """Resolve a Workflow source into aligned, catalog-indexed crop preparation."""
+    options = {**settings.get("platybrowser", {}), "object_ids": "segmentation"}
+    resolved = resolve_platybrowser({"inspection": {"platybrowser": options}})
+    mesh, data = resolved["inspection"]["mesh"], resolved["data"]
+    raw = mesh["remote_provenance"]["raw"]
+    segmentation = mesh["remote_provenance"]["segmentation"]
+    if raw["shape_zyx"] != segmentation["shape_zyx"] or any(
+        not np.allclose(raw[key], segmentation[key], rtol=1e-6, atol=1e-8)
+        for key in ("spacing_zyx", "origin_zyx")
+    ):
+        raise ValueError(
+            "The selected PlatyBrowser volumes are on different grids. "
+            f"Raw: {raw['shape_zyx']} at {raw['spacing_zyx']} µm; "
+            f"segmentation: {segmentation['shape_zyx']} at {segmentation['spacing_zyx']} µm. "
+            "Choose aligned resolution levels (raw 3 / nuclei 0 for dataset 1.0.1), "
+            "or resample the volumes locally first."
+        )
+    return {
+        **deepcopy(settings),
+        **{
+            key: mesh[key]
+            for key in (
+                "segmentation",
+                "segmentation_key",
+                "segmentation_axes",
+                "segmentation_channel",
+                "spacing_zyx",
+                "origin_zyx",
+                "unit",
+                "object_index",
+                "index_reference",
+                "remote_options",
+                "remote_provenance",
+            )
+        },
+        "source": "platybrowser",
+        "raw": data["raw"],
+        "raw_key": data["raw_key"],
+        "raw_axes": "zyx",
+        "raw_channel": 0,
+        "raw_spacing_zyx": raw["spacing_zyx"],
+        "raw_origin_zyx": raw["origin_zyx"],
+        "segmentation_spacing_zyx": segmentation["spacing_zyx"],
+        "segmentation_origin_zyx": segmentation["origin_zyx"],
+        "platybrowser": resolved["inspection"]["platybrowser"],
+        "inspection_config": resolved["inspection"],
+    }

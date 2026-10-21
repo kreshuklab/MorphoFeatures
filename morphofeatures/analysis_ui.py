@@ -10,17 +10,231 @@ import streamlit as st
 
 from morphofeatures.analysis.object_inspection import input_config_for_result, neighbor_sheet
 from morphofeatures.analysis.visualization import (
+    confusion_figure,
     figure_bytes,
     interactive_projection,
     projection_figure,
     projection_panels,
     selected_object_ids,
 )
+from morphofeatures.workspace_navigation import selector_key
+
+
+def evaluation_results(metrics, title, *, key):
+    """Render saved evaluation evidence, including reports created before figure exports."""
+    import matplotlib.pyplot as plt
+
+    st.subheader(title)
+    if "confusion_matrix" not in metrics:
+        st.info(
+            "No matched known labels are available for this evaluation. Predictions alone cannot provide an accuracy score or confusion matrix."
+        )
+        if "assigned_fraction" in metrics:
+            st.metric("Objects assigned a label", f"{metrics['assigned_fraction']:.1%}")
+        return
+    counts = np.asarray(metrics["confusion_matrix"])
+    labels = metrics.get("confusion_labels", metrics.get("classes"))
+    per_class = metrics.get("per_class", {})
+    accuracy = metrics.get(
+        "accuracy", float(np.trace(counts) / counts.sum()) if counts.sum() else None
+    )
+    balanced = metrics.get("balanced_accuracy", per_class.get("macro avg", {}).get("recall"))
+    macro_f1 = metrics.get("macro_f1", per_class.get("macro avg", {}).get("f1-score"))
+    for column, (name, value) in zip(
+        st.columns(3),
+        (("Accuracy", accuracy), ("Balanced accuracy", balanced), ("Macro F1", macro_f1)),
+    ):
+        if value is not None:
+            column.metric(name, f"{value:.1%}")
+    st.caption(
+        "Accuracy weights every object equally; balanced accuracy averages recall across cell types; macro F1 averages their precision/recall scores. Compare the same metric, classifier, object IDs and validation splits across runs."
+    )
+    st.caption(
+        "Confusion matrix: rows are known classes; columns are predicted classes. A strong diagonal indicates agreement. ‘unknown’ includes rejected predictions; novel target types are evaluated as unknown. A dash denotes a class with no evaluated objects."
+    )
+    mode = st.selectbox(
+        "Confusion matrix values",
+        ["Percent of each known class", "Object counts"],
+        key=key + ":mode",
+        help="Percentages make rare and common cell types easier to compare. Counts show how many objects support each result. Both display the same saved predictions; changing the view does not retrain the classifier.",
+    )
+    figure = confusion_figure(counts, labels, title, normalize=mode.startswith("Percent"))
+    try:
+        st.pyplot(figure)
+        for column, suffix in zip(st.columns(2), ("svg", "png")):
+            column.download_button(
+                "Download confusion matrix " + suffix.upper(),
+                figure_bytes(figure, suffix),
+                "confusion_matrix." + suffix,
+                key=key + ":" + suffix,
+            )
+    finally:
+        plt.close(figure)
+    table = pd.DataFrame(counts, index=labels, columns=labels)
+    st.download_button(
+        "Download confusion counts TSV",
+        table.to_csv(sep="\t", index_label="known_label"),
+        "confusion_matrix.tsv",
+        key=key + ":tsv",
+    )
+    with st.expander("Per-class scores and evaluation details"):
+        if per_class:
+            st.dataframe(
+                pd.DataFrame({k: v for k, v in per_class.items() if isinstance(v, dict)}).T
+            )
+        st.json({k: v for k, v in metrics.items() if k not in {"confusion_matrix", "per_class"}})
+
+
+def classification_results(metadata, path):
+    """One classification section for ordinary and multi-representation results."""
+    from morphofeatures.analysis.classification import classifier_space
+
+    entries = metadata.get("representations", {"Embedding": metadata})
+    entries = {
+        name: entry["classification"]
+        for name, entry in entries.items()
+        if entry.get("classification")
+    }
+    if not entries:
+        return
+    st.subheader("Classification check")
+    key = "classification:" + str(path)
+    name = (
+        st.selectbox(
+            "Classification representation",
+            list(entries),
+            key=key + ":representation",
+            help="Select the representation evaluated by the classifier. Classification can use its full features or training-fitted PCA/UMAP coordinates, with the configured scaling. These differ from the exploratory map fitted to all objects. Compare representations on matched objects and the same folds.",
+        )
+        if len(entries) > 1
+        else next(iter(entries))
+    )
+    evaluation = entries[name]
+    settings = evaluation.get("settings", metadata.get("classification_settings", metadata.get("settings", {})))
+    space = classifier_space(settings)
+    dimensions = settings.get("classifier_dimensions") or settings.get("evaluation_pca") or 2
+    st.caption(
+        f"Classification input: {space} ({dimensions if space != 'embeddings' else 'all'} dimensions); "
+        f"feature scaling before projection: {settings.get('normalization', 'standardize')}; "
+        f"standardize selected dimensions: {settings.get('classifier_standardize', False)}. "
+        "Scores pool held-out predictions across folds."
+    )
+    st.caption(
+        f"{evaluation['evaluated_objects']} labeled objects evaluated; "
+        f"{len(evaluation.get('excluded_object_ids', []))} objects excluded for missing labels or insufficient class counts. "
+        "Predictions are held out; learned preprocessing is fitted within training folds."
+    )
+    if evaluation.get("fold_metrics"):
+        with st.expander("Scores for individual validation folds"):
+            st.dataframe(pd.DataFrame(evaluation["fold_metrics"]))
+    models = evaluation["classifiers"]
+    labels = {
+        "linear": "Logistic regression",
+        "logistic": "Logistic regression",
+        "mlp": "MLP",
+        "knn": "K-nearest neighbors",
+    }
+    model = st.selectbox(
+        "Evaluated classifier",
+        list(models),
+        format_func=lambda v: labels.get(v, v),
+        key=key + ":" + name + ":model",
+        help="Choose a classifier already evaluated in this saved report. Its scores and confusion matrix use held-out predictions. Selecting it only changes the display; it does not fit a new model.",
+    )
+    evaluation_results(
+        models[model], name + " · " + labels.get(model, model), key=key + ":" + name + ":" + model
+    )
+
+
+def mobie_export_start(config, metadata, path):
+    from morphofeatures.analysis.mobie_export import export_source_defaults
+    from morphofeatures.workflow_ui import navigate, use_draft
+    from morphofeatures.workspace_state import new_draft
+
+    with st.expander("Export this analysis to MoBIE"):
+        st.caption(
+            "Bring raw images, original segmentation, clusters, known/predicted labels and saved "
+            "UMAP/PCA coordinates into Fiji's MoBIE viewer. Comparison results include every "
+            "representation. Choose a portable region or published PlatyBrowser streaming on "
+            "the next page, then review and run the export job."
+        )
+        if st.button("Create MoBIE export workflow", key="mobie-start:" + str(path)):
+            name = next(iter(metadata.get("representations", {})), None)
+            source = export_source_defaults(input_config_for_result(metadata, name))
+            stage = {
+                **source,
+                "action": "export_mobie",
+                "analysis": str(path),
+                "mode": "platybrowser" if source.get("platybrowser") else "portable",
+            }
+            draft = new_draft(
+                "export_mobie",
+                document={
+                    "stages": [stage],
+                    "slurm": {"cpus": 4, "gpus": 0, "memory": "8G", "time": "01:00:00"},
+                },
+            )
+            use_draft(config, draft, "Analyze")
+            navigate("Workflow")
+
+
+def mobie_export_results(metadata, path):
+    from morphofeatures.analysis.mobie_export import _inside
+
+    project = _inside(path.parent, metadata["project"])
+    st.success("MoBIE project exported")
+    st.code(str(project), language=None)
+    st.caption(
+        "In Fiji, search for Open MoBIE Project (Expert Mode) and select this project folder. "
+        + (
+            "Choose Remote/S3 image data; PlatyBrowser images require internet."
+            if metadata["spatial"]["mode"] == "platybrowser"
+            else "Choose Local image data. Copy the entire project folder when sharing."
+        )
+    )
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    k: row[k]
+                    for k in ("name", "embedding_objects", "matched_objects", "excluded_objects")
+                }
+                for row in metadata["representations"]
+            ]
+        ),
+        hide_index=True,
+    )
+    if any(row["excluded_objects"] for row in metadata["representations"]):
+        st.warning(
+            "Some embedding objects have no spatial overlay. Review the excluded-ID tables in the project's misc folder."
+        )
+    st.caption("ID coverage checked against: " + metadata["spatial"]["coverage_basis"])
+    if metadata.get("archive"):
+        archive = _inside(path.parent, metadata["archive"])
+        if archive.is_file() and archive.stat().st_size <= 200 * 1024**2:
+            with archive.open("rb") as stream:
+                st.download_button(
+                    "Download MoBIE project ZIP",
+                    stream,
+                    "mobie-project.zip",
+                    key="mobie-zip:" + str(path),
+                )
+        else:
+            st.info(
+                "Transfer the project folder or ZIP from disk; it exceeds the browser download limit."
+            )
+            st.code(str(archive), language=None)
+    readme = project / "README.txt"
+    if readme.is_file():
+        with st.expander("Opening and sharing instructions"):
+            st.text(readme.read_text())
+    with st.expander("Export manifest and provenance"):
+        st.json(metadata)
 
 
 def projection_results(frame, metadata, path):
     prefix = "projection:" + str(path)
-    methods = (["umap"] if "umap_1" in frame else []) + ["pca"]
+    methods = (["umap"] if "umap_1" in frame else []) + (["pca"] if "pca_1" in frame else [])
     method = st.selectbox("Projection", methods, key=prefix + ":method")
     opacity = st.slider(
         "Unlabeled point opacity",
@@ -37,10 +251,36 @@ def projection_results(frame, metadata, path):
     )
     for name in frame.representation.unique():
         subset = frame[frame.representation == name]
-        palette = metadata.get("representations", {}).get(name, metadata).get("class_colors")
+        representation = metadata.get("representations", {}).get(name, metadata)
+        palette = representation.get("class_colors")
         if palette:
             subset.attrs["class_colors"] = palette
+        for column in ("cluster", "dataset"):
+            if metadata.get(column + "_colors"):
+                subset.attrs[column + "_colors"] = metadata[column + "_colors"]
         st.subheader(str(name))
+        from morphofeatures.analysis.projection import NORMALIZATION_NAMES
+
+        actual_settings = representation.get("diagnostics", {}).get("projection_settings", metadata.get("settings", {}))
+        normalization = actual_settings.get("normalization", "standardize")
+        fusion = representation.get("extraction", {}).get("fusion_recipe", {})
+        if fusion:
+            st.caption("Feature combination: " + ("raw concatenation (weights ignored)" if fusion.get("combination") == "raw" else "L2-normalized feature blocks with weights"))
+        st.caption("Analysis scaling: " + NORMALIZATION_NAMES.get(normalization, normalization) + ". Saved NPZ files contain the input vectors; this analysis preprocessing is recorded separately.")
+        umap_input = representation.get("diagnostics", {}).get("umap_input")
+        if method == "umap" and umap_input:
+            from morphofeatures.analysis.projection import umap_input_description
+
+            st.caption(umap_input_description(umap_input))
+        cluster_input = representation.get("diagnostics", {}).get("cluster_input")
+        if cluster_input:
+            st.caption(
+                f"Clustering input: {cluster_input['effective_components']} PCA components "
+                f"({cluster_input['explained_variance_ratio_sum']:.1%} variance retained). "
+                "Cluster labels are computed before the displayed UMAP."
+                if cluster_input["enabled"] else
+                "Clustering uses the embedding vectors after the selected analysis scaling, before the displayed PCA/UMAP."
+            )
         chart = interactive_projection(subset, method, unlabeled_opacity=opacity, point_size=size)
         event = st.plotly_chart(
             chart,
@@ -100,6 +340,85 @@ def projection_results(frame, metadata, path):
                     key=prefix + ":download:" + str(name) + extension,
                 )
     return method
+
+
+def joint_projection_results(config, metadata, path):
+    """Show pooled plots, then route selections to the correct spatial dataset."""
+    frame = pd.read_csv(
+        path.parent / metadata["coordinates"],
+        sep="\t",
+        dtype={"label_id": np.int64, "source_label_id": np.int64},
+        converters={"dataset": str},
+    )
+    st.info(metadata["interpretation"])
+    if not metadata["model_verification"]["verified"]:
+        st.warning(
+            "Same-model compatibility was confirmed by the user; extraction provenance was incomplete for: "
+            + ", ".join(metadata["model_verification"]["unverified_datasets"])
+        )
+    from morphofeatures.provenance_ui import compatibility_details
+
+    compatibility_details(metadata["model_verification"].get("input_compatibility", []))
+    projection_results(frame, metadata, path)
+    st.download_button(
+        "Download joint coordinates and dataset IDs",
+        frame.drop(columns="representation", errors="ignore").to_csv(sep="\t", index=False),
+        "joint-coordinates.tsv",
+    )
+    archive = path.parent / "export.zip"
+    if archive.is_file():
+        if archive.stat().st_size <= 200 * 1024**2:
+            with archive.open("rb") as stream:
+                st.download_button(
+                    "Download all datasets, shared figures and reports", stream, "joint-analysis.zip"
+                )
+        else:
+            st.caption(f"This archive exceeds the 200 MB browser limit. Retrieve it from: {archive}")
+    with st.expander("Shared projection settings and provenance"):
+        st.json(metadata)
+    st.subheader("Inspect or export one dataset")
+    st.caption(
+        "Choose the dataset whose raw image and segmentation you want to inspect. Object IDs below are the original IDs for that dataset; coordinates and clusters remain those of the shared fit. Nearest-neighbor inspection here searches within the selected dataset."
+    )
+    name = st.selectbox(
+        "Dataset to inspect / export",
+        [dataset["name"] for dataset in metadata["settings"]["datasets"]],
+        key=selector_key("joint-dataset:" + str(path)),
+    )
+    entry = metadata["datasets"][name]
+    child = path.parent / entry["report"]
+    native_metadata = json.loads(child.read_text())
+    native_frame = pd.read_csv(
+        child.parent / "coordinates.tsv", sep="\t", dtype={"label_id": np.int64}
+    )
+    st.caption(
+        f"{entry['projected_objects']} of {entry['objects']} objects projected. Per-dataset report: {child}"
+    )
+    st.download_button(
+        "Download this dataset's shared coordinates",
+        native_frame.to_csv(sep="\t", index=False),
+        "dataset-coordinates.tsv",
+        key="joint-native:" + str(path),
+    )
+    mapping = frame[frame.dataset == name].set_index("label_id").source_label_id.to_dict()
+    for source_key, target_key in (
+        ("comparison:" + str(path) + ":Embedding", "comparison:" + str(child) + ":Embedding"),
+        ("picked:" + str(path) + ":Embedding", "picked:" + str(child) + ":Embedding"),
+    ):
+        selected = st.session_state.get(source_key, [])
+        signature = (name, tuple(selected))
+        if st.session_state.get(target_key + ":joint-sync") != signature:
+            native_ids = [int(mapping[value]) for value in selected if value in mapping]
+            st.session_state[target_key] = (
+                list(dict.fromkeys(st.session_state.get(target_key, []) + native_ids))
+                if source_key.startswith("comparison:")
+                else native_ids
+            )
+            st.session_state[target_key + ":joint-sync"] = signature
+    mobie_export_start(config, native_metadata, child)
+    inspect_results(
+        config, {"Embedding": child.parent / "embeddings.npz"}, native_metadata, native_frame, child
+    )
 
 
 def inspect_results(config, embeddings, metadata, frame, path):
@@ -204,7 +523,8 @@ def inspect_results(config, embeddings, metadata, frame, path):
             + (["PCA"] if "pca_1" in frame else [])
         )
         space = st.selectbox("Find neighbors in", spaces, key=prefix + ":space")
-        normalization = metadata.get("settings", {}).get("normalization", "standardize")
+        representation = metadata.get("representations", {}).get(name, metadata)
+        normalization = representation.get("diagnostics", {}).get("projection_settings", metadata.get("settings", {})).get("normalization", "standardize")
         if space == "Embedding":
             neighbors = nearest_neighbors(
                 embedding, selected, k=int(count), normalization=normalization
@@ -282,7 +602,7 @@ def inspect_results(config, embeddings, metadata, frame, path):
     if st.button(show_label, key=prefix + ":show"):
         if not source_config.get("data"):
             st.error(
-                "Load the matching mae_config.yaml or grouped N5 data YAML to locate these objects."
+                "Load the matching mae_config.yaml, distributed-patch data_config.yaml or grouped N5 data YAML to locate these objects."
             )
         else:
             try:
@@ -366,12 +686,17 @@ def _inspection_source_controls(source_config, prefix, cache_directory):
         )
     options["object_ids"] = st.selectbox(
         "Embedding IDs refer to",
-        ["cell", "nucleus"],
-        index=["cell", "nucleus"].index(options["object_ids"]),
+        ["cell", "nucleus", "segmentation"],
+        index=["cell", "nucleus", "segmentation"].index(options["object_ids"]),
         key=prefix + ":object_ids",
-        help="Cell IDs use the project's cells_to_nuclei mapping. Nucleus IDs match the published nucleus labels directly.",
+        help="Cell IDs use the published cells_to_nuclei mapping for the nuclei source. Segmentation IDs match the selected source directly and are used by Workflow-prepared crops.",
     )
     with st.expander("Streaming resolution and cache"):
+        for name, label in (
+            ("raw_source", "Published raw image source"),
+            ("segmentation_source", "Published segmentation source"),
+        ):
+            options[name] = st.text_input(label, options[name], key=prefix + ":" + name)
         for field, label in (
             ("raw_level", "Raw resolution level"),
             ("segmentation_level", "Nucleus resolution level"),
@@ -912,7 +1237,12 @@ def _volume_export_start(config, metadata, name, path, source_config):
             ]
             prep = source_config.get("data", {}).get("preprocessing")
             if prep and Path(prep).is_file():
-                settings = json.loads(Path(prep).read_text())["settings"]
+                metadata = json.loads(Path(prep).read_text())
+                settings = metadata["settings"]
+                if metadata.get("layout") == "distributed_patches":
+                    settings = dict(metadata["source"])
+                    settings["spacing_zyx"] = settings["segmentation_spacing_zyx"]
+                    settings["origin_zyx"] = settings["segmentation_origin_zyx"]
                 stage.update(
                     {
                         key: settings[key]
@@ -924,6 +1254,7 @@ def _volume_export_start(config, metadata, name, path, source_config):
                             "spacing_zyx",
                             "origin_zyx",
                             "unit",
+                            "id_mapping",
                         )
                         if key in settings
                     }

@@ -34,6 +34,9 @@ def mesh_source_defaults(config):
                     "segmentation_key",
                     "segmentation_axes",
                     "segmentation_channel",
+                    "segmentation_timepoint",
+                    "remote_options",
+                    "remote_provenance",
                     "spacing_zyx",
                     "origin_zyx",
                     "unit",
@@ -79,6 +82,8 @@ def _surface_from_mask(mask, start, spacing, origin, step):
 
 def _load_object_mesh(config, object_id, settings):
     source = settings.get("source", "prepared")
+    if source == "prepared" and config.get("data", {}).get("source") == "grouped_crops":
+        raise ValueError("Distributed fine patches contain only sampled parts of an object. Select segmentation to render the complete source object using the saved bounds and native ID.")
     spacing = triple(settings.get("spacing_zyx", [1, 1, 1]), "spacing_zyx")
     origin = triple(settings.get("origin_zyx", [0, 0, 0]), "origin_zyx", positive=False)
     unit = settings.get("unit", "voxel")
@@ -168,6 +173,7 @@ def _load_object_mesh(config, object_id, settings):
             settings.get("segmentation_key"),
             settings.get("segmentation_axes", "zyx"),
             settings.get("segmentation_channel", 0),
+            timepoint=settings.get("segmentation_timepoint", 0),
             remote_options=settings.get("remote_options"),
         ) as volume:
             if not np.issubdtype(volume.dtype, np.integer):

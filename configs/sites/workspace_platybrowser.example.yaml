@@ -1,0 +1,76 @@
+# Workflow → Start → Load settings from a file. Paths are relative to this YAML.
+# Prepares a small sample of real objects, trains a crop MAE and analyzes its embeddings.
+# In Prepare data, use "Choose training and embedding stages" for an existing MAE,
+# DINOv2/v3, or both. DINO needs local weights and an official backbone checkout.
+stages:
+  - action: preprocess
+    source: platybrowser
+    platybrowser:
+      project_url: https://github.com/mobie/platybrowser-project
+      revision: 2d231ac5dcd55d6d97436ad544f8fc5791fab3c7
+      dataset: "1.0.1"
+      raw_source: raw
+      segmentation_source: nuclei
+      # These levels share the [0.100, 0.080, 0.080] µm ZYX grid.
+      raw_level: 3
+      segmentation_level: 0
+      cache_directory: ../../outputs/remote_cache/platybrowser
+      cache_size_mb: 1024
+      timeout_seconds: 20
+      cache_version: "1"
+    # No whole-volume scan: published bounds locate each object.
+    # Coordinates and object IDs refer to the selected segmentation, not cell IDs
+    # from the grouped nuclear patch datasets. Use matching annotation IDs.
+    roi: null  # Or [[z0, y0, x0], [z1, y1, x1]] in the selected grid.
+    object_ids: []  # Optional stored segmentation IDs, e.g. [11486].
+    max_objects: 8  # Small initial run. 0 selects all eligible catalog objects.
+    crop_shape: [64, 64, 64]
+    output_format: h5  # npy, h5 or n5; saved locally in the run directory.
+    read_budget_side: 256  # Maximum extent of one streamed object, 8–512 voxels.
+    min_voxels: 10
+    center: bbox
+    oversized: clip  # Increase crop_shape or select skip to retain whole objects only.
+    boundary: pad
+    roi_boundary: skip
+    normalization: dtype
+    background: 0.0
+  - action: train
+    from_preprocessing: true
+    config:
+      seed: 42
+      device: auto
+      mae:
+        architecture_version: position-aware-3d-v2
+        input_shape: [64, 64, 64]
+        patch_size: [8, 8, 8]
+        embedding_dim: 128
+        encoder_depth: 4
+        encoder_heads: 4
+        decoder_dim: 256
+        mask_ratio: 0.75
+      training:
+        epochs: 1  # Increase after inspecting the prepared crops and first results.
+        batch_size: 2
+        learning_rate: 0.001
+        validation_fraction: 0.25
+      inference:
+        batch_size: 2
+  - action: extract
+    name: MAE
+    model: mae
+    from_training: true
+  - action: analyze
+    from_extraction: true
+    normalization: standardize
+    umap: false  # PCA for the initial small sample; enable UMAP for larger runs.
+    clusters: 2
+    seed: 42
+    # annotations: /path/to/nucleus_labels.tsv
+    # label_column: cell_type
+    # group_column: specimen
+slurm:
+  partition: gpu
+  cpus: 4
+  gpus: 1
+  memory: 16G
+  time: '01:00:00'

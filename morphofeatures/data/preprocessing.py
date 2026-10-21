@@ -9,7 +9,7 @@ from __future__ import annotations
 import csv
 import itertools
 import sqlite3
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from pathlib import Path
 
 import numpy as np
@@ -19,8 +19,10 @@ from scipy import ndimage
 from morphofeatures.artifacts import write_json_atomic
 from morphofeatures.data.crop_storage import crop_storage_backend
 from morphofeatures.data.crops import _normalize_crop
+from morphofeatures.data.remote_n5 import is_remote_url
 from morphofeatures.data.volumes import open_volume
 from morphofeatures.representations import fingerprint_file
+from morphofeatures.workflow_validation import FieldError, at_fields
 
 
 def triple(value, name, *, integer=False, positive=True):
@@ -35,10 +37,56 @@ def triple(value, name, *, integer=False, positive=True):
 
 
 def validate_preprocessing(settings):
+    from morphofeatures.data.object_selection import resolve_selection
+
+    resolve_selection(settings.get("object_selection"))
+    if settings.get("layout", "single_crop") == "distributed_patches":
+        from morphofeatures.data.distributed_patches import validate_patch_preparation
+
+        validate_patch_preparation(settings)
+        return
+    if settings.get("layout", "single_crop") != "single_crop":
+        raise FieldError("Choose single_crop or distributed_patches", "layout")
     crop_storage_backend(settings.get("output_format", "npy"))
     for key in ("raw", "segmentation"):
-        if not Path(settings.get(key, "")).exists() or not settings.get(key):
+        if not settings.get(key) or (
+            not is_remote_url(settings[key]) and not Path(settings[key]).exists()
+        ):
             raise ValueError(f"{key} container does not exist")
+    remote = any(is_remote_url(settings[k]) for k in ("raw", "segmentation"))
+    if remote:
+        from morphofeatures.analysis.platybrowser import validate_index_reference
+
+        if settings.get("source") == "ome_zarr":
+            limit = settings.get("max_scan_voxels", 128**3)
+            if not isinstance(limit, int) or not 1 <= limit <= 256**3:
+                raise ValueError("max_scan_voxels must be an integer between 1 and 16777216")
+            roi = settings.get("roi")
+            if roi is None:
+                raise ValueError(
+                    "OME-Zarr preparation requires an explicit bounded ROI; remote volumes are never scanned in full automatically"
+                )
+            bounds = np.asarray(roi)
+            if bounds.shape != (2, 3) or np.prod(bounds[1] - bounds[0], dtype=object) > limit:
+                raise ValueError(
+                    "OME-Zarr ROI exceeds max_scan_voxels; reduce the ROI or choose a coarser level"
+                )
+        else:
+            if (
+                not settings.get("index_reference")
+                or not Path(settings.get("object_index", "")).is_file()
+            ):
+                raise ValueError(
+                    "Remote preprocessing requires published object bounds; connect to PlatyBrowser first"
+                )
+            validate_index_reference(settings)
+        budget = settings.get("read_budget_side", 256)
+        if not isinstance(budget, int) or not 8 <= budget <= 512:
+            raise ValueError("read_budget_side must be an integer between 8 and 512")
+        if np.any(
+            triple(settings.get("crop_shape", [32, 32, 32]), "crop_shape", integer=True) > budget
+        ):
+            raise ValueError("crop_shape exceeds the remote read_budget_side")
     triple(settings.get("crop_shape", [32, 32, 32]), "crop_shape", integer=True)
     triple(settings.get("block_shape", [64, 64, 64]), "block_shape", integer=True)
     spacing = triple(settings.get("spacing_zyx", []), "spacing_zyx")
@@ -71,26 +119,37 @@ def validate_preprocessing(settings):
         raise ValueError("center must be bbox or centroid")
     if not np.isfinite(float(settings.get("background", 0))):
         raise ValueError("background must be finite")
-    with (
-        open_volume(
-            settings["raw"],
-            settings.get("raw_key"),
-            settings.get("raw_axes", "zyx"),
-            settings.get("raw_channel", 0),
-        ) as raw,
-        open_volume(
-            settings["segmentation"],
-            settings.get("segmentation_key"),
-            settings.get("segmentation_axes", "zyx"),
-            settings.get("segmentation_channel", 0),
-        ) as segmentation,
-    ):
+    with ExitStack() as stack:
+        volumes = {}
+        for kind in ("raw", "segmentation"):
+            with at_fields(
+                kind, kind + "_key", kind + "_axes", kind + "_channel", kind + "_timepoint"
+            ):
+                volumes[kind] = stack.enter_context(
+                    open_volume(
+                        settings[kind],
+                        settings.get(kind + "_key"),
+                        settings.get(kind + "_axes", "zyx"),
+                        settings.get(kind + "_channel", 0),
+                        timepoint=settings.get(kind + "_timepoint", 0),
+                        remote_options=settings.get("remote_options"),
+                    )
+                )
+        raw, segmentation = volumes["raw"], volumes["segmentation"]
         if raw.shape != segmentation.shape:
-            raise ValueError(
-                f"Raw/segmentation spatial shapes do not match: {raw.shape} versus {segmentation.shape}"
+            raise FieldError(
+                f"Raw/segmentation spatial shapes do not match: {raw.shape} versus {segmentation.shape}",
+                "raw",
+                "raw_axes",
+                "segmentation",
+                "segmentation_axes",
             )
         if not np.issubdtype(segmentation.dtype, np.integer):
-            raise ValueError("Instance segmentation requires an integer dataset")
+            raise FieldError(
+                "Instance segmentation requires an integer dataset",
+                "segmentation",
+                "segmentation_key",
+            )
         roi = settings.get("roi")
         if roi is not None:
             if not isinstance(roi, (list, tuple)) or len(roi) != 2:
@@ -99,6 +158,59 @@ def validate_preprocessing(settings):
             upper = triple(roi[1], "roi stop", integer=True)
             if np.any(lower < 0) or np.any(upper > raw.shape) or np.any(upper <= lower):
                 raise ValueError("ROI must be within the volume and use half-open ZYX voxel bounds")
+
+
+def _catalog_index(settings, roi_start, roi_stop, db):
+    from morphofeatures.analysis.annotations import read_id_table
+
+    table = read_id_table(settings["object_index"])
+    db.execute(
+        "CREATE TABLE objects (id INTEGER PRIMARY KEY, n INTEGER, z0 INTEGER, y0 INTEGER, x0 INTEGER, z1 INTEGER, y1 INTEGER, x1 INTEGER, sz REAL, sy REAL, sx REAL)"
+    )
+    for row in table.to_dict("records"):
+        label_id = int(row["label_id"])
+        if not 0 < label_id <= np.iinfo(np.int64).max:
+            raise ValueError("Published segmentation IDs must be positive int64 values")
+        lo = triple(
+            [row["bbox_min_" + a] for a in "zyx"], "catalog start", integer=True, positive=False
+        )
+        hi = triple([row["bbox_max_" + a] for a in "zyx"], "catalog stop", integer=True)
+        if np.any(lo < 0) or np.any(hi <= lo):
+            raise ValueError("Published object bounds must be nonempty and nonnegative")
+        if np.any(hi <= roi_start) or np.any(lo >= roi_stop):
+            continue
+        db.execute(
+            "INSERT INTO objects VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                label_id,
+                None,
+                *lo.tolist(),
+                *hi.tolist(),
+                0.0,
+                0.0,
+                0.0,
+            ),
+        )
+    db.commit()
+
+
+def _measure_catalog_object(segmentation, label_id, lower, upper, start, stop, budget):
+    lower, upper = np.maximum(start, lower - 1), np.minimum(stop, upper + 1)
+    if np.any(upper - lower > budget):
+        raise ValueError(
+            "Object bounds exceed read_budget_side; choose a coarser aligned grid or raise the read limit"
+        )
+    mask = segmentation.read(tuple(slice(int(a), int(b)) for a, b in zip(lower, upper))) == label_id
+    positions = np.nonzero(mask)
+    count = len(positions[0])
+    if not count:
+        raise ValueError(
+            "Published object ID is absent from its streamed segmentation bounds at this resolution"
+        )
+    lo = lower + np.array([p.min() for p in positions])
+    hi = lower + np.array([p.max() + 1 for p in positions])
+    centroid = lower + np.array([p.mean() for p in positions])
+    return count, lo, hi, centroid
 
 
 def _index_objects(segmentation, roi_start, roi_stop, block_shape, db, progress):
@@ -156,15 +268,16 @@ def _index_objects(segmentation, roi_start, roi_stop, block_shape, db, progress)
             progress(phase="scan", blocks=count, total_blocks=total)
 
 
-def _save_crops(staging, destination, count, shape, settings):
+def _save_crops(staging, destination, count, shape, settings, *, grouped=None):
     """Consolidate temporary crops one row at a time into the selected storage."""
     output_format = settings.get("output_format", "npy")
     backend = crop_storage_backend(output_format)
     dimensions = (count, *(int(s) for s in shape))
+    id_field = "patch_label_ids" if grouped is not None else "label_ids"
     specifications = {
         "crops": ("crops", np.float32, dimensions),
         "loss_masks": ("masks", np.uint8 if output_format == "n5" else bool, dimensions),
-        "label_ids": ("label_ids", np.int64, (count,)),
+        id_field: (id_field, np.int64, (count,)),
     }
     data, arrays = {}, {}
     with ExitStack() as stack:
@@ -174,7 +287,9 @@ def _save_crops(staging, destination, count, shape, settings):
             store = stack.enter_context(backend.File(str(path), "x"))
             store.attrs.update(
                 {
-                    "schema": "morphofeatures.masked_crops.v1",
+                    "schema": "morphofeatures.grouped_crops.v1"
+                    if grouped is not None
+                    else "morphofeatures.masked_crops.v1",
                     "unit": settings["unit"],
                     "spacing_zyx": list(settings["spacing_zyx"]),
                     "origin_zyx": list(settings.get("origin_zyx", [0, 0, 0])),
@@ -211,12 +326,38 @@ def _save_crops(staging, destination, count, shape, settings):
                     arrays["loss_masks"][index] = patch["mask"]
                     label_ids[index - first] = patch["label_id"]
                 temporary.unlink()
-            arrays["label_ids"][first:stop] = label_ids
+            arrays[id_field][first:stop] = label_ids
+        for field, values in (grouped or {}).items():
+            values = np.asarray(values)
+            if store is None:
+                path = destination / f"{field}.npy"
+                np.save(path, values, allow_pickle=False)
+            else:
+                store.create_dataset(
+                    field,
+                    data=values,
+                    chunks=(min(len(values), 4096), *values.shape[1:]),
+                    compression="gzip",
+                )
+                data[field + "_key"] = field
+            data[field] = str(path)
     staging.rmdir()
     return data
 
 
 def preprocess(settings, destination, progress=None):
+    if settings.get("layout", "single_crop") == "distributed_patches":
+        from morphofeatures.data.distributed_patches import prepare_patches
+
+        return prepare_patches(settings, destination, progress)
+    if settings.get("source") == "platybrowser":
+        from morphofeatures.analysis.platybrowser import resolve_platybrowser_preprocessing
+
+        settings = resolve_platybrowser_preprocessing(settings)
+    elif settings.get("source") == "ome_zarr":
+        from morphofeatures.data.ome_zarr import resolve_ome_zarr_preprocessing
+
+        settings = resolve_ome_zarr_preprocessing(settings)
     validate_preprocessing(settings)
     destination = Path(destination).resolve()
     destination.mkdir(parents=True, exist_ok=True)
@@ -248,14 +389,18 @@ def preprocess(settings, destination, progress=None):
             settings.get("raw_key"),
             settings.get("raw_axes", "zyx"),
             settings.get("raw_channel", 0),
+            timepoint=settings.get("raw_timepoint", 0),
+            remote_options=settings.get("remote_options"),
         ) as raw,
         open_volume(
             settings["segmentation"],
             settings.get("segmentation_key"),
             settings.get("segmentation_axes", "zyx"),
             settings.get("segmentation_channel", 0),
+            timepoint=settings.get("segmentation_timepoint", 0),
+            remote_options=settings.get("remote_options"),
         ) as segmentation,
-        sqlite3.connect(destination / "objects.sqlite") as db,
+        closing(sqlite3.connect(destination / "objects.sqlite")) as db,
         (destination / "objects.tsv").open("w") as manifest,
     ):
         if raw.shape != segmentation.shape:
@@ -269,38 +414,98 @@ def preprocess(settings, destination, progress=None):
             raise ValueError(
                 "ROI must be nonempty, within the volume, and use half-open ZYX voxel bounds"
             )
-        _index_objects(
-            segmentation,
-            start,
-            stop,
-            triple(settings.get("block_shape", [64, 64, 64]), "block_shape", integer=True),
-            db,
-            progress,
+        indexed = (
+            any(is_remote_url(settings[k]) for k in ("raw", "segmentation"))
+            and settings.get("source") != "ome_zarr"
         )
+        if indexed:
+            _catalog_index(settings, start, stop, db)
+        else:
+            _index_objects(
+                segmentation,
+                start,
+                stop,
+                triple(settings.get("block_shape", [64, 64, 64]), "block_shape", integer=True),
+                db,
+                progress,
+            )
         writer = csv.DictWriter(manifest, fieldnames=fields, delimiter="\t")
         writer.writeheader()
         selection = set(int(v) for v in settings.get("object_ids", []) or [])
+        from morphofeatures.data.object_selection import (
+            select_objects,
+            selection_active,
+            write_selection,
+        )
+
+        selection_audit = None
+        if selection_active(settings.get("object_selection")):
+            import pandas as pd
+
+            available_ids = [int(row[0]) for row in db.execute("SELECT id FROM objects ORDER BY id")]
+            available = pd.DataFrame({"label_id": available_ids, "segmentation_id": available_ids})
+            if selection:
+                available = available[available.label_id.isin(selection)]
+            chosen, selection_audit = select_objects(available, settings["object_selection"], destination=destination)
+            selection = set(map(int, chosen.label_id))
         for row in db.execute("SELECT * FROM objects ORDER BY id"):
             label_id, count = row[:2]
             lower, upper = np.array(row[2:5]), np.array(row[5:8])
-            centroid = np.array(row[8:11]) / count
-            item = {"label_id": label_id, "voxel_count": count, "status": "skipped", "reason": ""}
+            item = {"label_id": label_id, "status": "skipped", "reason": ""}
+            reason = None
+            if selection and label_id not in selection:
+                reason = "not selected"
+            elif settings.get("max_objects", 0) and summary["processed"] >= settings["max_objects"]:
+                reason = "object limit"
+            touches_roi = np.any(lower <= start) or np.any(upper >= stop)
+            if not reason and touches_roi and settings.get("roi_boundary", "skip") == "skip":
+                reason = "touches ROI boundary; extent may be incomplete"
+            if indexed and reason:
+                item["reason"] = reason
+                summary[
+                    "not_selected" if reason in {"not selected", "object limit"} else "skipped"
+                ] += 1
+                writer.writerow(item)
+                continue
+            if indexed:
+                try:
+                    count, lower, upper, centroid = _measure_catalog_object(
+                        segmentation,
+                        label_id,
+                        lower,
+                        upper,
+                        start,
+                        stop,
+                        settings.get("read_budget_side", 256),
+                    )
+                    db.execute(
+                        "UPDATE objects SET n=?,z0=?,y0=?,x0=?,z1=?,y1=?,x1=?,sz=?,sy=?,sx=? WHERE id=?",
+                        (
+                            count,
+                            *lower.tolist(),
+                            *upper.tolist(),
+                            *(centroid * count).tolist(),
+                            label_id,
+                        ),
+                    )
+                except (ValueError, OSError) as error:
+                    item.update(status="failed", reason=str(error))
+                    summary["failed"] += 1
+                    writer.writerow(item)
+                    if progress:
+                        progress(phase="extract", label_id=label_id, **summary)
+                    continue
+            else:
+                centroid = np.array(row[8:11]) / count
+            item["voxel_count"] = count
             for name, vector in (
                 ("bbox_min", lower),
                 ("bbox_max", upper),
                 ("centroid_voxel", centroid),
             ):
                 item.update({f"{name}_{axis}": v for axis, v in zip("zyx", vector)})
-            reason = None
-            if selection and label_id not in selection:
-                reason = "not selected"
-            elif settings.get("max_objects", 0) and summary["processed"] >= settings["max_objects"]:
-                reason = "object limit"
-            elif count < settings.get("min_voxels", 1):
+            if not reason and count < settings.get("min_voxels", 1):
                 reason = "below min_voxels"
-            touches_roi = np.any(lower == start) or np.any(upper == stop)
-            if not reason and touches_roi and settings.get("roi_boundary", "skip") == "skip":
-                reason = "touches ROI boundary; extent may be incomplete"
             center = (
                 np.floor(centroid).astype(int)
                 if settings.get("center", "bbox") == "centroid"
@@ -371,22 +576,43 @@ def preprocess(settings, destination, progress=None):
                     {"label_id": label_id, "status": "skipped", "reason": "ID absent from ROI"}
                 )
                 summary["skipped"] += 1
+        db.commit()
     metadata = {
         "schema": "morphofeatures.preprocessing.v1",
         "settings": settings,
         "summary": summary,
-        "raw": fingerprint_file(settings["raw"]),
-        "segmentation": fingerprint_file(settings["segmentation"]),
+        "raw": {"url": settings["raw"], "key": settings.get("raw_key")}
+        if is_remote_url(settings["raw"])
+        else fingerprint_file(settings["raw"]),
+        "segmentation": {"url": settings["segmentation"], "key": settings.get("segmentation_key")}
+        if is_remote_url(settings["segmentation"])
+        else fingerprint_file(settings["segmentation"]),
         "axes": "zyx",
         "unit": settings["unit"],
         "spacing_zyx": spacing.tolist(),
         "origin_zyx": origin.tolist(),
         "coordinate_convention": "integer voxel indices refer to voxel centers; physical = origin + index * spacing; bounding boxes are half-open",
         "mask": "exact instance equality, independent of raw zero intensity",
-        "selection_scope": "ROI",
+        "selection_scope": "published object catalog within ROI" if indexed else "ROI",
+        "id_namespace": "stored segmentation label IDs",
+        "index_basis": "published bounds; selected objects verified in voxels"
+        if indexed
+        else "voxel scan",
         "crop_shape": shape.tolist(),
         "output_format": settings.get("output_format", "npy"),
     }
+    if selection_audit is not None:
+        selection_audit["preparation_summary"] = summary
+        # Keep the exact crop exclusion reason separate from the ID-matching result.
+        with (destination / "objects.tsv").open() as stream:
+            outcomes = {int(row["label_id"]): row for row in csv.DictReader(stream, delimiter="\t")}
+        for row in selection_audit["rows"]:
+            outcome = outcomes.get(row["label_id"])
+            if outcome:
+                row["preparation_status"] = outcome["status"]
+                row["preparation_reason"] = outcome["reason"]
+        write_selection(destination, selection_audit)
+        metadata["object_selection"] = "selection.json"
     write_json_atomic(destination / "preprocessing.json", metadata)
     if not summary["processed"]:
         raise ValueError(
@@ -413,6 +639,8 @@ def preprocess(settings, destination, progress=None):
         "training": {"epochs": 2, "batch_size": 2, "learning_rate": 0.001},
         "inference": {"batch_size": 4},
     }
+    if settings.get("inspection_config"):
+        config["inspection"] = settings["inspection_config"]
     path = destination / "mae_config.yaml"
     path.write_text(yaml.safe_dump(config, sort_keys=False))
     return path

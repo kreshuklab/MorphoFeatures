@@ -52,7 +52,7 @@ def open_crop_array(data, field="crops"):
     if not isinstance(key, str) or not key.strip():
         raise ValueError(
             f"Specify data.{field}_key for the dataset inside {path.name}, "
-            "or load the generated mae_config.yaml to fill in the paths and keys"
+            "or load the generated mae_config.yaml (single crops) or data_config.yaml (distributed patches) to fill in the paths and keys"
         )
     backend = crop_storage_backend("n5" if suffix == ".n5" else "h5")
     with backend.File(str(path), "r") as store:

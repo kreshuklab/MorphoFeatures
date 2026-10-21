@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 import numpy as np
 from scipy import sparse
 from sklearn.cluster import KMeans
@@ -15,9 +13,139 @@ PROJECTION_DEFAULTS = {
     "neighbors": 15,
     "min_dist": 0.0,
     "umap_epochs": 50,
+    "umap_pca_components": None,
+    "cluster_pca_components": None,
     "resolution": 0.004,
     "seed": 42,
 }
+
+NORMALIZATION_NAMES = {
+    "none": "No analysis scaling",
+    "l2": "L2 of the complete vector",
+    "standardize": "Standardize each feature",
+}
+
+
+def analysis_normalizations(settings, *, default="standardize"):
+    """Scaling conditions evaluated on the same IDs/folds, not plot-only variants."""
+    from morphofeatures.workflow_validation import FieldError
+
+    values = settings.get("analysis_normalizations")
+    if values is None:
+        values = [settings.get("normalization", default)]
+    if (
+        not isinstance(values, list) or not values
+        or any(not isinstance(v, str) or v not in NORMALIZATION_NAMES for v in values)
+        or len(set(values)) != len(values)
+    ):
+        raise FieldError(
+            "Choose at least one distinct analysis scaling: none (unchanged vectors), "
+            "l2 (unit length per complete vector), or standardize (per-feature scaling).",
+            "analysis_normalizations",
+        )
+    if len(values) > 1 and settings.get("use_published_layout"):
+        raise FieldError(
+            "Disable the saved published layout before comparing scaling methods; "
+            "a saved map cannot show the effect of newly selected preprocessing.",
+            "analysis_normalizations", "use_published_layout",
+        )
+    return values
+
+
+def validate_projection_settings(settings):
+    """Validate the optional projection-only PCA before any worker reads inputs."""
+    from numbers import Integral
+
+    from morphofeatures.workflow_validation import FieldError
+
+    analysis_normalizations(settings)
+
+    for key, title in (
+        ("umap_pca_components", "UMAP"), ("cluster_pca_components", "clustering")
+    ):
+        count = settings.get(key)
+        if count is not None and (
+            isinstance(count, bool) or not isinstance(count, Integral) or count < 0
+        ):
+            raise FieldError(
+                f"PCA components before {title} must be a positive whole number (for example 50), "
+                "or 0 / null to use the full embedding vectors.", key,
+            )
+    for key, minimum in (("clusters", 2), ("neighbors", 2), ("seed", 0)):
+        value = settings.get(key, PROJECTION_DEFAULTS[key])
+        if isinstance(value, bool) or not isinstance(value, Integral) or value < minimum:
+            raise FieldError(f"{key} must be a whole number of at least {minimum}.", key)
+    for key, options in (
+        ("normalization", {"standardize", "l2", "none"}),
+        ("cluster_method", {"kmeans", "leiden"}),
+    ):
+        if settings.get(key, PROJECTION_DEFAULTS[key]) not in options:
+            raise FieldError(f"Choose {', '.join(sorted(options))} for {key}.", key)
+    for key, minimum, maximum in (("min_dist", 0, 1), ("resolution", 0, np.inf)):
+        try:
+            value = float(settings.get(key, PROJECTION_DEFAULTS[key]))
+            valid = np.isfinite(value) and minimum <= value <= maximum
+        except (ValueError, TypeError):
+            valid = False
+        if not valid:
+            raise FieldError(f"{key} must be a finite number between {minimum} and {maximum}.", key)
+    epochs = settings.get("umap_epochs", 50)
+    if epochs is not None and (
+        isinstance(epochs, bool) or not isinstance(epochs, Integral) or epochs < 3
+    ):
+        raise FieldError("UMAP epochs must be null or an integer of at least 3.", "umap_epochs")
+
+
+def prepare_umap_input(features, pca_components=None, *, seed=42):
+    """Optionally reduce already-normalized features, without whitening.
+
+    Fit on the projected cohort (pooled across datasets for shared maps), never
+    on the displayed two-component PCA coordinates. Cap to the available
+    centered sample rank and feature width; record the actual fit in reports.
+    """
+    from sklearn.decomposition import PCA
+
+    validate_projection_settings({"umap_pca_components": pca_components})
+    features = np.asarray(features)
+    details = {
+        "enabled": bool(pca_components),
+        "requested_components": pca_components,
+        "effective_components": None,
+        "input_features": int(features.shape[1]),
+        "fitted_objects": int(len(features)),
+        "explained_variance_ratio_sum": None,
+    }
+    if not pca_components:
+        return features, details
+    if len(features) < 2:
+        raise ValueError("PCA before UMAP requires at least two objects")
+    count = min(int(pca_components), features.shape[1], len(features) - 1)
+    reducer = PCA(n_components=count, random_state=int(seed), whiten=False)
+    reduced = reducer.fit_transform(features)
+    details.update(
+        effective_components=count,
+        explained_variance_ratio_sum=float(np.nansum(reducer.explained_variance_ratio_)),
+    )
+    return reduced, details
+
+
+def umap_input_description(details):
+    """Human-readable provenance shared by saved results, Tools and the CLI."""
+    if not details.get("enabled"):
+        return "UMAP uses the full normalized feature vectors; PCA before UMAP is off."
+    count = details["effective_components"]
+    requested = details["requested_components"]
+    cap = (
+        f" (requested {requested}; limited by the object/feature count)"
+        if count != requested else ""
+    )
+    return (
+        f"UMAP input: {details['input_features']} features → "
+        f"{count} PCA components{cap} → 2D UMAP. "
+        f"PCA retains {details['explained_variance_ratio_sum']:.1%} "
+        "of variance after normalization, "
+        f"fitted on the {details['fitted_objects']} objects in this map."
+    )
 
 
 def normalize_features(features, normalization="standardize"):
@@ -39,6 +167,7 @@ def project_embeddings(ids, features, settings):
     from sklearn.metrics import silhouette_score
 
     settings = {**PROJECTION_DEFAULTS, **settings}
+    validate_projection_settings(settings)
     if len(ids) < 3 or features.shape[1] < 2:
         raise ValueError("Analysis requires at least three objects and two features")
     order = np.argsort(ids)
@@ -54,8 +183,11 @@ def project_embeddings(ids, features, settings):
     seed = int(settings["seed"])
     data = normalize_features(features, settings["normalization"])
     pca = PCA(n_components=2, random_state=seed).fit_transform(data)
+    cluster_data, cluster_input = prepare_umap_input(
+        data, settings["cluster_pca_components"], seed=seed
+    )
     clusters = cluster_embeddings(
-        data,
+        cluster_data,
         method=settings["cluster_method"],
         n_clusters=int(settings["clusters"]),
         n_neighbors=int(settings["neighbors"]),
@@ -65,13 +197,17 @@ def project_embeddings(ids, features, settings):
     frame = pd.DataFrame(
         {"label_id": ids, "cluster": clusters, "pca_1": pca[:, 0], "pca_2": pca[:, 1]}
     )
+    umap_input = None
     if settings.get("umap", True):
         if len(ids) < 4:
             raise ValueError(
                 "UMAP requires at least four objects; disable umap for smaller subsets"
             )
+        umap_data, umap_input = prepare_umap_input(
+            data, settings["umap_pca_components"], seed=seed
+        )
         reduced = compute_umap(
-            data,
+            umap_data,
             n_neighbors=int(settings["neighbors"]),
             min_dist=float(settings["min_dist"]),
             seed=seed,
@@ -82,11 +218,14 @@ def project_embeddings(ids, features, settings):
         "clusters_observed": int(len(np.unique(clusters))),
         "projected_objects": len(ids),
         "projection_settings": settings,
-        "cluster_space": "normalized embedding features",
+        "cluster_space": "PCA components of normalized embeddings"
+        if cluster_input["enabled"] else "normalized embedding features",
+        "cluster_input": cluster_input,
+        "umap_input": umap_input,
     }
     if 1 < len(np.unique(clusters)) < len(ids):
         diagnostics["silhouette"] = float(
-            silhouette_score(data, clusters, sample_size=min(2000, len(ids)), random_state=seed)
+            silhouette_score(cluster_data, clusters, sample_size=min(2000, len(ids)), random_state=seed)
         )
     return frame, diagnostics
 
@@ -97,8 +236,10 @@ def compute_umap(
     min_dist: float = 0.0,
     n_components: int = 2,
     seed: int = 42,
-    n_epochs: Optional[int] = None,
+    n_epochs: int | None = None,
+    pca_components: int | None = None,
 ) -> np.ndarray:
+    features, _ = prepare_umap_input(features, pca_components, seed=seed)
     try:
         import umap
     except (ImportError, OSError) as error:
@@ -157,7 +298,9 @@ def cluster_embeddings(
     resolution: float = 0.004,
     n_clusters: int = 8,
     seed: int = 42,
+    pca_components: int | None = None,
 ) -> np.ndarray:
+    features, _ = prepare_umap_input(features, pca_components, seed=seed)
     if method == "kmeans":
         clusters = min(max(2, int(n_clusters)), len(features))
         return KMeans(n_clusters=clusters, random_state=seed, n_init=10).fit_predict(features)

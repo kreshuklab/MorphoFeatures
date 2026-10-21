@@ -5,6 +5,7 @@ import pytest
 from morphofeatures.slurm import (
     ClusterProfile,
     SlurmScheduler,
+    cluster_profiles_from_mapping,
     load_cluster_profiles,
     normalize_slurm_state,
     parse_sacct_output,
@@ -19,6 +20,24 @@ from morphofeatures.workflows import (
     validate_command,
     validate_workflow_request,
 )
+
+
+@pytest.mark.parametrize(
+    "resources, message",
+    [
+        ({"cpus": 1.5}, "cpus must be a whole number"),
+        ({"gpus": True}, "gpus must be a whole number"),
+        ({"nodes": "many"}, "nodes must be a whole number"),
+        ({"memory": "lots"}, "memory"),
+        ({"mail_types": ["FAIL"]}, "mail_user"),
+        ({"setup": "module load CUDA"}, "setup must be a list"),
+        ({"setup": [["rm", "-rf", "/tmp/example"]]}, "setup supports only module"),
+        (["gpu"], "resources must be a mapping"),
+    ],
+)
+def test_cluster_preset_errors_identify_the_preset_and_field(resources, message):
+    with pytest.raises(ValueError, match=f"Preset 'gpu-long': .*{message}"):
+        cluster_profiles_from_mapping({"profiles": {"gpu-long": resources}})
 
 
 @pytest.fixture

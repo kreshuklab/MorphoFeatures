@@ -1,0 +1,132 @@
+# Run from Workflow -> Load settings. Paths below are relative to this YAML.
+# These stages need only the bundled published artifacts, not raw volumes or GPUs.
+stages:
+  - action: analyze
+    embedding: ../analysis/data/morphocontextfeatures_all_cells_agglomerated.npy
+    published_reference: MorphoContextFeatures (200 dimensions)
+    use_published_layout: true   # Keep saved UMAP and 23 clusters; do not refit them.
+    normalization: standardize   # Used for optional probes/newly fitted analyses.
+    umap: true
+    # Optional class-label evaluation still uses the full 200-dimensional features:
+    # annotations: ../analysis/data/class_labels.tsv
+    # label_column: auto
+    # folds: 5
+
+  - action: bilateral
+    embeddings:
+      MorphoFeatures: ../analysis/data/morphofeatures_all_cells.npy
+      MorphoContextFeatures: ../analysis/data/morphocontextfeatures_all_cells_agglomerated.npy
+      Manual: ../analysis/data/manually_defined_features.npy
+      # Add MAE/DINO vectors of the SAME animal here. Intersection is explicit.
+      # DINO: /path/to/embeddings.npz
+    same_specimen: true
+    id_namespace: cell
+    candidates: ../analysis/data/bilateral_neighbors.pkl
+    sides: ../analysis/data/distance_from_midline_cells_1_0_1.tsv
+    top_k: [1, 5, 10, 50, 100]
+    batch_size: 128
+    workers: 2
+    # Compare against ANY prior bilateral result, not only published vectors.
+    # All methods are reranked on shared cells using THIS stage's settings.
+    # Keep each old report's complete folder with vectors and native-ID bridge.
+    compare_saved_runs: false
+    comparison_reports: {}
+    # comparison_reports:
+    #   Previous MAE: /path/to/previous_run/workspace/01-bilateral/bilateral.json
+    variants:
+      - name: Published all-cell protocol
+        normalization: standardize
+        metric: euclidean
+        search: all
+        pca: null
+      - name: Opposite side only
+        normalization: standardize
+        metric: euclidean
+        search: opposite
+        pca: null
+    # Per-input overrides if your new vectors use NUCLEUS rather than cell IDs:
+    # identities:
+    #   DINO:
+    #     id_namespace: nucleus
+    #     id_mapping: /path/to/cell_to_nucleus.tsv
+    #     cell_column: label_id
+    #     nucleus_column: nucleus_id
+
+# To generate new context vectors, add stages like these BEFORE the bilateral
+# stage, then add from_embeddings: [DINO context] to the bilateral stage.
+# The published cell-contact graph is not bundled; supply a physical graph.
+# - action: context
+#   name: DINO context
+#   embedding: /path/to/dino_embeddings.npz
+#   id_namespace: cell
+#   graph_id_namespace: cell
+#   graph_mode: adjacency_table
+#   adjacency_table: /path/to/physical_edges.tsv  # source_id, target_id columns
+#   include_self: true
+#   combination: raw               # concatenate own + mean(own and neighbors)
+#   reduction: none                # retain every dimension; agglomeration optional
+#   n_features: 200                 # only used for agglomeration
+#   missing_neighbors: error
+#   minimum_coverage: 1.0
+#   isolated: self
+#   roi_boundary: skip
+# - action: analyze
+#   from_embedding: DINO context
+#   normalization: standardize
+#   umap: true
+#   clusters: 8
+#   seed: 42
+
+# To stream a segmentation for context, replace graph_mode/adjacency_table above:
+#   graph_mode: segmentation
+#   spatial_source: ome_zarr
+#   ome_zarr:
+#     url: https://your-server.example/platy-cell-labels.ome.zarr
+#     image_index: 0
+#     level: 0                     # Discover physical resolutions in the UI.
+#     channel: 0
+#     timepoint: 0
+#   remote_options: {cache_size_mb: 512}
+#   roi: [[0, 0, 0], [256, 256, 256]]  # Replace with your region in selected-level voxels.
+#   max_scan_voxels: 16777216
+#   block_shape: [64, 64, 64]
+#   connectivity: 1               # Face contacts; nuclei usually do not touch.
+# Alternative published catalogue connection (may resolve to N5, not OME-Zarr):
+#   spatial_source: platybrowser
+#   platybrowser:
+#     project_url: https://github.com/mobie/platybrowser-project
+#     dataset: 1.0.1
+#     segmentation_source: cells
+#     segmentation_level: 0
+# The loader's pinned default revision is used unless explicitly overridden.
+
+# Add after the bilateral stage for non-MoBIE 3D links (TSV/NPZ/VTK):
+# - action: export_bilateral
+#   from_bilateral: true
+#   make_mobie: false
+#   positions: /path/to/cells/default.tsv
+#   positions_ids: cell
+#   position_columns: [anchor_z, anchor_y, anchor_x]
+#   positions_unit: um
+#   max_pairs: 20                  # Per representation and probe variant.
+#   pair_order: best               # best, worst, id; or set explicit query_ids.
+#   query_ids: []                  # Cell IDs, not nucleus IDs.
+#   bilateral_representation: null # Null includes every representation.
+#   bilateral_variant: null        # Null includes every variant; 0 is the first.
+# To also create streaming MoBIE pair views, use these instead of make_mobie: false:
+#   make_mobie: true
+#   mode: platybrowser
+#   platybrowser:
+#     segmentation_source: cells
+#     object_ids: segmentation
+# positions can be omitted when MoBIE supplies the published object catalogue.
+# Optional export_pair_masks: true requires mode: portable, segmentation source,
+# ROI, physical spacing/origin/unit, and max_mask_voxels (total across pair layers).
+# See docs/analysis_and_mobie.md for portable examples and napari loading.
+
+slurm:
+  partition: compute              # Replace with your cluster's CPU partition.
+  cpus: 2
+  gpus: 0
+  memory: 8G
+  time: '01:00:00'

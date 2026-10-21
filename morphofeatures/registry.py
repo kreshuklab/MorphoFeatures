@@ -61,6 +61,10 @@ class JobRecord:
     provenance: Mapping[str, Any] = field(default_factory=dict)
     error_message: Optional[str] = None
 
+    @property
+    def display_name(self):
+        return self.provenance.get("display_name") or self.run_id
+
 
 class JobRegistry:
     def __init__(self, path: Path):
@@ -137,6 +141,11 @@ class JobRegistry:
         try:
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                if connection.execute(
+                    "SELECT 1 FROM jobs WHERE run_id = ? AND application_state IN ('deleting', 'deletion_failed', 'deleted')",
+                    (record.run_id,),
+                ).fetchone():
+                    raise DuplicateSubmissionError("This run was deleted or is being deleted; choose a new run ID.")
                 connection.execute(sql, tuple(values[column] for column in columns))
         except sqlite3.IntegrityError as error:
             if "submission_key" in str(error) or "jobs.run_id, jobs.workflow" in str(error):
@@ -160,12 +169,55 @@ class JobRegistry:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             cursor = connection.execute(
-                "UPDATE jobs SET {} WHERE id = ?".format(assignments),
+                "UPDATE jobs SET {} WHERE id = ? AND application_state NOT IN ('deleting', 'deletion_failed', 'deleted')".format(assignments),
                 tuple(encoded.values()) + (job_id,),
             )
             if cursor.rowcount != 1:
                 raise KeyError("Unknown job record: {}".format(job_id))
         return self.get(job_id)
+
+    def append_artifacts(self, job_id, paths):
+        """Merge derived outputs atomically, including concurrent Results sessions."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT artifacts FROM jobs WHERE id = ? AND application_state NOT IN ('deleting', 'deletion_failed', 'deleted')", (job_id,)).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            artifacts = list(dict.fromkeys([*json.loads(row["artifacts"]), *map(str, paths)]))
+            connection.execute("UPDATE jobs SET artifacts = ? WHERE id = ?", (json.dumps(artifacts), job_id))
+        return self.get(job_id)
+
+    def rename_run(self, run_id, name):
+        """Change a finished run's human-facing name; IDs, paths and dependencies stay stable."""
+        from morphofeatures.artifacts import write_json_atomic
+
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Enter a nonempty run display name.")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute("SELECT * FROM jobs WHERE run_id = ?", (run_id,)).fetchall()
+            if not rows:
+                raise KeyError(run_id)
+            if any(row["application_state"] not in {"completed", "failed", "cancelled", "dry_run"} for row in rows):
+                raise ValueError("Wait until all jobs in this run have finished before renaming it.")
+            for row in rows:
+                provenance = json.loads(row["provenance"])
+                history = provenance.setdefault("name_history", [])
+                history.append({
+                    "previous": provenance.get("display_name", run_id),
+                    "name": name.strip(), "at": utc_now(),
+                })
+                provenance["display_name"] = name.strip()
+                connection.execute(
+                    "UPDATE jobs SET provenance = ? WHERE id = ?",
+                    (json.dumps(provenance), row["id"]),
+                )
+                directory = Path(row["working_directory"])
+                if directory.is_dir():
+                    write_json_atomic(directory / "display_name.json", {
+                        "run_id": run_id, "display_name": name.strip(), "name_history": history,
+                    })
+        return self.list(run_id=run_id)
 
     @staticmethod
     def _record(row: sqlite3.Row) -> JobRecord:
@@ -197,8 +249,11 @@ class JobRegistry:
         workflow: Optional[str] = None,
         states: Iterable[str] = (),
         limit: int = 500,
+        include_deleted: bool = False,
     ) -> List[JobRecord]:
         clauses = []
+        if not include_deleted:
+            clauses.append("application_state != 'deleted'")
         parameters: List[Any] = []
         if run_id:
             clauses.append("run_id = ?")

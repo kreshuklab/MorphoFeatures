@@ -29,3 +29,24 @@ def test_streamlit_launcher_targets_dashboard():
     assert "8765" in command
     assert "127.0.0.1" in command
     assert command[-2:] == ["--browser.gatherUsageStats", "false"]
+
+
+def test_project_cli_optional_pca_and_saved_provenance(tmp_path, capsys):
+    import numpy as np
+
+    from morphofeatures.cli import main
+    from morphofeatures.data.io import export_embeddings, load_embeddings
+
+    source = export_embeddings(
+        tmp_path / "features.npz", np.arange(16), np.random.default_rng(4).normal(size=(16, 8))
+    )
+    output = tmp_path / "coordinates.tsv"
+    assert main([
+        "project", "--embedding", str(source), "--output", str(output),
+        "--umap-pca-components", "3", "--umap-epochs", "12",
+        "--cluster-method", "kmeans", "--clusters", "2",
+    ]) == 0
+    assert load_embeddings(output).features.shape == (16, 3)
+    report = json.loads((tmp_path / "coordinates_projection.json").read_text())
+    assert report["umap_input"]["effective_components"] == 3
+    assert "8 features → 3 PCA components" in capsys.readouterr().out

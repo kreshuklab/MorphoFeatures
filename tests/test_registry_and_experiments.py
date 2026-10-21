@@ -47,6 +47,18 @@ def test_registry_round_trip_duplicate_protection_and_concurrent_updates(tmp_pat
         list(executor.map(update, range(12)))
     assert registry.get(record.id).raw_scheduler_state.startswith("UPDATE_")
 
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        list(executor.map(lambda i: registry.append_artifacts(record.id, [f"result-{i}.json"]), range(12)))
+    assert all(f"result-{i}.json" in registry.get(record.id).artifacts for i in range(12))
+    renamed = registry.rename_run(record.run_id, "A readable experiment")[0]
+    assert renamed.display_name == "A readable experiment"
+    assert renamed.run_id == record.run_id and renamed.working_directory == record.working_directory
+    assert renamed.provenance["name_history"][0]["previous"] == record.run_id
+    registry.update(record.id, application_state="running")
+    with pytest.raises(ValueError, match="finished"):
+        registry.rename_run(record.run_id, "Too early")
+    assert registry.get(record.id).display_name == "A readable experiment"
+
 
 def test_workflow_specific_input_override_is_snapshotted_without_overwrite(tmp_path, repo_root):
     registry = JobRegistry(tmp_path / "registry.sqlite3")
@@ -143,3 +155,124 @@ def test_unknown_accounting_state_is_retained(tmp_path, repo_root):
     refreshed = registry.get(record.id)
     assert refreshed.application_state == "unknown"
     assert "delayed or purged" in refreshed.error_message
+
+
+@pytest.mark.parametrize("accounting", ["FAILED", "purged", "unavailable"])
+def test_refresh_preserves_terminal_worker_error_and_artifacts(tmp_path, accounting):
+    from test_run_deletion import _worker_status
+    from test_workspace_usability import make_run
+
+    from morphofeatures.slurm import SchedulerQuery
+
+    record = make_run(tmp_path, "stale-failure", [])
+    registry = JobRegistry.under_output_root(tmp_path)
+    status = _worker_status(record)
+    registry.update(
+        record.id, application_state="failed", slurm_job_id="90", raw_scheduler_state="RUNNING"
+    )
+    scheduler = FakeScheduler()
+    if accounting == "FAILED":
+        scheduler.set_state("90", "FAILED", "1:0")
+    if accounting == "unavailable":
+        scheduler.query = lambda ids: SchedulerQuery({}, ("sacct unavailable",))
+    refresh_jobs(registry, scheduler)
+    repaired = registry.get(record.id)
+    assert repaired.application_state == "failed"
+    assert repaired.error_message == status["error"]
+    assert set(record.artifacts) <= set(repaired.artifacts)
+    assert repaired.raw_scheduler_state == ("FAILED" if accounting == "FAILED" else None)
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_worker_persists_final_status_before_finalizing_registry(tmp_path, monkeypatch, failure):
+    from test_workspace_usability import make_run
+
+    import morphofeatures.dino_memory as memory
+    from morphofeatures.workspace_jobs import run_job
+
+    record = make_run(tmp_path, "initialization", [])
+    registry = JobRegistry.under_output_root(tmp_path)
+    registry.update(
+        record.id, application_state="queued", raw_scheduler_state="PENDING", slurm_job_id="91"
+    )
+    Path(record.config_snapshot).write_text(
+        yaml.safe_dump(
+            {
+                "worker": {
+                    "record_id": record.id,
+                    "registry": str(registry.path),
+                    "directory": record.working_directory,
+                },
+                "stages": [],
+            }
+        )
+    )
+    if failure:
+
+        def fail(*args, **kwargs):
+            raise ValueError("Invalid memory setup")
+
+        monkeypatch.setattr(memory, "attach_allocation", fail)
+        with pytest.raises(ValueError, match="Invalid memory setup"):
+            run_job(Path(record.config_snapshot))
+    else:
+        run_job(Path(record.config_snapshot))
+    final = registry.get(record.id)
+    assert final.application_state == ("failed" if failure else "completed")
+    assert final.exit_status == ("1" if failure else "0")
+    assert final.raw_scheduler_state is None
+    assert (Path(record.working_directory) / "status.json").is_file()
+
+
+def test_worker_status_write_failure_still_marks_registry_failed(tmp_path, monkeypatch):
+    from test_workspace_usability import make_run
+
+    import morphofeatures.workspace_jobs as jobs
+
+    record = make_run(tmp_path, "full-disk", [])
+    registry = JobRegistry.under_output_root(tmp_path)
+    registry.update(
+        record.id, application_state="queued", slurm_job_id="92", raw_scheduler_state="PENDING"
+    )
+    Path(record.config_snapshot).write_text(
+        yaml.safe_dump(
+            {
+                "worker": {
+                    "record_id": record.id,
+                    "registry": str(registry.path),
+                    "directory": record.working_directory,
+                },
+                "stages": [],
+            }
+        )
+    )
+
+    def disk_full(*args, **kwargs):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(jobs, "write_json_atomic", disk_full)
+    with pytest.raises(OSError, match="No space left"):
+        jobs.run_job(Path(record.config_snapshot))
+    final = registry.get(record.id)
+    assert final.application_state == "failed" and final.exit_status == "1"
+    assert final.raw_scheduler_state is None
+    assert "Could not save final worker status" in final.error_message
+
+
+def test_worker_outcome_uses_identity_and_aware_times(tmp_path):
+    import json
+    from dataclasses import replace
+
+    from test_run_deletion import _worker_status
+    from test_workspace_usability import make_run
+
+    from morphofeatures.job_status import worker_outcome
+
+    record = make_run(tmp_path, "identity", [])
+    status = _worker_status(record)
+    # Naive SLURM local time cannot be compared with a UTC worker timestamp.
+    assert worker_outcome(replace(record, started_at="2099-01-01T00:00:00"))
+    assert not worker_outcome(replace(record, started_at="2099-01-01T00:00:00+00:00"))
+    status["record_id"] = "another-job"
+    (Path(record.working_directory) / "status.json").write_text(json.dumps(status))
+    assert not worker_outcome(record)

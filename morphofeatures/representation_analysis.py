@@ -8,16 +8,15 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
-from sklearn.decomposition import PCA
 from sklearn.metrics import (
     accuracy_score,
     adjusted_rand_score,
     balanced_accuracy_score,
 )
-from sklearn.preprocessing import StandardScaler
 
 from morphofeatures.analysis.annotations import join_labels, read_annotations
 from morphofeatures.analysis.classification import LEGACY_CELL_TYPES, configured_classifier
+from morphofeatures.analysis.projection import NORMALIZATION_NAMES, analysis_normalizations
 
 # Public aliases retained for callers; both UI routes use the same implementation.
 from morphofeatures.analysis.projection import normalize_features as transformed
@@ -27,6 +26,7 @@ from morphofeatures.analysis.visualization import save_projection_figure as save
 from morphofeatures.artifacts import write_json_atomic
 from morphofeatures.data.io import export_embeddings, load_embeddings
 from morphofeatures.representations import fingerprint_file
+from morphofeatures.workflow_validation import prefix_fields
 
 
 def package_results(destination):
@@ -39,17 +39,36 @@ def package_results(destination):
     temporary = destination / "export.zip.tmp"
     with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
         for item in sorted(destination.rglob("*")):
-            if item.is_file() and item not in {archive, temporary}:
+            if item.is_file() and item.name not in {"export.zip", "export.zip.tmp"} and not any(
+                part.startswith(".") for part in item.relative_to(destination).parts
+            ):
                 bundle.write(item, item.relative_to(destination))
     os.replace(temporary, archive)
     return archive
 
 
 def analyze(embedding, destination, settings):
+    from morphofeatures.analysis.variants import run_configured_variants, validate_variants
+
+    normalizations = analysis_normalizations(settings)
+    if len(normalizations) > 1:
+        return compare({"Embedding": embedding}, destination, settings)
+    settings = {**settings, "normalization": normalizations[0]}
+    validate_variants(settings)
+    if settings.get("bilateral", {}).get("enabled"):
+        from morphofeatures.analysis.bilateral import validate_bilateral
+
+        with prefix_fields("bilateral"):
+            validate_bilateral(settings["bilateral"], representation_count=1)
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
     table = load_embeddings(embedding).sorted()
-    frame, diagnostics = project_table(table.label_ids, table.features, settings)
+    if settings.get("use_published_layout"):
+        from morphofeatures.analysis.published import published_projection
+
+        frame, diagnostics = published_projection(table, {**settings, "embedding": str(embedding)})
+    else:
+        frame, diagnostics = project_table(table.label_ids, table.features, settings)
     export_embeddings(destination / "embeddings.npz", table.label_ids, table.features)
     result = {
         "schema": "morphofeatures.analysis.v1",
@@ -71,9 +90,15 @@ def analyze(embedding, destination, settings):
             "training-fold-only scaling; generalization to independent specimens depends on "
             "the grouping and representation pretraining exposure."
         )
-    metadata = Path(embedding).with_suffix(".metadata.json")
-    if metadata.exists():
-        result["extraction"] = json.loads(metadata.read_text())
+    from morphofeatures.analysis.joint import extraction_metadata
+
+    metadata = extraction_metadata(embedding)
+    if metadata:
+        result["extraction"] = metadata
+        write_json_atomic(destination / "embeddings.metadata.json", metadata)
+        if metadata.get("supervision"):
+            result["representation_fit_warning"] = metadata["supervision"]["warning"]
+            result["interpretation"] += " " + result["representation_fit_warning"]
     frame = frame.merge(labels, on="label_id", how="left", validate="one_to_one")
     result["class_colors"] = frame.attrs["class_colors"] = label_palette(labels)
     labels.merge(frame[["label_id", "cluster"]], on="label_id", how="left").to_csv(
@@ -82,7 +107,14 @@ def analyze(embedding, destination, settings):
     result["object_labels"] = "object_labels.tsv"
     frame.to_csv(destination / "coordinates.tsv", sep="\t", index=False)
     save_figure(frame, destination / "projection.svg", "Exploratory morphology", settings)
+    if settings.get("bilateral", {}).get("enabled"):
+        from morphofeatures.analysis.bilateral import run_bilateral
+
+        with prefix_fields("bilateral"):
+            run_bilateral({"Embedding": str(embedding)}, destination / "bilateral", settings["bilateral"])
+        result["bilateral"] = "bilateral/bilateral.json"
     path = write_json_atomic(destination / "analysis.json", result)
+    run_configured_variants(path, settings)
     package_results(destination)
     return path
 
@@ -137,27 +169,16 @@ def evaluation_splits(ids, annotations, settings):
 
 def evaluate_features(features, y, splits, settings, *, predictions=None):
     from sklearn.neighbors import NearestNeighbors
+    from sklearn.pipeline import make_pipeline
 
     scores = []
     for fold, (train, test) in enumerate(splits):
         x_train, x_test = features[train], features[test]
-        normalization = settings.get("normalization", "standardize")
-        if normalization == "standardize":
-            scaler = StandardScaler().fit(x_train)
-            x_train, x_test = scaler.transform(x_train), scaler.transform(x_test)
-        else:
-            x_train, x_test = (
-                transformed(x_train, normalization),
-                transformed(x_test, normalization),
-            )
-        if settings.get("evaluation_pca"):
-            dimensions = int(settings["evaluation_pca"])
-            if dimensions > min(x_train.shape):
-                raise ValueError(
-                    "evaluation_pca exceeds a training fold's sample count or feature dimension"
-                )
-            reducer = PCA(dimensions, random_state=int(settings.get("seed", 42))).fit(x_train)
-            x_train, x_test = reducer.transform(x_train), reducer.transform(x_test)
+        template = configured_classifier("logistic", settings, train_count=len(train))
+        if template.steps[:-1]:
+            preprocessing = make_pipeline(*(step for _, step in template.steps[:-1]))
+            x_train = preprocessing.fit_transform(x_train)  # Projection never sees labels.
+            x_test = preprocessing.transform(x_test)
         k = min(int(settings.get("knn_k", 5)), len(train))
         if k < 1:
             raise ValueError("knn_k must be positive")
@@ -180,10 +201,20 @@ def evaluate_features(features, y, splits, settings, *, predictions=None):
         encoded = np.asarray([classes.index(value) for value in y])
         for model_name in settings.get("classifier_models", ["logistic", "knn"]):
             name = "linear" if model_name == "logistic" else model_name
-            estimator = configured_classifier(model_name, settings, train_count=len(train))
-            estimator.fit(features[train], encoded[train])
-            predicted = np.asarray(classes)[estimator.predict(features[test])]
-            confidence = estimator.predict_proba(features[test]).max(axis=1)
+            estimator = configured_classifier(
+                model_name,
+                {
+                    **settings,
+                    "normalization": "none",
+                    "evaluation_pca": None,
+                    "classifier_space": "embeddings",
+                    "classifier_standardize": False,
+                },
+                train_count=len(train),
+            )
+            estimator.fit(x_train, encoded[train])
+            predicted = np.asarray(classes)[estimator.predict(x_test)]
+            confidence = estimator.predict_proba(x_test).max(axis=1)
             if predictions is not None:
                 predictions.extend(
                     {
@@ -310,6 +341,7 @@ def classify_embedding(table, destination, settings):
     labels.to_csv(destination / "object_labels.tsv", sep="\t", index=False)
     return {
         "evaluated_objects": len(ids),
+        "settings": settings,
         "excluded_object_ids": [int(i) for i in table.label_ids if i not in set(ids)],
         "effective_folds": len(splits),
         "prediction_model": prediction_model,
@@ -329,9 +361,19 @@ def classify_embedding(table, destination, settings):
 
 
 def compare(embeddings, destination, settings):
+    from morphofeatures.analysis.fusion import dataset_namespace
+    from morphofeatures.analysis.variants import run_configured_variants, validate_variants
+
+    validate_variants(settings)
+    if settings.get("bilateral", {}).get("enabled"):
+        from morphofeatures.analysis.bilateral import validate_bilateral
+
+        with prefix_fields("bilateral"):
+            validate_bilateral(settings["bilateral"], representation_count=len(embeddings))
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
-    if len(embeddings) < 2:
+    normalizations = analysis_normalizations(settings)
+    if len(embeddings) * len(normalizations) < 2:
         raise ValueError("Comparison requires at least two representations")
     tables = {name: load_embeddings(Path(path)).sorted() for name, path in embeddings.items()}
     extraction_metadata = {}
@@ -340,14 +382,9 @@ def compare(embeddings, destination, settings):
         metadata_path = Path(path).with_suffix(".metadata.json")
         if metadata_path.exists():
             extraction_metadata[name] = json.loads(metadata_path.read_text())
-            sources = extraction_metadata[name].get("sources", {})
-            data_sources = {
-                key: value
-                for key, value in sources.items()
-                if key in {"crops", "label_ids", "patches_container", "positions_container"}
-            }
-            if data_sources:
-                source_signatures.append(json.dumps(data_sources, sort_keys=True))
+            namespace = dataset_namespace(extraction_metadata[name])
+            if namespace:
+                source_signatures.append(namespace)
     if len(set(source_signatures)) > 1:
         raise ValueError(
             "Embedding provenance refers to different target datasets; extract the same object source for each representation"
@@ -361,12 +398,12 @@ def compare(embeddings, destination, settings):
         name: sorted(int(i) for i in set(t.label_ids) - set(ids)) for name, t in tables.items()
     }
     annotation_excluded = []
-    splits = None
     # Classification is shared with standalone analysis, including rare-class
     # filtering, ID-sorted fold assignment, and out-of-fold predictions.
     report = {
         "schema": "morphofeatures.comparison.v1",
         "settings": settings,
+        "analysis_normalizations": normalizations,
         "matched_objects": len(ids),
         "excluded_from_matching": excluded,
         "excluded_from_evaluation": annotation_excluded,
@@ -381,33 +418,49 @@ def compare(embeddings, destination, settings):
             "representation_training_exposure": "not inferred; report whether the representation was trained on evaluation specimens",
         },
         "representations": {},
-        "interpretation": "Evaluate biological tasks using held-out metrics; projections alone do not establish quality."
-        if splits
+        "interpretation": "Known labels color these exploratory maps; classifier evaluation is disabled. See the originating experiment for any separately fitted validation results."
+        if settings.get("annotations") and not settings.get("classify", True)
         else "No labels supplied: only exploratory neighborhoods and clustering diagnostics; predictive biological value and generalization remain untested.",
     }
     frames = []
-    for index, (name, table) in enumerate(tables.items()):
+    conditions = [
+        (name, table, normalization)
+        for name, table in tables.items() for normalization in normalizations
+    ]
+    for index, (input_name, table, normalization) in enumerate(conditions):
+        name = (
+            f"{input_name} · {NORMALIZATION_NAMES[normalization]}"
+            if len(normalizations) > 1 else input_name
+        )
+        effective = {**settings, "normalization": normalization}
+        effective.pop("analysis_normalizations", None)
         sub = destination / f"representation-{index}"
         sub.mkdir(exist_ok=True)
         features = table.features[np.searchsorted(table.label_ids, ids)]
         export_embeddings(sub / "embeddings.npz", ids, features)
-        frame, diagnostics = project_table(ids, features, settings)
+        frame, diagnostics = project_table(ids, features, effective)
         result = {
+            "input_representation": input_name,
+            "normalization": normalization,
+            "settings": effective,
             "directory": sub.name,
-            "source": fingerprint_file(embeddings[name]),
+            "source": fingerprint_file(embeddings[input_name]),
             "diagnostics": diagnostics,
             "dimensions": features.shape[1],
             "feature_bytes": features.nbytes,
         }
-        metadata = Path(embeddings[name]).with_suffix(".metadata.json")
+        metadata = Path(embeddings[input_name]).with_suffix(".metadata.json")
         if metadata.exists():
             result["extraction"] = json.loads(metadata.read_text())
-        labels = join_labels(ids, settings)
+            write_json_atomic(sub / "embeddings.metadata.json", result["extraction"])
+            if result["extraction"].get("supervision"):
+                report.setdefault("representation_fit_warnings", {})[name] = result["extraction"]["supervision"]["warning"]
+        labels = join_labels(ids, effective)
         if settings.get("annotations") and settings.get("classify", True):
             from morphofeatures.data.contracts import EmbeddingTable
 
             result["classification"] = classify_embedding(
-                EmbeddingTable(ids, features), sub, settings
+                EmbeddingTable(ids, features), sub, effective
             )
             result["evaluation"] = result["classification"]["fold_metrics"]
             labels = pd.read_csv(sub / "object_labels.tsv", sep="\t", dtype={"label_id": np.int64})
@@ -423,7 +476,7 @@ def compare(embeddings, destination, settings):
             sub / "object_labels.tsv", sep="\t", index=False
         )
         frame.to_csv(sub / "coordinates.tsv", sep="\t", index=False)
-        save_figure(frame, sub / "projection.svg", name, settings)
+        save_figure(frame, sub / "projection.svg", name, effective)
         frame["representation"] = name
         frames.append(frame)
         report["representations"][name] = result
@@ -437,17 +490,17 @@ def compare(embeddings, destination, settings):
         "",
         f"Matched objects: {len(ids)}. Objects without evaluation labels: {len(report['excluded_from_evaluation'])}.",
         "",
-        "The same folds and one fixed downstream parameter set are used for every representation. "
-        "Scaling and optional evaluation PCA are fitted on training folds only. "
+        "The same folds are used for every representation and scaling condition. "
+        "Classifier scaling and PCA/UMAP are fitted on training folds only. "
         "Representation pretraining exposure must be assessed separately.",
         "",
-        "| Representation | Dimensions | Extraction seconds | Training cost |",
-        "|---|---:|---:|---|",
+        "| Representation | Analysis scaling | Dimensions | Extraction seconds | Training cost |",
+        "|---|---|---:|---:|---|",
     ]
     for name, result in report["representations"].items():
         extraction = result.get("extraction", {})
         lines.append(
-            f"| {str(name).replace('|', '/')} | {result['dimensions']} | {extraction.get('extraction_seconds', 'unavailable')} | {str(extraction.get('training_cost', 'unavailable')).replace('|', '/')} |"
+            f"| {str(name).replace('|', '/')} | {NORMALIZATION_NAMES[result['normalization']]} | {result['dimensions']} | {extraction.get('extraction_seconds', 'unavailable')} | {str(extraction.get('training_cost', 'unavailable')).replace('|', '/')} |"
         )
         if result.get("evaluation"):
             scores = pd.DataFrame(result["evaluation"])
@@ -469,7 +522,14 @@ def compare(embeddings, destination, settings):
         ]
     )
     (destination / "report.md").write_text("\n".join(lines) + "\n")
+    if settings.get("bilateral", {}).get("enabled"):
+        from morphofeatures.analysis.bilateral import run_bilateral
+
+        with prefix_fields("bilateral"):
+            run_bilateral(embeddings, destination / "bilateral", settings["bilateral"])
+        report["bilateral"] = "bilateral/bilateral.json"
     path = write_json_atomic(destination / "comparison.json", report)
+    run_configured_variants(path, settings)
     package_results(destination)
     return path
 

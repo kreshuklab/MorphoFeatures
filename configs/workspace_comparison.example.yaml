@@ -58,6 +58,12 @@ stages:
     evaluation_pca: null
     normalization: standardize
     umap: true
+    umap_pca_components: null # Try 50 to reduce normalized vectors before UMAP; null/0 disables.
+    cluster_pca_components: null # Independent PCA before K-means/Leiden; null/0 uses full normalized vectors.
+    analysis_variants: [] # Additional named combinations; extraction/classification are reused.
+    # analysis_variants:
+    #   - {name: PCA50 K8, cluster_pca_components: 50, umap_pca_components: 50}
+    #   - {name: PCA50 K12, clusters: 12, cluster_pca_components: 50, umap_pca_components: 50}
     neighbors: 15
     min_dist: 0.0
     umap_epochs: 50

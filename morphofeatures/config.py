@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import os
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import yaml
-
 
 DATA_ROOT_ENV = "MORPHOFEATURES_DATA_ROOT"
 OUTPUT_ROOT_ENV = "MORPHOFEATURES_OUTPUT_ROOT"
@@ -49,14 +49,25 @@ def load_config(path: Optional[Path] = None) -> PipelineConfig:
         with config_path.open("r", encoding="utf-8") as stream:
             raw = yaml.safe_load(stream) or {}
 
+    return config_from_mapping(raw, base=config_path.parent)
+
+
+def config_from_mapping(raw, *, base, apply_environment=True) -> PipelineConfig:
+    """Resolve a defaults document without writing a temporary configuration file.
+
+    Loading a file retains environment overrides. Explicit UI edits use
+    ``apply_environment=False`` so their preview and exported paths agree.
+    """
+    raw = deepcopy(raw)
+    if not isinstance(raw, dict) or not isinstance(raw.get("paths", {}), dict):
+        raise ValueError("Workspace YAML must contain a mapping with a paths mapping")
     path_config = raw.get("paths", {})
-    configured_repo = _resolve(path_config.get("repo_root", str(repo_root)), config_path.parent)
-    data_root_value = os.environ.get(
-        DATA_ROOT_ENV, path_config.get("data_root", str(configured_repo))
-    )
-    output_root_value = os.environ.get(
-        OUTPUT_ROOT_ENV, path_config.get("output_root", "outputs")
-    )
+    configured_repo = _resolve(path_config.get("repo_root", str(repository_root())), Path(base))
+    data_root_value = path_config.get("data_root", str(configured_repo))
+    output_root_value = path_config.get("output_root", "outputs")
+    if apply_environment:
+        data_root_value = os.environ.get(DATA_ROOT_ENV, data_root_value)
+        output_root_value = os.environ.get(OUTPUT_ROOT_ENV, output_root_value)
     data_root = _resolve(data_root_value, configured_repo)
     paths = PathsConfig(
         repo_root=configured_repo,

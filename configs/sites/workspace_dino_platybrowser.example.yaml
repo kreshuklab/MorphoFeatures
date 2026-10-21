@@ -1,0 +1,63 @@
+# A small public Platynereis pilot. Edit checkpoint/checkout paths before use.
+# No private image endpoints or changes to existing site configurations.
+stages:
+  - action: dino_experiment
+    datasets:
+      - name: Platynereis
+        source:
+          source: platybrowser
+          platybrowser:
+            project_url: https://github.com/mobie/platybrowser-project
+            revision: 2d231ac5dcd55d6d97436ad544f8fc5791fab3c7
+            dataset: '1.0.1'
+            raw_source: raw
+            segmentation_source: nuclei
+            raw_level: 1
+            segmentation_level: 0
+            object_ids: segmentation # Use cell only when annotations contain corresponding cell IDs.
+            cache_directory: ../../outputs/remote_cache/platybrowser
+            cache_size_mb: 1024
+            timeout_seconds: 20
+          object_ids: null
+          roi: null # Published object bounds avoid a full remote segmentation scan.
+          max_object_voxels: 16777216
+        annotations: null
+        label_column: auto
+        group_column: null
+    backbones:
+      - model: dinov2
+        variant: dinov2_vits14
+        checkpoint: /path/to/dinov2_vits14_pretrain.pth
+        model_repository: /path/to/official/dinov2
+    max_objects: 100
+    seed: 42
+    device: auto
+    cache: ../../outputs/embedding_cache
+    tile_sizes_um: [1.0]
+    views:
+      mode: both
+      size: 224
+      axes: [0, 1, 2]
+      coarse_fractions: [0.1, 0.3, 0.5, 0.7, 0.9]
+      fine_fractions: [0.5]
+      max_tiles: 64
+      min_foreground_fraction: 0.01
+      exhaustive: false
+      normalization: foreground_percentile
+      percentiles: [1, 99]
+      resize: letterbox
+      mask: true
+      aggregation: mean
+      batch_size: 16
+    fusion_weights: [0.5, 0.5]
+    classify: true
+    folds: 5
+    umap: true
+    clusters: 8
+    transfer: {enabled: false, reference: Platynereis}
+slurm:
+  partition: gpu
+  cpus: 4
+  gpus: 1
+  memory: 32G
+  time: '04:00:00'

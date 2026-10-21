@@ -16,8 +16,54 @@ from morphofeatures.config import load_config
 from morphofeatures.data.io import load_embeddings
 
 
-@pytest.mark.parametrize("model", ["logistic", "mlp"])
-def test_workflow_classifier_matches_tools_by_id(tmp_path, model):
+def test_scaling_conditions_refit_classifiers_on_identical_folds(tmp_path, monkeypatch):
+    from morphofeatures.data.io import export_embeddings
+    from morphofeatures.representation_analysis import analyze
+
+    # Class information is in vector length, which per-object L2 removes.
+    rng = np.random.default_rng(42)
+    ids = np.arange(40, dtype=np.int64) + 2**53 + 1
+    features = np.tile([1.0, 2.0, 3.0], (40, 1)) * np.repeat([1.0, 8.0], 20)[:, None]
+    features *= rng.uniform(0.999, 1.001, features.shape)
+    embedding = export_embeddings(tmp_path / "input.npz", ids[::-1], features[::-1])
+    annotations = tmp_path / "labels.tsv"
+    pd.DataFrame({"label_id": ids, "label": np.repeat(["small", "large"], 20)}).to_csv(annotations, sep="\t", index=False)
+    monkeypatch.setattr("morphofeatures.representation_analysis.save_figure", lambda *a, **k: None)
+    path = analyze(embedding, tmp_path / "comparison", {
+        "analysis_normalizations": ["none", "l2", "standardize"],
+        "annotations": str(annotations), "label_column": "label", "classifier_models": ["logistic"],
+        "classifier_standardize": False, "folds": 4, "clusters": 2, "umap": False, "seed": 42,
+    })
+    report = json.loads(path.read_text())
+    assert report["schema"] == "morphofeatures.comparison.v1"
+    entries = {v["normalization"]: v for v in report["representations"].values()}
+    assert set(entries) == {"none", "l2", "standardize"}
+    splits = set()
+    for normalization, entry in entries.items():
+        assert entry["classification"]["settings"]["normalization"] == normalization
+        assert entry["diagnostics"]["projection_settings"]["normalization"] == normalization
+        folder = path.parent / entry["directory"]
+        table = load_embeddings(folder / "embeddings.npz")
+        np.testing.assert_array_equal(table.label_ids, ids)
+        np.testing.assert_allclose(table.features, features)
+        splits.add((folder / "splits.tsv").read_bytes())
+    assert len(splits) == 1
+    assert entries["none"]["classification"]["mean_metrics"]["linear_accuracy"] == 1.0
+    assert entries["l2"]["classification"]["mean_metrics"]["linear_accuracy"] < 0.8
+
+
+@pytest.mark.parametrize("value", [[], ["none", "none"], ["raw"], "l2", [None]])
+def test_invalid_scaling_conditions_fail_before_reading_embeddings(tmp_path, value):
+    from morphofeatures.representation_analysis import analyze
+    from morphofeatures.workflow_validation import FieldError
+
+    with pytest.raises(FieldError, match="scaling") as error:
+        analyze(tmp_path / "missing.npz", tmp_path / "out", {"analysis_normalizations": value})
+    assert ("analysis_normalizations",) in error.value.fields
+
+
+@pytest.mark.parametrize("model,space", [("logistic", "embeddings"), ("mlp", "embeddings"), ("logistic", "pca"), ("logistic", "umap")])
+def test_workflow_classifier_matches_tools_by_id(tmp_path, model, space):
     from morphofeatures.analysis.classification import evaluate_embedding_classifier
     from morphofeatures.data.io import export_embeddings
     from morphofeatures.representation_analysis import classify_embedding
@@ -33,8 +79,25 @@ def test_workflow_classifier_matches_tools_by_id(tmp_path, model):
     annotations.sample(frac=1, random_state=5).to_csv(
         tmp_path / "labels.tsv", sep="\t", index=False
     )
+    options = (
+        {}
+        if space == "embeddings"
+        else {
+            "classifier_space": space,
+            "classifier_dimensions": 2,
+            "classifier_standardize": True,
+            "classifier_umap_epochs": 12,
+            "classifier_umap_neighbors": 4,
+        }
+    )
     tool = evaluate_embedding_classifier(
-        path, tmp_path / "labels.tsv", model=model, folds=3, seed=7, max_iter=100
+        path,
+        tmp_path / "labels.tsv",
+        model=model,
+        folds=3,
+        seed=7,
+        max_iter=100,
+        classifier_settings=options,
     )
     destination = tmp_path / "central"
     destination.mkdir()
@@ -48,6 +111,7 @@ def test_workflow_classifier_matches_tools_by_id(tmp_path, model):
             "folds": 3,
             "seed": 7,
             "max_iter": 100,
+            **options,
         },
     )
     predictions = pd.read_csv(destination / "predictions.tsv", sep="\t").set_index("label_id")
@@ -60,6 +124,48 @@ def test_workflow_classifier_matches_tools_by_id(tmp_path, model):
     assert labels.loc[ids[36:], "prediction_source"].eq("fit_on_labeled_objects").all()
     assert labels.loc[ids[36:], "predicted_label"].notna().all()
     assert labels.loc[ids[36], "known_label"] == "rare"
+
+
+def test_classifier_projection_is_training_only_and_unsupervised(monkeypatch):
+    from umap import UMAP
+
+    from morphofeatures.analysis.classification import configured_classifier
+    from morphofeatures.representation_analysis import evaluate_features
+
+    rng = np.random.default_rng(8)
+    features = rng.normal(size=(16, 4))
+    labels = np.repeat(["a", "b"], 8)
+    train, test = np.array([0, 1, 2, 3, 8, 9, 10, 11]), np.array([4, 5, 6, 7, 12, 13, 14, 15])
+    captured = []
+    original = UMAP.fit
+
+    def fit(self, X, y=None, **kwargs):
+        assert y is None  # sklearn pipelines must not turn this into supervised UMAP.
+        captured.append(np.array(X))
+        return original(self, X, **kwargs)
+
+    monkeypatch.setattr(UMAP, "fit", fit)
+    settings = {
+        "normalization": "none",
+        "classifier_space": "umap",
+        "classifier_dimensions": 2,
+        "classifier_standardize": True,
+        "classifier_umap_epochs": 12,
+        "classifier_umap_neighbors": 3,
+        "classifier_models": ["logistic", "knn"],
+        "clusters": 2,
+    }
+    evaluate_features(features, labels, [(train, test)], settings)
+    assert len(captured) == 1  # The same training-fitted map is shared by classifiers.
+    np.testing.assert_allclose(captured[0], features[train], rtol=1e-6)
+    for space in ("pca", "umap"):
+        model = configured_classifier(
+            "linear", {**settings, "classifier_space": space}, train_count=len(train)
+        ).fit(features[train], labels[train])
+        selected = model[:-1].transform(features[train])
+        np.testing.assert_allclose(selected.mean(0), 0, atol=1e-6)
+        np.testing.assert_allclose(selected.std(0), 1, atol=1e-6)
+        assert np.isfinite(model.predict_proba(features[test])).all()
 
 
 def test_annotations_preserve_large_and_decimal_ids_and_missing_types(tmp_path):
@@ -75,14 +181,15 @@ def test_annotations_preserve_large_and_decimal_ids_and_missing_types(tmp_path):
         read_annotations(path)
 
 
-def test_projection_subset_is_id_stable_and_uses_shared_tool_defaults():
+@pytest.mark.parametrize("pca_components", [None, 3])
+def test_projection_subset_is_id_stable_and_uses_shared_tool_defaults(pca_components):
     pytest.importorskip("umap")
     from morphofeatures.analysis.projection import project_embeddings
     from morphofeatures.representation_analysis import project_table
 
     ids = np.arange(36, dtype=np.int64) + 101
     features = np.random.default_rng(5).normal(size=(36, 6))
-    settings = {"subset": 24, "umap_epochs": 20, "seed": 5}
+    settings = {"subset": 24, "umap_epochs": 20, "seed": 5, "umap_pca_components": pca_components}
     tool, diagnostics = project_embeddings(ids, features, settings)
     order = np.random.default_rng(11).permutation(len(ids))
     central, _ = project_table(ids[order], features[order], settings)
@@ -90,6 +197,54 @@ def test_projection_subset_is_id_stable_and_uses_shared_tool_defaults():
     assert len(tool) == 24 and {"umap_1", "pca_1", "cluster"} <= set(tool)
     assert diagnostics["projection_settings"]["min_dist"] == 0.0
     assert diagnostics["clusters_observed"] == 8
+    assert diagnostics["umap_input"]["effective_components"] == pca_components
+
+
+@pytest.mark.parametrize("requested,effective", [(None, None), (0, None), (3, 3), (50, 5)])
+def test_pca_before_umap_uses_normalized_cohort_and_preserves_other_outputs(
+    monkeypatch, requested, effective
+):
+    from sklearn.decomposition import PCA
+
+    from morphofeatures.analysis import projection
+
+    features = np.random.default_rng(6).normal(size=(10, 8)) * np.arange(1, 9)
+    ids = np.arange(10, dtype=np.int64) + 2**53 + 5
+    original = features.copy()
+    received = []
+
+    def capture(data, **kwargs):
+        received.append(data.copy())
+        return np.zeros((len(data), 2))
+
+    monkeypatch.setattr(projection, "compute_umap", capture)
+    settings = {"subset": 6, "seed": 3, "clusters": 2, "umap_pca_components": requested}
+    frame, diagnostics = projection.project_embeddings(ids, features, settings)
+    selected = features[np.searchsorted(ids, frame.label_id)]
+    normalized = StandardScaler().fit_transform(selected)
+    expected = normalized
+    if effective:
+        fit = PCA(n_components=effective, random_state=3).fit(normalized)
+        expected = fit.transform(normalized)
+        assert diagnostics["umap_input"]["explained_variance_ratio_sum"] == pytest.approx(
+            fit.explained_variance_ratio_.sum()
+        )
+    np.testing.assert_allclose(received[0], expected, atol=1e-12)
+    assert diagnostics["umap_input"]["effective_components"] == effective
+    assert diagnostics["umap_input"]["fitted_objects"] == 6
+    baseline, _ = projection.project_embeddings(ids, features, {**settings, "umap": False})
+    pd.testing.assert_frame_equal(frame.drop(columns=["umap_1", "umap_2"]), baseline)
+    np.testing.assert_array_equal(features, original)
+
+
+@pytest.mark.parametrize("invalid", [-1, 1.5, True, "50", [50]])
+def test_umap_pca_validation_identifies_the_field(invalid):
+    from morphofeatures.analysis.projection import validate_projection_settings
+    from morphofeatures.workflow_validation import FieldError
+
+    with pytest.raises(FieldError, match="positive whole number") as caught:
+        validate_projection_settings({"umap_pca_components": invalid})
+    assert caught.value.fields == (("umap_pca_components",),)
 
 
 def test_known_label_overlay_does_not_require_classification(tmp_path):

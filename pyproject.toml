@@ -16,6 +16,7 @@ dependencies = [
   "scipy>=1.9,<2",
   "scikit-learn>=1.2,<2",
   "PyYAML>=6,<7",
+  "psutil>=5.9,<8",
 ]
 
 [project.optional-dependencies]

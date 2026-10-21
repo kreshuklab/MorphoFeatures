@@ -31,8 +31,13 @@ def fingerprint_file(path):
 
 
 def extraction_identity(settings):
+    from morphofeatures.data.object_selection import selection_sources
+
     paths = {"checkpoint": fingerprint_file(settings["checkpoint"])}
-    for key in ("crops", "label_ids", "loss_masks", "patches_container", "positions_container"):
+    selections = selection_sources(settings)
+    if selections:
+        paths["object_selection"] = selections
+    for key in ("crops", "label_ids", "loss_masks", "patches_container", "positions_container", "patch_label_ids", "patch_offsets", "positions_um", "preprocessing"):
         value = settings.get("config", {}).get("data", {}).get(key)
         if isinstance(value, str) and value:
             paths[key] = fingerprint_file(value)
@@ -47,6 +52,16 @@ def extraction_identity(settings):
 
 
 def extract_representation(settings, destination, writer=None):
+    from morphofeatures.data.object_selection import validate_extraction_selection
+
+    validate_extraction_selection(settings)
+    if settings.get("model") in {"dinov2", "dinov3"} and settings.get("views", {}).get("mode", "stored") != "stored":
+        from morphofeatures.dino_physical import extract_physical
+
+        paths = extract_physical(settings, destination, writer=writer)
+        mode = settings["views"]["mode"]
+        mode = "fixed_tiles" if mode == "both" else mode
+        return paths[mode + "." + settings["views"].get("feature", "cls")]
     data = settings.get("config", {}).get("data", {})
     if (
         data.get("crops")
@@ -65,6 +80,11 @@ def extract_representation(settings, destination, writer=None):
     metadata_path = output.with_suffix(".metadata.json")
     if output.exists() and metadata_path.exists():
         load_embeddings(output)
+        cached_metadata = json.loads(metadata_path.read_text())
+        if cached_metadata.get("object_selection"):
+            from morphofeatures.data.object_selection import write_selection
+
+            write_selection(destination, cached_metadata["object_selection"])
         write_json_atomic(
             destination / "result.json", {"embedding": str(output.resolve()), "cache_hit": True}
         )
@@ -87,9 +107,15 @@ def extract_representation(settings, destination, writer=None):
         )
         encode_from_config(config_path, Path(settings["checkpoint"]), output)
     else:
+        from morphofeatures.data.object_selection import write_selection
         from morphofeatures.dino import extract_dino
 
-        ids, features, excluded = extract_dino(settings, progress=writer)
+        selection_audit = {}
+        try:
+            ids, features, excluded = extract_dino(settings, progress=writer, selection_report=selection_audit)
+        finally:
+            if selection_audit:
+                write_selection(destination, selection_audit)
         export_embeddings(output, ids, features)
     table = load_embeddings(output)
     metadata = {
@@ -105,8 +131,16 @@ def extract_representation(settings, destination, writer=None):
         "extraction_seconds": time.perf_counter() - started,
         "process_peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         "training_cost": settings.get("training_cost", "not measured here"),
+        "input_coverage": "Limited to the supplied crops or grouped patches; complete-label coverage is not established.",
         "excluded_objects": excluded,
     }
+    if settings.get("model", "mae") != "mae" and selection_audit:
+        from morphofeatures.data.object_selection import write_selection
+
+        selection_audit["encoded"] = len(table.label_ids)
+        selection_audit["extraction_exclusions"] = excluded
+        write_selection(destination, selection_audit)
+        metadata["object_selection"] = selection_audit
     if torch.cuda.is_available():
         metadata["cuda_peak_allocated_bytes"] = torch.cuda.max_memory_allocated()
     from importlib.metadata import PackageNotFoundError, version
@@ -120,6 +154,10 @@ def extract_representation(settings, destination, writer=None):
     preprocessing = settings.get("config", {}).get("data", {}).get("preprocessing")
     if preprocessing and Path(preprocessing).is_file():
         metadata["preprocessing"] = json.loads(Path(preprocessing).read_text())
+        if settings.get("config", {}).get("data", {}).get("source") == "grouped_crops":
+            # Fine-patch files are a view of the original objects, not a new
+            # dataset. Preserve their namespace for fusion with coarse views.
+            metadata["dataset_identity"] = metadata["preprocessing"]["dataset_identity"]
     if output.with_suffix(output.suffix + ".metadata.json").exists():
         metadata["mae_details"] = json.loads(
             output.with_suffix(output.suffix + ".metadata.json").read_text()

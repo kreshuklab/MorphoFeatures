@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import confusion_matrix
@@ -31,6 +32,199 @@ LEGACY_CELL_TYPES = (
 )
 
 
+CLASSIFIER_NAMES = {
+    "logistic": "Linear classifier (logistic regression)",
+    "linear": "Linear classifier (logistic regression)",
+    "mlp": "MLP neural network",
+    "knn": "K-nearest neighbors",
+}
+
+
+class UnsupervisedUMAP(TransformerMixin, BaseEstimator):
+    """Training-only UMAP with bounded exact-neighbor transforms and numeric persistence.
+
+    A normal sklearn Pipeline passes y to its transformers. UMAP would then use
+    the class labels to build a supervised map, so deliberately ignore y here.
+    Exact transform neighbors avoid serializing executable ANN search objects.
+    """
+
+    def __init__(self, n_components=2, n_neighbors=15, min_dist=0.1, n_epochs=200, seed=42):
+        self.n_components = n_components
+        self.n_neighbors = n_neighbors
+        self.min_dist = min_dist
+        self.n_epochs = n_epochs
+        self.seed = seed
+
+    def _model(self, count):
+        from umap import UMAP
+
+        return UMAP(
+            n_components=self.n_components,
+            n_neighbors=min(self.n_neighbors, count - 1),
+            min_dist=self.min_dist,
+            n_epochs=self.n_epochs,
+            random_state=self.seed,
+            transform_seed=self.seed,
+            init="random",
+            n_jobs=1,
+            metric="euclidean",
+        )
+
+    def fit(self, X, y=None):
+        X = np.asarray(X, dtype=np.float32, order="C")
+        if len(X) < 4:
+            raise ValueError(
+                "Classifier UMAP requires at least four objects in every training fold"
+            )
+        self.reducer_ = self._model(len(X)).fit(X)  # Never pass y to UMAP.
+        # Use this same transform implementation before and after saving a reference.
+        self.reducer_._small_data = True
+        self.reducer_._input_distance_func = "euclidean"
+        if hasattr(self.reducer_, "_knn_search_index"):
+            del self.reducer_._knn_search_index
+        self.n_features_in_ = X.shape[1]
+        return self
+
+    def transform(self, X):
+        from sklearn.utils.validation import check_is_fitted
+
+        check_is_fitted(self, "reducer_")
+        X = np.asarray(X, dtype=np.float32, order="C")
+        if X.ndim != 2 or X.shape[1] != self.n_features_in_ or not np.isfinite(X).all():
+            raise ValueError(
+                "Classifier UMAP inputs must be finite and match the fitted feature dimensions"
+            )
+        raw = self.reducer_._raw_data
+        if X.shape == raw.shape and np.array_equal(X, raw):
+            return self.reducer_.embedding_.copy()
+        if not len(X):
+            return np.empty((0, self.n_components), dtype=np.float32)
+        batch = max(1, min(128, 2_000_000 // len(raw)))
+        result = np.concatenate(
+            [self.reducer_.transform(X[i : i + batch]) for i in range(0, len(X), batch)]
+        )
+        if not np.isfinite(result).all():
+            raise ValueError(
+                "Classifier UMAP produced nonfinite coordinates; revise the classifier projection settings"
+            )
+        return result
+
+    def numeric_state(self):
+        import umap
+
+        return (
+            {
+                "version": umap.__version__,
+                "a": float(self.reducer_._a),
+                "b": float(self.reducer_._b),
+                "initial_alpha": float(self.reducer_._initial_alpha),
+            },
+            self.reducer_._raw_data,
+            self.reducer_.embedding_,
+        )
+
+    def restore_numeric(self, state, raw, embedding):
+        import joblib
+        import umap
+
+        if state["version"] != umap.__version__:
+            raise ValueError(
+                f"This reference UMAP was saved with umap-learn {state['version']}; use that version to reuse its fitted transform"
+            )
+        raw = np.asarray(raw, dtype=np.float32, order="C")
+        self.reducer_ = self._model(len(raw))
+        # Attributes used by UMAP's euclidean, dense, exact-neighbor transform path.
+        self.reducer_._raw_data = raw
+        self.reducer_.embedding_ = np.asarray(embedding, dtype=np.float32)
+        self.reducer_._input_hash = joblib.hash(raw)
+        self.reducer_._n_neighbors = min(self.n_neighbors, len(raw) - 1)
+        self.reducer_._small_data = True
+        self.reducer_._sparse_data = False
+        self.reducer_._input_distance_func = "euclidean"
+        self.reducer_._metric_kwds = {}
+        self.reducer_._disconnection_distance = np.inf
+        self.reducer_._a, self.reducer_._b = state["a"], state["b"]
+        self.reducer_._initial_alpha = state["initial_alpha"]
+        self.reducer_.tqdm_kwds = {}
+        self.n_features_in_ = raw.shape[1]
+        return self
+
+
+def classifier_space(settings):
+    return settings.get("classifier_space") or (
+        "pca" if settings.get("evaluation_pca") else "embeddings"
+    )
+
+
+def classifier_preprocessing(
+    *,
+    normalization="standardize",
+    evaluation_pca=None,
+    classifier_space=None,
+    classifier_dimensions=None,
+    classifier_standardize=False,
+    classifier_umap_neighbors=15,
+    classifier_umap_min_dist=0.1,
+    classifier_umap_epochs=200,
+    seed=42,
+):
+    from sklearn.decomposition import PCA
+
+    steps = []
+    if normalization == "standardize":
+        steps.append(StandardScaler())
+    elif normalization == "l2":
+        steps.append(Normalizer())
+    elif normalization != "none":
+        raise ValueError("normalization must be standardize, l2, or none")
+    space = classifier_space or ("pca" if evaluation_pca else "embeddings")
+    if space not in {"embeddings", "pca", "umap"}:
+        raise ValueError("classifier_space must be embeddings, pca or umap")
+    if space != "embeddings":
+        dimensions = (
+            classifier_dimensions
+            if classifier_dimensions is not None
+            else evaluation_pca
+            if space == "pca" and evaluation_pca
+            else 2
+        )
+        if isinstance(dimensions, bool) or int(dimensions) != dimensions or int(dimensions) < 1:
+            raise ValueError("Classifier dimensions must be a positive integer")
+        if space == "pca":
+            steps.append(PCA(n_components=int(dimensions), random_state=int(seed)))
+        else:
+            if (
+                int(classifier_umap_neighbors) < 2
+                or int(classifier_umap_neighbors) != classifier_umap_neighbors
+            ):
+                raise ValueError("Classifier UMAP neighbors must be an integer of at least 2")
+            if not 0 <= float(classifier_umap_min_dist) <= 1:
+                raise ValueError("Classifier UMAP minimum distance must be between 0 and 1")
+            if (
+                int(classifier_umap_epochs) < 3
+                or int(classifier_umap_epochs) != classifier_umap_epochs
+            ):
+                raise ValueError("Classifier UMAP epochs must be an integer of at least 3")
+            steps.append(
+                UnsupervisedUMAP(
+                    int(dimensions),
+                    int(classifier_umap_neighbors),
+                    float(classifier_umap_min_dist),
+                    int(classifier_umap_epochs),
+                    int(seed),
+                )
+            )
+    if classifier_standardize:
+        steps.append(StandardScaler())
+    return steps
+
+
+CLASSIFIER_TRANSFORM_KEYS = (
+    "classifier_space", "classifier_dimensions", "classifier_standardize",
+    "classifier_umap_neighbors", "classifier_umap_min_dist", "classifier_umap_epochs",
+)
+
+
 def classifier_pipeline(
     model="logistic",
     *,
@@ -42,20 +236,27 @@ def classifier_pipeline(
     class_weight="balanced",
     hidden_dimensions=(64,),
     knn_k=5,
+    classifier_space=None,
+    classifier_dimensions=None,
+    classifier_standardize=False,
+    classifier_umap_neighbors=15,
+    classifier_umap_min_dist=0.1,
+    classifier_umap_epochs=200,
 ):
     """The shared Tools/workflow estimator; fit preprocessing on training rows only."""
-    from sklearn.decomposition import PCA
     from sklearn.neighbors import KNeighborsClassifier
 
-    steps = []
-    if normalization == "standardize":
-        steps.append(StandardScaler())
-    elif normalization == "l2":
-        steps.append(Normalizer())
-    elif normalization != "none":
-        raise ValueError("normalization must be standardize, l2, or none")
-    if evaluation_pca:
-        steps.append(PCA(n_components=int(evaluation_pca), random_state=int(seed)))
+    steps = classifier_preprocessing(
+        normalization=normalization,
+        evaluation_pca=evaluation_pca,
+        seed=seed,
+        classifier_space=classifier_space,
+        classifier_dimensions=classifier_dimensions,
+        classifier_standardize=classifier_standardize,
+        classifier_umap_neighbors=classifier_umap_neighbors,
+        classifier_umap_min_dist=classifier_umap_min_dist,
+        classifier_umap_epochs=classifier_umap_epochs,
+    )
     if model in {"logistic", "linear"}:
         estimator = LogisticRegression(
             C=float(c),
@@ -95,6 +296,7 @@ def configured_classifier(model, settings, *, train_count):
         class_weight=settings.get("class_weight", "balanced"),
         hidden_dimensions=settings.get("hidden_dimensions", [64]),
         knn_k=min(int(settings.get("knn_k", 5)), train_count),
+        **{k: settings[k] for k in CLASSIFIER_TRANSFORM_KEYS if k in settings},
     )
 
 
@@ -195,6 +397,7 @@ def cross_validate_shallow_classifier(
     class_weight: str | None = None,
     hidden_dimensions: Sequence[int] = (64,),
     label_ids: np.ndarray | None = None,
+    classifier_settings: dict | None = None,
 ) -> ClassificationResult:
     """Evaluate a linear probe or one-hidden-layer MLP without scaling leakage."""
 
@@ -225,6 +428,11 @@ def cross_validate_shallow_classifier(
                 c=c,
                 class_weight=class_weight,
                 hidden_dimensions=hidden_dimensions,
+                **{
+                    k: v
+                    for k, v in (classifier_settings or {}).items()
+                    if k in (*CLASSIFIER_TRANSFORM_KEYS, "normalization", "evaluation_pca")
+                },
             )
             pipeline.fit(features[train_indices], labels[train_indices])
             fold_predictions = pipeline.predict(features[test_indices])
@@ -257,6 +465,7 @@ def evaluate_embedding_classifier(
     hidden_dimensions: Sequence[int] = (64,),
     minimum_class_count: int = 2,
     skip_types: Iterable[str] | None = None,
+    classifier_settings: dict | None = None,
 ) -> ClassificationResult:
     """Join annotations by ``label_id``, run deterministic CV, and save interpretable tables."""
 
@@ -296,9 +505,10 @@ def evaluate_embedding_classifier(
         seed=seed,
         max_iter=max_iter,
         c=c,
-        class_weight=class_weight if model == "logistic" else None,
+        class_weight=class_weight if model in {"logistic", "linear"} else None,
         hidden_dimensions=hidden_dimensions,
         label_ids=matched_ids,
+        classifier_settings=classifier_settings,
     )
     if output_dir is not None:
         import json
@@ -317,6 +527,7 @@ def evaluate_embedding_classifier(
         ).to_csv(output / "cross_validated_predictions.tsv", sep="\t", index=False)
         summary = {
             "model": model,
+            "classifier_settings": {"normalization": "standardize", **(classifier_settings or {})},
             "embedding": str(Path(embedding_path).resolve()),
             "labels": str(Path(labels_path).resolve()),
             "n_matched": int(len(result.labels)),

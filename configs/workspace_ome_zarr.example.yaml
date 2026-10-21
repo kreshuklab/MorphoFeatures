@@ -1,0 +1,51 @@
+# Workflow → Start → Load settings from a file.
+# Paste your image-group / WEBKNOSSOS layer URLs below or in Prepare data.
+# Either layer can be previewed independently. Preparing objects requires BOTH.
+# Shared WEBKNOSSOS links may expire; use the source's current Zarr link.
+stages:
+  - action: preprocess
+    source: ome_zarr
+    ome_zarr:
+      raw:
+        url: null
+        image_index: 0  # First multiscale image in the group.
+        level: 0  # Zero-based entry in the resolutions list, NOT magnification.
+        channel: 0
+        timepoint: 0
+      segmentation:
+        url: null  # Add the matching instance-label layer when available.
+        image_index: 0
+        level: 0
+        channel: 0
+        timepoint: 0
+    remote_options:
+      format: ome_zarr
+      cache_directory: ../outputs/remote_cache/ome_zarr
+      cache_size_mb: 1024
+      timeout_seconds: 20
+      cache_version: '1'  # Change when hosted raw/segmentation content changes.
+    # null permits bounded previews anywhere in the volume.
+    # Before preprocessing, select an explicit ROI in the chosen level's ZYX grid:
+    # roi: [[100, 100, 100], [164, 164, 164]]
+    roi: null
+    max_scan_voxels: 2097152  # 128³; limits the label scan, independently of max_objects.
+    block_shape: [32, 32, 32]
+    read_budget_side: 256
+    max_objects: 8
+    crop_shape: [32, 32, 32]
+    output_format: h5
+    min_voxels: 10
+    center: bbox
+    oversized: clip
+    boundary: pad
+    roi_boundary: skip
+    # Suitable for floating-point denoised data, including negative intensities.
+    normalization: percentile
+    background: 0.0
+# Add MAE and/or DINO with Prepare data → Choose training and embedding stages.
+slurm:
+  partition: compute
+  cpus: 4
+  gpus: 0
+  memory: 8G
+  time: '01:00:00'

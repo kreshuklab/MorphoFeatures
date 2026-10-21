@@ -26,7 +26,6 @@ data:
 inspection:
   mesh:
     source: segmentation             # segmentation, prepared, or files
-    # /g/kreshuk/mansaray/copied/mobie_viz/pkd1_ncald/images/ome-zarr - containes raw nuc and segmented nuclei data
     segmentation: /g/kreshuk/data/arendt/platyneris_v1/data.n5
     segmentation_key: volumes/paintera/nuclei/data/s2
     segmentation_axes: zyx

@@ -1,0 +1,75 @@
+# Prepare reusable fine patches, then encode one DINO vector per native object ID.
+# Edit source geometry and local DINO paths before running. This is not an MAE input.
+# Guide: docs/workspace_workflows.md, "Distributed fine patches for DINO".
+stages:
+  - action: preprocess
+    layout: distributed_patches
+    source: local
+    raw: /path/to/raw.h5
+    raw_key: raw
+    raw_axes: zyx
+    segmentation: /path/to/nuclei.h5
+    segmentation_key: labels
+    segmentation_axes: zyx
+    unit: um
+    # Example measured spacings only; replace with YOUR image metadata.
+    raw_spacing_zyx: [0.025, 0.020, 0.020]
+    segmentation_spacing_zyx: [0.100, 0.080, 0.080]
+    raw_origin_zyx: [0.0, 0.0, 0.0]
+    segmentation_origin_zyx: [0.0, 0.0, 0.0]
+    # ROI is on the segmentation grid, stop exclusive. Edge-touching objects skip.
+    roi: [[0, 0, 0], [128, 128, 128]]
+    object_index: null # Optional bounds TSV: label_id, bbox_min_z/y/x, bbox_max_z/y/x.
+    object_ids: null # Exact native IDs; null selects eligible objects from the ROI.
+    id_mapping: null # Optional TSV: label_id, segmentation_id.
+    max_objects: 100 # Seeded object cohort; 0 selects all. Skipped objects are not replaced.
+    min_voxels: 10
+    seed: 42
+    crop_shape: [32, 32, 32] # Resampled grid, or exact raw voxel counts in native_voxels mode.
+    output_format: h5 # npy, h5, n5. H5/N5 store all arrays in crops.h5/n5.
+    max_object_voxels: 16777216 # Segmentation bounding-box + halo memory budget (256³).
+    max_scan_voxels: 2097152 # Remote scanning cap without an object catalog (128³).
+    patches:
+      sampling: physical_resampled # Or native_voxels: direct raw cuts, no spatial resampling.
+      # native_voxels ignores tile_size_um; field of view = crop_shape × raw voxel spacing.
+      # Native grids may be rectangular, e.g. [16, 32, 32]; each side is at most 128.
+      tile_size_um: 1.0 # Cubic physical width: starting experiment, not an optimum.
+      min_foreground_fraction: 0.5 # At least half the 3D tile is this object's label.
+      tile_anchor: centroid # centroid, bbox_center, bbox_min.
+      max_tiles: 64 # Spatially distributed eligible tiles per object; try 200 as a comparison.
+      exhaustive: false # true saves ALL eligible lattice tiles, ignoring max_tiles.
+      percentiles: [1, 99] # ONE contrast estimate per object, shared by its patches.
+      max_candidate_tiles: 250000 # Lattice safety budget before foreground filtering.
+  - action: extract
+    name: DINO_fine
+    model: dinov2
+    variant: dinov2_vitb14_reg
+    checkpoint: /path/to/dinov2_vitb14_reg4_pretrain.pth
+    model_repository: /path/to/official/dinov2
+    from_preprocessing: true
+    config: {device: auto, seed: 42}
+    views:
+      mode: stored
+      normalization: unit # Required: preparation already scaled pixels to [0,1].
+      size: 224
+      axes: [0, 1, 2] # XY, XZ, YZ planes.
+      fractions: [0.5] # One center slice per axis per patch; empty masks skip.
+      mask: true
+      resize: letterbox
+      feature: foreground_mean # cls, patch_mean, foreground_mean.
+      aggregation: mean # Equal weight for every valid slice; max is also supported.
+      batch_size: 16 # DINO images per model call, separate from max_tiles.
+  - action: analyze
+    from_extraction: true
+    normalization: none
+    umap: true
+    neighbors: 15
+    clusters: 8
+    seed: 42
+    annotations: null # Optional TSV/CSV with native label_id and known cell type.
+slurm:
+  partition: gpu
+  cpus: 4
+  gpus: 1
+  memory: 32G
+  time: '04:00:00'

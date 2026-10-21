@@ -415,69 +415,122 @@ def submit_plan(
 
 
 def refresh_jobs(registry: JobRegistry, scheduler: SchedulerBackend) -> Tuple[int, Tuple[str, ...]]:
-    active = registry.list(states=("queued", "running", "unknown"))
-    slurm_ids = [record.slurm_job_id for record in active if record.slurm_job_id]
+    from morphofeatures.job_status import (
+        PROTECTED,
+        TERMINAL,
+        reconcile_job_states,
+        resolved_changes,
+    )
+    from morphofeatures.registry import JSON_FIELDS
+    from morphofeatures.slurm import normalize_slurm_state
+
+    reconcile_job_states(registry)
+    with registry._connect() as connection:
+        records = [registry._record(row) for row in connection.execute("SELECT * FROM jobs")]
+    # Finished workers still need their last PENDING/RUNNING observation refreshed.
+    active = [
+        r
+        for r in records
+        if r.slurm_job_id
+        and r.application_state not in PROTECTED
+        and (
+            r.application_state not in TERMINAL
+            or normalize_slurm_state(r.raw_scheduler_state or "") not in TERMINAL
+        )
+    ]
+    slurm_ids = [record.slurm_job_id for record in active]
     result = scheduler.query(slurm_ids)
     updated = 0
     for record in active:
-        if not record.slurm_job_id:
-            continue
         status = result.statuses.get(record.slurm_job_id)
-        if status is None:
-            registry.update(
-                record.id,
-                application_state="unknown",
-                error_message="No squeue/sacct record; accounting may be delayed or purged",
+        with registry._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            # Re-read after querying SLURM: a worker or deletion may have finished
+            # while the query was in flight. Never resurrect removed records.
+            row = connection.execute("SELECT * FROM jobs WHERE id = ?", (record.id,)).fetchone()
+            current = registry._record(row) if row else None
+            if current is None or current.application_state in PROTECTED:
+                continue
+            provenance = dict(current.provenance)
+            provenance["scheduler_query"] = {
+                "checked_at": utc_now(),
+                "found": status is not None,
+                "warnings": list(result.warnings),
+            }
+            if status is not None:
+                provenance["scheduler_observation"] = {
+                    "checked_at": utc_now(),
+                    "raw_state": status.raw_state,
+                }
+            changes = {"provenance": provenance}
+            if status is None:
+                # Missing/purged accounting cannot erase a recorded outcome.
+                if current.application_state not in TERMINAL:
+                    changes.update(
+                        application_state="unknown",
+                        error_message=current.error_message
+                        or "No squeue/sacct record; accounting may be delayed or purged",
+                    )
+            else:
+                changes.update(application_state=status.state, raw_scheduler_state=status.raw_state)
+                if status.exit_status is not None:
+                    changes["exit_status"] = status.exit_status
+                if status.started_at:
+                    changes["started_at"] = status.started_at
+                if status.state in TERMINAL:
+                    changes["completed_at"] = (
+                        status.completed_at or current.completed_at or utc_now()
+                    )
+                if status.state == "failed":
+                    changes["error_message"] = (
+                        current.error_message
+                        or f"SLURM ended with {status.raw_state} (exit {status.exit_status or 'unavailable'}). See the job logs."
+                    )
+                # Preserve a known worker error, including when a wrapper exits 0.
+                if (
+                    current.application_state == "failed"
+                    and current.completed_at
+                    and current.exit_status not in (None, "0", "0:0")
+                ):
+                    changes["application_state"] = "failed"
+                    changes["error_message"] = current.error_message
+            artifacts = existing_artifacts(
+                Path(p) if p else None
+                for p in (
+                    current.config_snapshot,
+                    current.metrics_path,
+                    current.checkpoint_path,
+                    current.embedding_path,
+                    current.stdout_path,
+                    current.stderr_path,
+                )
             )
-            continue
-        changes: Dict[str, Any] = {
-            "application_state": status.state,
-            "raw_scheduler_state": status.raw_state,
-            "exit_status": status.exit_status,
-            "error_message": None,
-        }
-        if status.started_at:
-            changes["started_at"] = status.started_at
-        if status.completed_at:
-            changes["completed_at"] = status.completed_at
-        if status.state in {"completed", "failed", "cancelled"} and not status.completed_at:
-            changes["completed_at"] = utc_now()
-        artifacts = existing_artifacts(
-            Path(path) if path else None
-            for path in (
-                record.config_snapshot,
-                record.metrics_path,
-                record.checkpoint_path,
-                record.embedding_path,
-                record.stdout_path,
-                record.stderr_path,
+            changes["artifacts"] = tuple(dict.fromkeys((*current.artifacts, *artifacts)))
+            changes.update(resolved_changes(replace(current, **changes)))
+            encoded = {
+                k: json.dumps(v, sort_keys=True) if k in JSON_FIELDS else v
+                for k, v in changes.items()
+            }
+            connection.execute(
+                "UPDATE jobs SET " + ", ".join(f"{key} = ?" for key in encoded) + " WHERE id = ?",
+                (*encoded.values(), current.id),
             )
-        )
-        if record.workflow == "workspace_run":
-            status_path = Path(record.working_directory) / "status.json"
-            if status_path.exists():
-                worker_status = json.loads(status_path.read_text())
-                # A scheduler refresh can race the worker's final registry update.
-                # Retain scientific outputs rather than replacing them with log paths.
-                artifacts = tuple(worker_status.get("artifacts", record.artifacts))
-                if worker_status.get("state") in {"completed", "failed"}:
-                    changes["application_state"] = worker_status["state"]
-                    changes["error_message"] = worker_status.get("error")
-        changes["artifacts"] = artifacts
-        registry.update(record.id, **changes)
         updated += 1
     return updated, result.warnings
 
 
 def cancel_job(record: JobRecord, registry: JobRegistry, scheduler: SchedulerBackend) -> JobRecord:
+    from morphofeatures.job_control import can_stop_slurm
+
+    record = registry.get(record.id)
     if not record.slurm_job_id:
         raise ValueError("This job has no submitted SLURM job ID")
-    if record.application_state not in {"queued", "running", "unknown"}:
-        raise ValueError("Only active jobs can be cancelled")
+    if not can_stop_slurm(record):
+        raise ValueError("Only active SLURM allocations can be cancelled")
     scheduler.cancel(record.slurm_job_id)
     return registry.update(
         record.id,
         raw_scheduler_state="CANCEL_REQUESTED",
         application_state="cancelled",
-        completed_at=utc_now(),
+        completed_at=None,
     )

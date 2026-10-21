@@ -26,6 +26,64 @@ def read_object_crops(config, object_ids, *, source="prepared", max_side=128):
     requested = [int(value) for value in object_ids]
     if not 1 <= len(requested) <= 25 or not 8 <= int(max_side) <= 256:
         raise ValueError("Inspect 1–25 objects with a view side between 8 and 256 voxels")
+    if data.get("source") == "grouped_crops" and source == "prepared":
+        from contextlib import ExitStack
+
+        from morphofeatures.data.distributed_patches import grouped_arrays
+
+        with ExitStack() as stack:
+            crops, masks, ids, offsets = grouped_arrays(stack, data)
+            lookup = {int(value): i for i, value in enumerate(ids)}
+            positions = stack.enter_context(open_crop_array(data, "positions_um"))
+            for object_id in requested:
+                if object_id not in lookup:
+                    raise ValueError(f"Object {object_id} has no prepared patch group")
+                first, stop = offsets[lookup[object_id] : lookup[object_id] + 2]
+                centers = np.asarray(positions[int(first) : int(stop)])
+                chosen = int(first) + int(np.argmin(np.square(centers - centers.mean(0)).sum(1)))
+                patch = np.asarray(crops[chosen])
+                start = np.maximum(0, (np.asarray(patch.shape) - max_side) // 2)
+                patch = patch[tuple(slice(int(a), int(a + max_side)) for a in start)]
+                yield (
+                    object_id,
+                    patch,
+                    f"Representative saved fine patch near the sampled center ({stop - first} patches total); not a whole-object view",
+                )
+        return
+    if data.get("source") in {"physical_volume", "grouped_crops"}:
+        from contextlib import ExitStack
+
+        from morphofeatures.analysis.annotations import read_id_table
+        from morphofeatures.data.dino_views import open_source
+
+        settings = data["volume"]
+        table = read_id_table(config["inspection"]["mesh"]["object_index"]).set_index("label_id")
+        with ExitStack() as stack:
+            raw = open_source(stack, settings, "raw")
+            spacing = np.array(settings["segmentation_spacing_zyx"])
+            origin = np.array(settings["segmentation_origin_zyx"])
+            for object_id in requested:
+                row = table.loc[object_id]
+                center = (
+                    origin
+                    + np.array(
+                        [(row["bbox_min_" + a] + row["bbox_max_" + a] - 1) / 2 for a in "zyx"]
+                    )
+                    * spacing
+                )
+                position = np.rint(
+                    (center - settings["raw_origin_zyx"]) / settings["raw_spacing_zyx"]
+                ).astype(int)
+                lo, hi = (
+                    np.maximum(0, position - max_side // 2),
+                    np.minimum(raw.shape, position + max_side // 2),
+                )
+                yield (
+                    object_id,
+                    raw.read(tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))),
+                    "Original raw around nucleus (bounded physical-source inspection)",
+                )
+        return
     if data.get("source") == "platybrowser":
         from morphofeatures.analysis.annotations import read_id_table
         from morphofeatures.analysis.mesh_inspection import object_id_mapping
@@ -83,6 +141,8 @@ def read_object_crops(config, object_ids, *, source="prepared", max_side=128):
             settings.get("raw_key"),
             settings.get("raw_axes", "zyx"),
             settings.get("raw_channel", 0),
+            timepoint=settings.get("raw_timepoint", 0),
+            remote_options=settings.get("remote_options"),
         ) as raw:
             for object_id in requested:
                 if object_id not in objects.index:

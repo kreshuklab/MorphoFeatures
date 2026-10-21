@@ -101,8 +101,10 @@ def check_inspection_ids(embedding_ids, config, settings, directory, *, progress
             raise ValueError(
                 "Remote ID checks require an object table; full remote scans are not started automatically"
             )
-        tick(phase="Checking the published object table")
+        tick(phase="Checking the object table")
         index = read_id_table(settings["object_index"])
+        if "status" in index:
+            index = index[index["status"] == "processed"]
         mapping = object_id_mapping(settings) if settings.get("id_mapping") else None
         source_ids = index.label_id
         if settings.get("index_ids", "segmentation") != "segmentation":
@@ -116,6 +118,7 @@ def check_inspection_ids(embedding_ids, config, settings, directory, *, progress
             settings.get("segmentation_key"),
             settings.get("segmentation_axes", "zyx"),
             settings.get("segmentation_channel", 0),
+            timepoint=settings.get("segmentation_timepoint", 0),
             remote_options=settings.get("remote_options"),
         ) as volume:
             if not np.issubdtype(volume.dtype, np.integer):
@@ -152,6 +155,7 @@ def check_inspection_ids(embedding_ids, config, settings, directory, *, progress
             settings.get("segmentation_key"),
             settings.get("segmentation_axes", "zyx"),
             settings.get("segmentation_channel", 0),
+            timepoint=settings.get("segmentation_timepoint", 0),
         ) as volume:
             report.update(
                 shape_zyx=list(volume.shape),

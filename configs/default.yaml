@@ -1,6 +1,20 @@
 seed: 42
 device: auto
 
+# UI defaults for new DINO workflows; per-run paths remain editable.
+# Configure these in Workspace settings or replace null with a local path.
+dino:
+  dinov2:
+    model_repository: null  # Official checkout containing hubconf.py.
+    weights_directory: null  # Optional base folder for checkpoint filenames.
+    variant: dinov2_vits14
+    checkpoints: {}  # Map exact architectures to files, e.g. dinov2_vits14: small.pth.
+  dinov3:
+    model_repository: null
+    weights_directory: null
+    variant: dinov3_vits16
+    checkpoints: {}
+
 paths:
   # Relative paths are resolved against the repository, never the shell cwd.
   repo_root: ..

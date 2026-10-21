@@ -7,6 +7,8 @@ from pathlib import Path
 
 import yaml
 
+from morphofeatures.workflow_validation import FieldError, at_fields
+
 
 def parse_document(text):
     value = yaml.safe_load(text)
@@ -20,12 +22,18 @@ def absolute_paths(values, base):
     from morphofeatures.data.remote_n5 import is_remote_url
 
     values = deepcopy(values)
+    from morphofeatures.data.object_selection import resolve_selection_paths
+
+    resolve_selection_paths(values, base)
     fields = {
         "data": (
             "crops",
             "label_ids",
             "loss_masks",
             "preprocessing",
+            "patch_label_ids",
+            "patch_offsets",
+            "positions_um",
             "patches_container",
             "positions_container",
             "qc_raw_container",
@@ -38,6 +46,7 @@ def absolute_paths(values, base):
             "id_mapping",
         ),
         "training": ("resume_from",),
+        "runtime": ("scratch_directory",),
         "model": ("checkpoint",),
         "annotations": ("cell_table", "cell_to_nucleus", "symmetric_cells"),
     }
@@ -187,19 +196,21 @@ def validate_training(values, base, *, require_data=True):
     training = values.get("training", {})
     mae = values.get("mae", {})
     for key in ("epochs", "batch_size"):
-        value = training.get(key, 2)
-        if isinstance(value, bool) or int(value) != value or value < 1:
-            raise ValueError(f"training.{key} must be a positive integer")
+        with at_fields("training." + key):
+            value = training.get(key, 2)
+            if isinstance(value, bool) or int(value) != value or value < 1:
+                raise ValueError(f"training.{key} must be a positive integer")
     for key, default in (("learning_rate", 0.001), ("weight_decay", 0.01)):
-        value = float(training.get(key, default))
-        if not math.isfinite(value) or value < 0 or (key == "learning_rate" and value == 0):
-            raise ValueError(
-                f"training.{key} must be finite and {'positive' if key == 'learning_rate' else 'non-negative'}"
-            )
+        with at_fields("training." + key):
+            value = float(training.get(key, default))
+            if not math.isfinite(value) or value < 0 or (key == "learning_rate" and value == 0):
+                raise ValueError(
+                    f"training.{key} must be finite and {'positive' if key == 'learning_rate' else 'non-negative'}"
+                )
     if values.get("device", "auto") not in {"auto", "cpu", "cuda"}:
         raise ValueError("device must be auto, cpu, or cuda")
     if not 0 < float(mae.get("mask_ratio", 0.75)) < 1:
-        raise ValueError("mae.mask_ratio must be between zero and one")
+        raise FieldError("Mask ratio must be between zero and one.", "mae.mask_ratio")
     dimensions = [("embedding_dim", "encoder_heads", 4)]
     if values.get("data", {}).get("source") == "n5_masked_patches":
         dimensions.append(("decoder_dim", "decoder_heads", mae.get("encoder_heads", 8)))
@@ -212,7 +223,11 @@ def validate_training(values, base, *, require_data=True):
                 or int(mae[dimension]) < 1
                 or int(mae[dimension]) % int(mae.get(heads, default))
             ):
-                raise ValueError(f"mae.{dimension} must be positive and divisible by mae.{heads}")
+                raise FieldError(
+                    f"mae.{dimension} must be positive and divisible by mae.{heads}",
+                    "mae." + dimension,
+                    "mae." + heads,
+                )
     if values.get("data", {}).get("source") == "n5_masked_patches":
         from morphofeatures.real_mae import resolve_real_mae_config
 
@@ -250,11 +265,17 @@ def validate_training(values, base, *, require_data=True):
         from morphofeatures.data.crop_storage import open_crop_array
         from morphofeatures.mae3d import _load_label_ids, _load_loss_masks
 
-        with open_crop_array(values["data"]) as crops:
+        with at_fields("data.crops", "data.crops_key"), open_crop_array(values["data"]) as crops:
             if crops.ndim not in (4, 5) or not len(crops):
                 raise ValueError("data.crops must contain nonempty (N,Z,Y,X) or (N,C,Z,Y,X) crops")
             if tuple(crops.shape[-3:]) != tuple(mae.get("input_shape", (16, 16, 16))):
-                raise ValueError("mae.input_shape must match data.crops spatial shape")
-            _load_label_ids(values, len(crops))
-            _load_loss_masks(values, len(crops), crops.shape[-3:])
+                raise FieldError(
+                    "mae.input_shape must match data.crops spatial shape",
+                    "mae.input_shape",
+                    "data.crops",
+                )
+            with at_fields("data.label_ids", "data.label_ids_key"):
+                _load_label_ids(values, len(crops))
+            with at_fields("data.loss_masks", "data.loss_masks_key"):
+                _load_loss_masks(values, len(crops), crops.shape[-3:])
     return values

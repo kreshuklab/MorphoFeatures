@@ -18,6 +18,12 @@ The result is a label-first `(n_cells, 481)` array: column 0 is `label_id`, and 
 - [Dataset workspace workflows](docs/workspace_workflows.md): persistent MAE configuration,
   local/SLURM pipelines, cached MAE/DINO embeddings, matched comparisons, bounded instance
   preprocessing, and mesh intensity visualization/export.
+- [Physical DINO fine/coarse experiments](docs/workspace_workflows.md#dino-finecoarse-experiments):
+  distributed views, foreground token pooling, full-vector fusion, matched cross-dataset
+  projections and reference-only label transfer with optional CORAL adaptation.
+- [Reusable distributed fine patches](docs/workspace_workflows.md#distributed-fine-patches-for-dino):
+  physically sized, foreground-filtered patches in NPY/HDF5/N5, with previews,
+  exact native IDs and one pooled DINO embedding per object.
 - Installable package with one `morphofeatures` CLI.
 - Exact validation of all bundled NumPy and MoBIE artifacts.
 - Deterministic logistic-regression evaluation, UMAP, Leiden, and K-means workflows.
@@ -76,8 +82,17 @@ the exact settings and command before running locally or submitting to Slurm.
 snapshot without executing it. Follow progress in **Runs** and reopen outputs
 in **Results**. Specialist workflows and sweeps remain in **Tools**.
 
-See [the workspace guide](docs/workspace_workflows.md) and
-[workspace interaction guide](docs/workspace_workflows.md).
+Choose **Shared space across independent datasets** to pool embeddings from the
+same MAE/DINO checkpoint into one PCA/UMAP, with dataset and cell-type overlays.
+Use saved embeddings or add an extraction for each dataset. See the
+[shared-space example](configs/workspace_joint_datasets.example.yaml).
+
+Export a saved analysis/comparison through **Results → Export this analysis to
+MoBIE**, or append an export stage in Workflow. Choose a portable image region
+or streamed PlatyBrowser images, with saved labels, clusters and UMAP/PCA views.
+See the [MoBIE guide for biologists](docs/analysis_and_mobie.md) for preparation,
+outputs and Fiji instructions, and the [workspace guide](docs/workspace_workflows.md)
+for the full pipeline.
 
 ## Installation groups
 
@@ -135,6 +150,13 @@ Bundled and immediately reproducible:
 - `analysis/data/gene_expression.tsv`: gene-expression analysis table
 - `data_mobie/*.tsv`: feature, projection, cluster, and prediction tables
 
+The Workflow page includes **Explore published MorphoFeatures / MorphoContextFeatures**,
+**Compare bilateral-partner retrieval**, and **Build spatial context from embeddings**.
+These support saved MAE/DINO vectors, explicit cell/nucleus mapping, matched-cohort
+retrieval comparisons and physical-neighborhood context generation. See the
+[walkthrough](docs/workspace_workflows.md#bilateral-retrieval-and-spatial-context)
+and [example YAML](configs/workspace_bilateral_context.example.yaml).
+
 Required for training but not bundled:
 
 - raw 3D EM volume
@@ -152,7 +174,7 @@ morphofeatures validate        validate published artifacts
 morphofeatures classify        logistic-regression cross-validation
 morphofeatures project         UMAP plus Leiden or K-means
 morphofeatures combine         concatenate aligned feature groups
-morphofeatures context         aggregate neighbor features
+morphofeatures context         legacy mean/max neighbor aggregation
 morphofeatures synthetic       create a small 3D fixture
 morphofeatures n5-inventory    inspect N5 metadata without reading chunks
 morphofeatures shape-train     train DeepGCN shape embeddings

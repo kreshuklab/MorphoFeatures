@@ -17,6 +17,8 @@ def category_colors(values):
 
 def projection_panels(frame, columns=None):
     panels = [("cluster", "Embedding clusters")]
+    if "dataset" in frame:
+        panels.insert(0, ("dataset", "Datasets"))
     if "known_label" in frame and frame.known_label.notna().any():
         panels.append(("known_label", "Known cell types"))
     if "predicted_label" in frame and frame.predicted_label.notna().any():
@@ -24,7 +26,9 @@ def projection_panels(frame, columns=None):
     if columns is not None:
         available = dict(panels)
         if not columns or not set(columns) <= set(available):
-            raise ValueError("Choose available cluster, known-label or predicted-label panels")
+            raise ValueError(
+                "Choose available dataset, cluster, known-label or predicted-label panels"
+            )
         panels = [(column, available[column]) for column in columns]
     return panels
 
@@ -40,6 +44,12 @@ def label_palette(frame):
             for v in frame[column]
         ]
     )
+
+
+def panel_palette(frame, column):
+    if column in {"cluster", "dataset"}:
+        return frame.attrs.get(column + "_colors") or category_colors(frame[column])
+    return label_palette(frame)
 
 
 def projection_figure(
@@ -58,12 +68,11 @@ def projection_figure(
 
     if not 0 <= unlabeled_opacity <= 1:
         raise ValueError("Unlabeled opacity must be between zero and one")
-    methods = methods or (["pca"] + (["umap"] if "umap_1" in frame else []))
+    methods = methods or (["pca"] if "pca_1" in frame else []) + (["umap"] if "umap_1" in frame else [])
     panels = projection_panels(frame, panels)
-    class_colors = label_palette(frame)
     categories = {}
     for column, _ in panels:
-        palette = category_colors(frame[column]) if column == "cluster" else class_colors
+        palette = panel_palette(frame, column)
         categories[column] = [
             (name, color)
             for name, color in palette.items()
@@ -138,6 +147,88 @@ def figure_bytes(figure, format="svg", *, dpi=180):
     return buffer.getvalue()
 
 
+def confusion_figure(matrix, labels, title="Known versus predicted cell types", *, normalize=True):
+    """Display recorded evaluation counts without fitting a model or changing class order."""
+    import textwrap
+
+    import matplotlib.pyplot as plt
+
+    counts = np.asarray(matrix, dtype=float)
+    if counts.shape != (len(labels), len(labels)) or not len(labels):
+        raise ValueError("Confusion matrix dimensions must match the class labels")
+    totals = counts.sum(axis=1, keepdims=True)
+    values = (
+        np.divide(counts, totals, out=np.zeros_like(counts), where=totals > 0)
+        if normalize
+        else counts
+    )
+    side = max(6, min(18, 3 + 0.65 * len(labels)))
+    with plt.rc_context(
+        {
+            "text.color": "black",
+            "axes.labelcolor": "black",
+            "xtick.color": "black",
+            "ytick.color": "black",
+        }
+    ):
+        figure, axis = plt.subplots(
+            figsize=(side + 1.5, side), layout="constrained", facecolor="white"
+        )
+        axis.set_facecolor("white")
+        heatmap = axis.imshow(
+            values, cmap="Blues", vmin=0, vmax=1 if normalize else max(1, values.max())
+        )
+        ticks = [textwrap.fill(str(label), 22) for label in labels]
+        axis.set_xticks(range(len(labels)), ticks, rotation=45, ha="right", fontsize=9)
+        axis.set_yticks(range(len(labels)), ticks, fontsize=9)
+        axis.set(
+            xlabel="Predicted cell type", ylabel="Known cell type", title=textwrap.fill(title, 75)
+        )
+        if len(labels) <= 30:
+            for (i, j), value in np.ndenumerate(values):
+                text = (
+                    "—"
+                    if normalize and not totals[i, 0]
+                    else f"{value:.0%}"
+                    if normalize
+                    else f"{value:g}"
+                )
+                axis.text(
+                    j,
+                    i,
+                    text,
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color="white" if value > heatmap.norm.vmax / 2 else "black",
+                )
+        bar = figure.colorbar(heatmap, ax=axis, shrink=0.8)
+        bar.set_label("Fraction of each known class" if normalize else "Object count")
+    return figure
+
+
+def save_confusion_figures(metrics, destination, title):
+    """Worker exports; missing ground truth intentionally produces no matrix."""
+    from pathlib import Path
+
+    import matplotlib.pyplot as plt
+
+    if "confusion_matrix" not in metrics:
+        return
+    destination = Path(destination)
+    labels = metrics.get("confusion_labels", metrics.get("classes"))
+    pd.DataFrame(metrics["confusion_matrix"], index=labels, columns=labels).to_csv(
+        destination / "confusion_matrix.tsv", sep="\t", index_label="known_label"
+    )
+    for normalize, name in ((False, "confusion_counts"), (True, "confusion_normalized")):
+        figure = confusion_figure(metrics["confusion_matrix"], labels, title, normalize=normalize)
+        try:
+            for suffix in ("svg", "png"):
+                (destination / f"{name}.{suffix}").write_bytes(figure_bytes(figure, suffix))
+        finally:
+            plt.close(figure)
+
+
 def save_projection_figure(frame, destination, title, settings=None):
     import matplotlib.pyplot as plt
 
@@ -145,6 +236,10 @@ def save_projection_figure(frame, destination, title, settings=None):
         frame, title, unlabeled_opacity=float((settings or {}).get("unlabeled_opacity", 0.15))
     )
     figure.savefig(destination, bbox_inches="tight")
+    if str(destination).endswith(".svg"):
+        from pathlib import Path
+
+        figure.savefig(Path(destination).with_suffix(".png"), bbox_inches="tight", dpi=150, facecolor="white")
     plt.close(figure)
 
 
@@ -165,7 +260,6 @@ def interactive_projection(
         shared_xaxes=True,
         shared_yaxes=True,
     )
-    class_colors = label_palette(frame)
     unlabeled = frame.get("known_label", pd.Series("labeled", index=frame.index)).isna()
     if unlabeled.all():
         unlabeled = pd.Series(False, index=frame.index)
@@ -189,7 +283,7 @@ def interactive_projection(
         if "maxheight" in go.layout.Legend()._valid_props:
             legends[legend_id]["maxheight"] = 210
         lines = 0
-        colors = category_colors(frame[column]) if column == "cluster" else class_colors
+        colors = panel_palette(frame, column)
         values = frame[column].astype("string").fillna("Unlabeled")
         for category in sorted(values.unique()):
             wrapped_name = textwrap.wrap(str(category), 28)
@@ -203,6 +297,8 @@ def interactive_projection(
                     points.get("known_label", pd.Series("", index=points.index))
                     .fillna("Unlabeled")
                     .astype(str),
+                    points.get("dataset", pd.Series("", index=points.index)).astype(str),
+                    points.get("source_label_id", points.label_id).astype(str),
                 )
             )
             figure.add_trace(
@@ -218,7 +314,8 @@ def interactive_projection(
                         "size": point_size,
                         "opacity": np.where(unlabeled.loc[keep], unlabeled_opacity, 0.85),
                     },
-                    hovertemplate="ID %{customdata[0]}<br>Known: %{customdata[1]}<br>%{x:.3f}, %{y:.3f}<extra>%{fullData.name}</extra>",
+                    hovertemplate=("Dataset: %{customdata[2]}<br>" if "dataset" in frame else "")
+                    + "ID %{customdata[3]}<br>Known: %{customdata[1]}<br>%{x:.3f}, %{y:.3f}<extra>%{fullData.name}</extra>",
                 ),
                 row=1,
                 col=col,

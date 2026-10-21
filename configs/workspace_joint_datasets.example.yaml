@@ -1,0 +1,54 @@
+# Independent datasets encoded by the SAME weights, in one shared coordinate system.
+# Replace /path/to entries. Relative paths are relative to this YAML.
+stages:
+  - action: joint_analyze
+    datasets:
+      - name: Specimen A
+        embedding: /path/to/specimen_a/embeddings.npz
+        annotations: null  # Optional TSV/CSV: label_id and cell_type (or label).
+        label_column: auto
+        input_config: null  # Optional inspection YAML for specimen A's volumes.
+      - name: Specimen B
+        embedding: /path/to/specimen_b/embeddings.npz
+        annotations: null  # IDs and labels belong to specimen B only.
+        label_column: auto
+        input_config: null
+    # Keep .metadata.json sidecars, or use embeddings.npz beside its analysis.json.
+    # Set true only if provenance is missing and you have checked weights/settings.
+    # A known checkpoint or feature-setting mismatch is always rejected.
+    assume_same_model: false
+    max_objects_per_dataset: 0  # All objects; e.g. 5000 caps each dataset reproducibly.
+    normalization: standardize  # Fitted once across pooled rows.
+    umap: true
+    umap_pca_components: null # Try 50; one PCA fit across both datasets before UMAP. null/0 disables.
+    cluster_pca_components: null # Optional PCA before shared clustering, independent of UMAP.
+    analysis_variants: [] # Named combinations use this result's exact pooled plotted cohort.
+    neighbors: 15
+    min_dist: 0.0
+    umap_epochs: 50
+    cluster_method: kmeans
+    clusters: 8
+    seed: 42
+    unlabeled_opacity: 0.15
+slurm:
+  partition: compute
+  cpus: 4
+  gpus: 0
+  memory: 16G
+  time: '01:00:00'
+
+# To extract first, prepend these stages to `stages` above, then replace each
+# dataset's `embedding` with `from_embedding: specimen_a` / `specimen_b`.
+# Each model/data YAML describes the same model and its OWN dataset inputs.
+# - action: extract
+#   name: specimen_a
+#   model: mae
+#   checkpoint: &shared_weights /path/to/checkpoint.pt
+#   config: /path/to/specimen_a_model_and_data.yaml
+# - action: extract
+#   name: specimen_b
+#   model: mae
+#   checkpoint: *shared_weights
+#   config: /path/to/specimen_b_model_and_data.yaml
+# For DINO use identical model, variant, checkpoint, model_repository and views
+# in both extraction stages. Select GPU resources above when extraction needs them.

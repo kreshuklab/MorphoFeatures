@@ -6,8 +6,8 @@ import argparse
 import importlib.util
 import json
 import pickle
-from pathlib import Path
 import shutil
+from pathlib import Path
 from typing import Optional, Sequence
 
 import numpy as np
@@ -17,7 +17,12 @@ from morphofeatures.analysis.classification import (
     evaluate_embedding_classifier,
 )
 from morphofeatures.analysis.context import aggregate_neighbors, agglomerate_features
-from morphofeatures.analysis.projection import cluster_embeddings, compute_umap
+from morphofeatures.analysis.projection import (
+    cluster_embeddings,
+    compute_umap,
+    prepare_umap_input,
+    umap_input_description,
+)
 from morphofeatures.analysis.validation import validate_bundled_artifacts, validate_mobie_tables
 from morphofeatures.config import load_config
 from morphofeatures.data.io import export_embeddings, load_embeddings, merge_embeddings
@@ -87,14 +92,20 @@ def _project(args: argparse.Namespace) -> int:
         ids = table.label_ids
         features = table.features
     features = StandardScaler().fit_transform(features)
+    umap_features, umap_input = prepare_umap_input(
+        features, args.umap_pca_components, seed=args.seed
+    )
     projection = compute_umap(
-        features,
+        umap_features,
         n_neighbors=args.umap_neighbors,
         seed=args.seed,
         n_epochs=args.umap_epochs,
     )
+    cluster_features, cluster_input = prepare_umap_input(
+        features, args.cluster_pca_components, seed=args.seed
+    )
     labels = cluster_embeddings(
-        features,
+        cluster_features,
         method=args.cluster_method,
         n_neighbors=args.cluster_neighbors,
         resolution=args.resolution,
@@ -108,6 +119,14 @@ def _project(args: argparse.Namespace) -> int:
         np.column_stack((labels, projection)),
         ("cluster", "umap_1", "umap_2"),
     )
+    from morphofeatures.artifacts import write_json_atomic
+
+    write_json_atomic(
+        output.with_name(output.stem + "_projection.json"),
+        {"source": str(embedding_path), "umap_input": umap_input,
+         "cluster_input": cluster_input, "seed": args.seed},
+    )
+    print(umap_input_description(umap_input))
     print("Saved {} rows to {}".format(len(ids), output))
     return 0
 
@@ -299,9 +318,29 @@ def _workspace_submit(args):
     return 0
 
 
+def _dino_benchmark(args):
+    from morphofeatures.dino_benchmark import benchmark_command
+
+    return benchmark_command(args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="morphofeatures", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    benchmark = subparsers.add_parser("dino-benchmark", help="Profile a fixed physical-DINO cohort with cold/warm caches and feature-drift checks")
+    benchmark.add_argument("--config", required=True, type=Path)
+    benchmark.add_argument("--output", required=True, type=Path)
+    benchmark.add_argument("--stage", type=int, default=0)
+    benchmark.add_argument("--dataset", type=int, default=0)
+    benchmark.add_argument("--backbone", type=int, default=0)
+    benchmark.add_argument("--scale", type=int, default=0)
+    benchmark.add_argument("--objects", type=int, default=3)
+    benchmark.add_argument("--workers", nargs="+", type=int, default=[0, 2])
+    benchmark.add_argument("--batch-sizes", nargs="+", type=int, default=[16, 32])
+    benchmark.add_argument("--precisions", nargs="+", choices=["float32", "bfloat16", "float16"], default=["float32"])
+    benchmark.add_argument("--device", choices=["auto", "cpu", "cuda"])
+    benchmark.set_defaults(handler=_dino_benchmark)
 
     worker = subparsers.add_parser("workspace-run", help="Run a saved scientific pipeline")
     worker.add_argument("--config", required=True, type=Path)
@@ -342,7 +381,18 @@ def build_parser() -> argparse.ArgumentParser:
     project.add_argument("--seed", type=int, default=42)
     project.add_argument("--umap-neighbors", type=int, default=15)
     project.add_argument("--umap-epochs", type=int)
+    project.add_argument(
+        "--umap-pca-components", type=int, default=None,
+        help=(
+            "Reduce standardized embeddings to this many PCA components before UMAP; "
+            "0 or omitted disables. Capped to feature count and objects minus one."
+        ),
+    )
     project.add_argument("--cluster-method", choices=("leiden", "kmeans"), default="leiden")
+    project.add_argument(
+        "--cluster-pca-components", type=int, default=None,
+        help="Optional PCA before clustering, independent of UMAP preprocessing; 0 or omitted disables.",
+    )
     project.add_argument("--cluster-neighbors", type=int, default=20)
     project.add_argument("--clusters", type=int, default=8)
     project.add_argument("--resolution", type=float, default=0.004)

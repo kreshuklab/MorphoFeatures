@@ -11,6 +11,8 @@ import itertools
 import json
 import os
 import struct
+import sqlite3
+import time
 import tempfile
 import threading
 from functools import lru_cache
@@ -20,6 +22,8 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 import numpy as np
+
+from morphofeatures.data.bounded_cache import ByteLRU, file_lock
 
 MAX_FILE_BYTES = 64 * 1024**2
 
@@ -48,7 +52,7 @@ def _cache_lock(root):
 
 
 class HttpCache:
-    """Atomic cache entries, with least-recently-used eviction on download.
+    """Atomic downloads with indexed eviction and independent entry locks.
 
     Only HTTP 404 denotes an absent N5 block. Transport/authentication/server errors
     are surfaced rather than silently interpreted as empty segmentation voxels.
@@ -69,6 +73,64 @@ class HttpCache:
                 "Remote cache must be positive and at most 64 GiB; timeout must be 1–120 seconds"
             )
         self.downloads = self.downloaded_bytes = self.hits = 0
+        self.download_seconds = self.evictions = 0
+        self._touches = {}
+        self._last_touch = time.monotonic()
+        self.root.mkdir(parents=True, exist_ok=True)
+        with _cache_lock(str(self.root)), file_lock(self.root / "index.lock"):
+            with sqlite3.connect(self.root / "index.sqlite") as db:
+                exists = db.execute(
+                    "SELECT name FROM sqlite_master WHERE name='entries'"
+                ).fetchone()
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS entries (name TEXT PRIMARY KEY, size INTEGER, used REAL)"
+                )
+                db.execute("CREATE INDEX IF NOT EXISTS entries_used ON entries(used)")
+                if not exists:
+                    # One migration scan for older caches, never one scan per download.
+                    for entry in (self.root / "downloads").glob("*.cache"):
+                        try:
+                            stat = entry.stat()
+                            db.execute(
+                                "INSERT OR REPLACE INTO entries VALUES (?, ?, ?)",
+                                (entry.name, stat.st_size, stat.st_mtime),
+                            )
+                        except FileNotFoundError:
+                            pass
+
+    def _index(self, name=None, size=0):
+        with _cache_lock(str(self.root)), file_lock(self.root / "index.lock"):
+            with sqlite3.connect(self.root / "index.sqlite") as db:
+                db.executemany(
+                    "UPDATE entries SET used=? WHERE name=?",
+                    [(used, key) for key, used in self._touches.items()],
+                )
+                self._touches.clear()
+                self._last_touch = time.monotonic()
+                if name is not None:
+                    db.execute(
+                        "INSERT OR REPLACE INTO entries VALUES (?, ?, ?)", (name, size, time.time())
+                    )
+                total, count = db.execute(
+                    "SELECT COALESCE(SUM(size), 0), COUNT(*) FROM entries"
+                ).fetchone()
+                if total > self.limit or count > 10000:
+                    for key, length in db.execute(
+                        "SELECT name, size FROM entries ORDER BY used"
+                    ).fetchall():
+                        if total <= self.limit and count <= 10000:
+                            break
+                        (self.root / "downloads" / key).unlink(missing_ok=True)
+                        db.execute("DELETE FROM entries WHERE name=?", (key,))
+                        self.evictions += 1
+                        total -= length
+                        count -= 1
+
+    def stats(self):
+        return {
+            key: getattr(self, key)
+            for key in ("downloads", "downloaded_bytes", "hits", "evictions", "download_seconds")
+        }
 
     def _download(self, url):
         try:
@@ -93,21 +155,28 @@ class HttpCache:
         name = hashlib.sha256((self.version + "\n" + url).encode()).hexdigest()
         # Prefix byte distinguishes a real empty object from a cached HTTP 404.
         path = self.root / "downloads" / (name + ".cache")
-        with _cache_lock(str(self.root)):
+        # Striped entry locks include only this download, allowing other URLs in parallel.
+        with file_lock(self.root / "locks" / (name[:2] + ".lock")):
             try:
                 cached = path.read_bytes()
                 if not cached or cached[:1] not in (b"0", b"1"):
                     raise ValueError("Invalid cache entry; change cache_version to rebuild it")
-                os.utime(path, None)
+                with _cache_lock(str(self.root)):
+                    self._touches[path.name] = time.time()
+                    if len(self._touches) >= 128 or time.monotonic() - self._last_touch > 5:
+                        self._index()
                 self.hits += 1
                 content = None if cached[:1] == b"0" else cached[1:]
             except FileNotFoundError:
+                started = time.perf_counter()
                 try:
                     content = self._download(url)
                 except FileNotFoundError:
                     if not missing_ok:
                         raise
                     content = None
+                finally:
+                    self.download_seconds += time.perf_counter() - started
                 encoded = b"0" if content is None else b"1" + content
                 if len(encoded) <= self.limit:
                     path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,18 +187,7 @@ class HttpCache:
                         os.replace(temporary, path)
                     finally:
                         temporary.unlink(missing_ok=True)
-                    entries = [
-                        (entry.stat().st_mtime_ns, entry.stat().st_size, entry)
-                        for entry in path.parent.glob("*.cache")
-                    ]
-                    size = sum(item[1] for item in entries)
-                    count = len(entries)
-                    for _, length, entry in sorted(entries):
-                        if size <= self.limit and count <= 10000:
-                            break
-                        entry.unlink(missing_ok=True)
-                        size -= length
-                        count -= 1
+                    self._index(path.name, len(encoded))
             if content is None and not missing_ok:
                 raise FileNotFoundError(f"Remote object not found: {url}")
             return content
@@ -148,6 +206,8 @@ class HttpN5Array:
             )
         self.url = remote_url(root) + "/" + str(key)
         self.cache = HttpCache(options)
+        self.decoded = ByteLRU(int(float((options or {}).get("decoded_cache_mb", 128)) * 1024**2))
+        self.decode_seconds = 0.0
         self.attrs = self.cache.json(self.url + "/attributes.json")
         self.shape = tuple(reversed(self.attrs["dimensions"]))
         self.chunks = tuple(reversed(self.attrs["blockSize"]))
@@ -208,12 +268,21 @@ class HttpN5Array:
         if not result.size:
             return result
         for position in itertools.product(*grid):
-            content = self.cache.get(
-                self.url + "/" + "/".join(map(str, reversed(position))), missing_ok=True
-            )
-            if content is None:
+
+            def load(position=position):
+                content = self.cache.get(
+                    self.url + "/" + "/".join(map(str, reversed(position))), missing_ok=True
+                )
+                if content is None:
+                    return np.empty((0, 0, 0), dtype=self.dtype)
+                started = time.perf_counter()
+                block = self._decode(content)
+                self.decode_seconds += time.perf_counter() - started
+                return block
+
+            block = self.decoded.get(position, load)
+            if not block.size:
                 continue  # Sparse N5 blocks are defined to be zero.
-            block = self._decode(content)
             start = np.asarray(position) * self.chunks
             lo, hi = np.maximum(lower, start), np.minimum(upper, start + block.shape)
             if np.any(hi <= lo):

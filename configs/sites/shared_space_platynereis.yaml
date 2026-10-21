@@ -1,0 +1,14 @@
+# Actual local Platynereis inputs, not portable example data.
+extends: ../shared_space.example.yaml
+inputs:
+  expression: /g/kreshuk/frazer/data/platy_data/expression/sclocator/spatial_expr_df_binarized.tsv
+  mapping: /g/kreshuk/mansaray/platy_data/1.0.1/tables/sbem-6dpf-1-whole-segmented-cells/cells_to_nuclei.tsv
+  morphology:
+    MorphoFeatures: /g/kreshuk/frazer/projects/MorphoFeatures/analysis/data/morphofeatures_all_cells.npy
+    DINO: /g/kreshuk/frazer/projects/MorphoFeatures/outputs/experiments/DinoV2-b-reg-embedding-label-transfer-platy-par/workspace/00-transfer/reference/original_embeddings.npz
+  nucleus_table: /g/kreshuk/mansaray/platy_data/1.0.1/tables/sbem-6dpf-1-whole-segmented-nuclei/default.tsv
+  cell_table: /g/kreshuk/mansaray/platy_data/1.0.1/tables/sbem-6dpf-1-whole-segmented-cells/default.tsv
+  bilateral: /g/kreshuk/mansaray/platy_data/1.0.1/tables/sbem-6dpf-1-whole-segmented-cells/symmetric_cells.tsv
+  manual_labels: /g/kreshuk/frazer/projects/MorphoFeatures/analysis/data/class_labels.tsv
+  gene_metadata_h5ad: /g/kreshuk/frazer/data/platy_data/expression/sclocator/sclocator_broad_types/atlas/scrnaseq_bin_expr.h5ad
+output_root: /g/kreshuk/frazer/projects/MorphoFeatures/outputs/exploration/shared_space

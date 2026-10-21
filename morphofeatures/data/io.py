@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Iterable, Sequence
 
 import numpy as np
 import pandas as pd
@@ -11,13 +11,13 @@ import pandas as pd
 from .contracts import EmbeddingTable
 
 
-def load_embeddings(path: Path, mmap: bool = False) -> EmbeddingTable:
+def load_embeddings(path: Path, mmap: bool = False, *, require_finite: bool = True) -> EmbeddingTable:
     source = Path(path)
     suffix = source.suffix.lower()
     if suffix == ".npz":
         with np.load(source, allow_pickle=False) as archive:
             table = EmbeddingTable(archive["label_ids"], archive["features"])
-        if not np.isfinite(table.features).all():
+        if require_finite and not np.isfinite(table.features).all():
             raise ValueError("Embedding features contain NaN or infinite values")
         return table
     if suffix == ".npy":
@@ -26,7 +26,7 @@ def load_embeddings(path: Path, mmap: bool = False) -> EmbeddingTable:
         separator = "\t" if suffix == ".tsv" else ","
         frame = pd.read_csv(source, sep=separator)
         if "label_id" not in frame.columns:
-            raise ValueError("{} has no label_id column".format(source))
+            raise ValueError(f"{source} has no label_id column")
         feature_columns = [column for column in frame.columns if column != "label_id"]
         ids = frame["label_id"].to_numpy()
         if not np.issubdtype(ids.dtype, np.integer):
@@ -34,14 +34,14 @@ def load_embeddings(path: Path, mmap: bool = False) -> EmbeddingTable:
                 raise ValueError("label_id requires exact integers; store large IDs as integer text")
             ids = ids.astype(np.int64)
         features = frame[feature_columns].to_numpy()
-        if not np.isfinite(features).all():
+        if require_finite and not np.isfinite(features).all():
             raise ValueError("Embedding features contain NaN or infinite values")
         return EmbeddingTable(ids, features)
     elif suffix in {".np", ".txt"}:
         matrix = np.loadtxt(source)
     else:
-        raise ValueError("Unsupported embedding format: {}".format(source.suffix))
-    return EmbeddingTable.from_array(matrix)
+        raise ValueError(f"Unsupported embedding format: {source.suffix}")
+    return EmbeddingTable.from_array(matrix, require_finite=require_finite)
 
 
 def merge_embeddings(paths: Sequence[Path], standardize: bool = False) -> EmbeddingTable:

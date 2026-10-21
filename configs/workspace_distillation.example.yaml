@@ -1,0 +1,58 @@
+# Replace paths. Labels must use the embedding's specimen and cell/nucleus IDs.
+# No image extraction or backbone training is repeated.
+stages:
+  - action: distill
+    name: Distilled
+    embedding: /path/to/embeddings.npz
+    annotations: /path/to/cell_types.tsv
+    label_column: cell_type
+    group_column: null  # Prefer independent specimen/groups when available.
+    folds: 5            # Approximately 80% training / 20% validation.
+    validation_fold: 0  # Only this fold is scored, not pooled cross-validation.
+    seed: 42
+    pca_components: 64  # Capped at training objects minus 1 / input dimensions.
+    pca_standardize: true
+    adapter:
+      hidden_dim: 128
+      latent_dim: 64
+      epochs: 100
+      batch_size: 128
+      learning_rate: 0.001
+      weight_decay: 0.0001
+      standardize: true
+      device: cpu
+    probe_c: 1.0        # Same standardized linear probe for all three methods.
+    analysis:
+      normalization: none
+      umap: true
+      umap_pca_components: null
+      clusters: 8
+      neighbors: 15
+      min_dist: 0.1
+      seed: 42
+    bilateral_population: held_out  # Remove training objects from query AND search.
+    bilateral:
+      enabled: false
+      same_specimen: true # All three outputs come from this one input.
+      candidates: /path/to/bilateral_candidates.tsv # source_id,target_id in cell IDs
+      id_namespace: nucleus # Change to cell if embedding IDs are cell IDs.
+      id_mapping: /path/to/cells_to_nuclei.tsv
+      cell_column: label_id
+      nucleus_column: nucleus_id
+      top_k: [1, 5, 10, 50, 100]
+      variants:
+        - name: Euclidean without extra scaling
+          normalization: none
+          metric: euclidean
+          search: all
+          pca: null
+# Later stages can reference Distilled.base, Distilled.pca or Distilled.adapter.
+# "Distilled" alone aliases the adapter's ALL-object vectors.
+# Prefer */held_out.npz for follow-up validation. Ordinary classifier CV on
+# all-object adapter vectors does not refit the adapter.
+slurm:
+  partition: compute
+  cpus: 4
+  gpus: 0
+  memory: 8G
+  time: "01:00:00"
